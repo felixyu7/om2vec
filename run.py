@@ -36,21 +36,33 @@ if __name__=="__main__":
     if cfg['dataloader'] == 'prometheus':
         from dataloaders.prometheus import PrometheusTimeSeriesDataModule
         dm = PrometheusTimeSeriesDataModule(cfg)
+    elif cfg['dataloader'] == 'icecube':
+        from dataloaders.icecube_parquet import ICTimeSeriesDataModule
+        dm = ICTimeSeriesDataModule(cfg)
     else:
         print("Unknown dataloader!")
         exit()
     dm.setup()
     
-    # initialize models
-    net = NT_VAE(cfg['model_options']['in_features'],
-                 cfg['model_options']['latent_dim'],
-                 cfg['model_options']['beta_factor'],
-                 cfg['model_options']['beta_peak_epoch'],
-                 np.ceil(len(dm.train_dataset) / cfg['training_options']['batch_size']),
-                 cfg['training_options']['batch_size'],
-                 cfg['training_options']['lr'],
-                 cfg['training_options']['lr_schedule'],
-                 cfg['training_options']['weight_decay'])
+    if cfg['training']:
+        dataset_size = len(dm.train_dataset)
+    else:
+        dataset_size = len(dm.valid_dataset)
+    
+    if cfg['checkpoint'] != '':
+        # initialize models
+        print("Loading checkpoint: ", cfg['checkpoint'])
+        net = NT_VAE.load_from_checkpoint(cfg['checkpoint'])
+    else:
+        net = NT_VAE(cfg['model_options']['in_features'],
+                    cfg['model_options']['latent_dim'],
+                    cfg['model_options']['beta_factor'],
+                    cfg['model_options']['beta_peak_epoch'],
+                    np.ceil(dataset_size / cfg['training_options']['batch_size']),
+                    cfg['training_options']['batch_size'],
+                    cfg['training_options']['lr'],
+                    cfg['training_options']['lr_schedule'],
+                    cfg['training_options']['weight_decay'])
 
     if cfg['training']:
         # initialise the wandb logger and name your wandb project
@@ -67,20 +79,20 @@ if __name__=="__main__":
                                               save_on_train_epoch_end=True)
         trainer = pl.Trainer(accelerator=cfg['accelerator'], 
                              devices=cfg['num_devices'],
-                            #  precision="bf16-mixed",
-                             max_epochs=cfg['training_options']['epochs'],                    
+                             precision="bf16-mixed",
+                             max_epochs=cfg['training_options']['epochs'], 
                              log_every_n_steps=1, 
                             #  overfit_batches=10,
                              gradient_clip_val=0.5,
                              logger=wandb_logger, 
-                             callbacks=[lr_monitor, checkpoint_callback],
+                             callbacks=[lr_monitor, checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr'])],
                              num_sanity_val_steps=0)
         trainer.fit(model=net, datamodule=dm)
     else:
         logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'])
         logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
         trainer = pl.Trainer(accelerator=cfg['accelerator'], 
-                            #  precision="bf16-mixed",
+                             precision="bf16-mixed",
                              profiler='simple', 
                              logger=logger,
                              num_sanity_val_steps=0)
