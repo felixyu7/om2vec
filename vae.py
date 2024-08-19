@@ -3,8 +3,6 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from blocks import BEiTv2Block
-
 import lightning.pytorch as pl
 
 import time
@@ -15,6 +13,7 @@ class NT_VAE(pl.LightningModule):
                  latent_dim=128,
                  beta_factor=1e-5,
                  beta_peak_epoch=4,
+                 positional_encoding=True,
                  dataset_size=98314,
                  batch_size=128,
                  lr=1e-3, 
@@ -25,59 +24,62 @@ class NT_VAE(pl.LightningModule):
         
         embed_dim = 32
         self.embedding = nn.Linear(1, embed_dim)
+        self.initial_downsample = nn.Sequential(nn.Linear(in_features, latent_dim*16),
+                                                nn.LeakyReLU())
         self.encoder = nn.Sequential(Transformer_VAE_Enc(dim=embed_dim,
-                                                         num_heads=2,
-                                                         ff_dim=128,
-                                                         seq_len_in=in_features, 
-                                                         seq_len_out=latent_dim*32),
+                                                        num_heads=4,
+                                                        ff_dim=256,
+                                                        seq_len_in=latent_dim*16, 
+                                                        seq_len_out=latent_dim*8),
                                      Transformer_VAE_Enc(dim=embed_dim,
-                                                         num_heads=2,
-                                                            ff_dim=128,
-                                                            seq_len_in=latent_dim*32,
-                                                            seq_len_out=latent_dim*16),
+                                                        num_heads=4,
+                                                        ff_dim=256,
+                                                        seq_len_in=latent_dim*8, 
+                                                        seq_len_out=latent_dim*4),
                                      Transformer_VAE_Enc(dim=embed_dim,
-                                                         num_heads=2,
-                                                            ff_dim=128,
-                                                            seq_len_in=latent_dim*16,
-                                                            seq_len_out=latent_dim*8),
-                                     Transformer_VAE_Enc(dim=embed_dim,
-                                                         num_heads=2,
-                                                         ff_dim=128,
-                                                            seq_len_in=latent_dim*8,
-                                                            seq_len_out=latent_dim*4),
-                                     Transformer_VAE_Enc(dim=embed_dim,
-                                                         num_heads=2,
-                                                            ff_dim=128,
-                                                            seq_len_in=latent_dim*4,
-                                                            seq_len_out=latent_dim*2),
-        )
+                                                        num_heads=4,
+                                                        ff_dim=256,
+                                                        seq_len_in=latent_dim*4, 
+                                                        seq_len_out=latent_dim*2)
+                                     )
         self.latent_output = nn.Linear(embed_dim, 1)
         self.decoder_embedding = nn.Linear(1, embed_dim)
         
         self.tgt_embedding = nn.Parameter(torch.randn(latent_dim, embed_dim))
         
-        self.decoder = Transformer_VAE_Dec(dim=embed_dim,
-                                           num_heads=4,
-                                           ff_dim=256,
-                                           seq_len_in=latent_dim,
-                                           seq_len_out=in_features)
+        self.decoder = nn.Sequential(Transformer_VAE_Dec(dim=embed_dim,
+                                                        num_heads=4,
+                                                        ff_dim=256,
+                                                        seq_len_in=latent_dim, 
+                                                        seq_len_out=latent_dim*4),
+                                     Transformer_VAE_Dec(dim=embed_dim,
+                                                        num_heads=4,
+                                                        ff_dim=256,
+                                                        seq_len_in=latent_dim*4, 
+                                                        seq_len_out=latent_dim*16),
+                                     Transformer_VAE_Dec(dim=embed_dim,
+                                                        num_heads=4,
+                                                        ff_dim=256,
+                                                        seq_len_in=latent_dim*16, 
+                                                        seq_len_out=in_features)
+                                     )
         self.output = nn.Linear(embed_dim, 1)
         
         self.fc_mu = nn.Linear(latent_dim*2, latent_dim)
         self.fc_logvar = nn.Linear(latent_dim*2, latent_dim)                   
         
-        self.positional_encoding = nn.Linear(3, in_features)
+        if positional_encoding:
+            self.positional_encoding = nn.Linear(3, in_features)
         
         self.beta = 0.
+        self.iter = 0
         self.beta_factor = beta_factor
         self.total_steps = dataset_size * beta_peak_epoch
-        self.iter = 0
 
     def encode(self, inputs):
-        # h = self.encoder(inputs)
-        
+        inputs = self.initial_downsample(inputs)
         h = self.embedding(inputs.unsqueeze(-1))
-        h = self.encoder(h)        
+        h = self.encoder(h)
         h = self.latent_output(h).squeeze()
         
         mu = self.fc_mu(h)
@@ -87,19 +89,20 @@ class NT_VAE(pl.LightningModule):
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        # eps = 0.
         return mu + eps * std
     
     def decode(self, z):
         z = self.decoder_embedding(z.unsqueeze(-1))
         tgt = self.tgt_embedding.unsqueeze(0).expand(z.size(0), -1, -1)
-        outputs = self.decoder(tgt, z)
-        outputs = self.output(outputs)
+        for layer in self.decoder:
+            z = layer(z, tgt)
+        outputs = self.output(z)
         return outputs.squeeze()
     
-    def forward(self, inputs, pos):
-        mu, logvar = self.encode(inputs + self.positional_encoding(pos))
-        import pdb; pdb.set_trace()
+    def forward(self, inputs, pos=None):
+        if self.hparams.positional_encoding:
+            inputs = inputs + self.positional_encoding(pos)
+        mu, logvar = self.encode(inputs)
         z = self.reparameterize(mu, logvar)
         outputs = self.decode(z)
         outputs = torch.softmax(outputs, dim=-1)
@@ -109,8 +112,13 @@ class NT_VAE(pl.LightningModule):
         return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
     def training_step(self, batch, batch_idx):
-        inputs, pos = batch
-        outputs, mu, logvar = self(inputs, pos)
+        if self.hparams.positional_encoding:
+            inputs, pos = batch
+            outputs, mu, logvar = self(inputs, pos)
+        else:
+            inputs = batch
+            outputs, mu, logvar = self(inputs)
+            
         reconstruction_loss = nll_poisson_loss(inputs, outputs)
         # reconstruction_loss = F.mse_loss(inputs, outputs)
         kl_loss = self.kl_divergence(mu, logvar)
@@ -128,8 +136,12 @@ class NT_VAE(pl.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
-        inputs, pos = batch
-        outputs, mu, logvar = self(inputs, pos)
+        if self.hparams.positional_encoding:
+            inputs, pos = batch
+            outputs, mu, logvar = self(inputs, pos)
+        else:
+            inputs = batch
+            outputs, mu, logvar = self(inputs)
 
         reconstruction_loss = nll_poisson_loss(inputs, outputs)
         # reconstruction_loss = F.mse_loss(inputs, outputs)
@@ -143,9 +155,12 @@ class NT_VAE(pl.LightningModule):
         return loss
     
     def test_step(self, batch, batch_idx):
-        inputs, pos = batch
-        import pdb; pdb.set_trace()
-        outputs, mu, logvar = self(inputs, pos)
+        if self.hparams.positional_encoding:
+            inputs, pos = batch
+            outputs, mu, logvar = self(inputs, pos)
+        else:
+            inputs = batch
+            outputs, mu, logvar = self(inputs)
 
         reconstruction_loss = nll_poisson_loss(inputs, outputs)
         kl_loss = self.kl_divergence(mu, logvar)

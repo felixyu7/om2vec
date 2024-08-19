@@ -1,10 +1,13 @@
 import torch
 import numpy as np
-import awkward as ak
 import lightning.pytorch as pl
-import pyarrow.parquet as pq
-import glob
-from collections import defaultdict
+import gc, os, glob
+from collections import OrderedDict
+
+import awkward as ak
+from bisect import bisect_right
+
+from dataloaders.data_utils import get_file_names, RandomChunkSampler
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
     def __init__(self, cfg, field='mc_truth'):
@@ -17,36 +20,40 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
     
     def setup(self, stage=None):
         if self.cfg['training']:
-            train_files = sorted(glob.glob(self.cfg['data_options']['train_data_file'] + '*.parquet'))
-            self.train_dataset = PrometheusTimeSeriesDataset(train_files,
-                                                             self.cfg['data_options']['num_bins'],
-                                                             self.cfg['data_options']['max_time'])
+            train_files = get_file_names(self.cfg['data_options']['train_data_files'], self.cfg['data_options']['train_data_file_ranges'])
+            self.train_dataset = PrometheusTimeSeriesDataset(cache_size=64,
+                                           reduce_size=-1,
+                                           resource_path='/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/GNN/software/src/nunet/resources',
+                                           paths=train_files)
             
-        valid_files = sorted(glob.glob(self.cfg['data_options']['valid_data_file'] + '*.parquet'))
-        self.valid_dataset = PrometheusTimeSeriesDataset(valid_files,
-                                                        self.cfg['data_options']['num_bins'],
-                                                        self.cfg['data_options']['max_time'])
-            
+        valid_files = get_file_names(self.cfg['data_options']['valid_data_files'], self.cfg['data_options']['valid_data_file_ranges'])
+        self.valid_dataset = PrometheusTimeSeriesDataset(cache_size=64,
+                                        reduce_size=-1,
+                                        resource_path='/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/GNN/software/src/nunet/resources',
+                                        paths=valid_files)
+        
     def train_dataloader(self):
-        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        sampler = RandomChunkSampler(self.train_dataset, batch_size=self.cfg['training_options']['batch_size'], chunks=self.train_dataset.chunks)
         dataloader = torch.utils.data.DataLoader(self.train_dataset, 
                                             batch_size = self.cfg['training_options']['batch_size'], 
                                             # shuffle=True,
                                             sampler=sampler,
                                             pin_memory=True,
                                             persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers'])
+                                            num_workers=self.cfg['training_options']['num_workers']-1,
+                                            prefetch_factor=2)
         return dataloader
     
     def val_dataloader(self):
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        sampler = RandomChunkSampler(self.valid_dataset, batch_size=self.cfg['training_options']['batch_size'], chunks=self.valid_dataset.chunks)
         return torch.utils.data.DataLoader(self.valid_dataset, 
                                             batch_size = self.cfg['training_options']['batch_size'], 
                                             # shuffle=True,
                                             sampler=sampler,
                                             pin_memory=True,
                                             persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers'])
+                                            num_workers=self.cfg['training_options']['num_workers']-1,
+                                            prefetch_factor=2)
 
     def test_dataloader(self):
         return torch.utils.data.DataLoader(self.valid_dataset, 
@@ -54,106 +61,84 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
                                             shuffle=False,
                                             pin_memory=True,
                                             persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers'])
+                                            num_workers=self.cfg['training_options']['num_workers']-1,
+                                            prefetch_factor=2)
          
 class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
-    
     def __init__(
         self,
-        files,
-        num_bins,
-        max_time):
+        cache_size=32,
+        reduce_size=-1,
+        resource_path='',
+        paths=[]
+    ):  
+        self.reduce_size, self.cache_size = reduce_size, cache_size
+        self.resource_path = resource_path
 
-        self.files = files
-        self.num_bins = num_bins
-        self.max_time = max_time
-        num_events = []
-        for file in self.files:
-            data = pq.ParquetFile(file)
-            num_events.append(data.metadata.num_rows)
-        num_events = np.array(num_events)
-        self.cumulative_lengths = np.cumsum(num_events)
-        self.dataset_size = self.cumulative_lengths[-1]
+        self.path_dict = {}  # keep track of which folder the files are in
+        self.meta_path_dict = {}  # keep track of which folder the meta files are in
         
-        self.current_file = ''
-        self.current_data = None
+        self.chunks = []
+        self.files = []
+        self.meta_files = []
+        self.paths = paths
         
-        self.current_event = []
+        for path in self.paths:
+            # Get the number of events in each folder
+            base_path = '/' + os.path.join(*path.split('/')[:-1])
+            
+            # Get the file names and meta file names
+            _files = [p.split('/')[-1] for p in sorted(glob.glob(path)) if 'meta' not in p]
+            self.files += _files
+            for f in _files:
+                self.path_dict[f] = base_path
+            
+            # TODO: eliminate the meta_path_dict
+            _meta_files = [p.split('/')[-1] for p in sorted(glob.glob(path + '/*.meta.parquet'))]
+            self.meta_files += _meta_files
+            for mf in _meta_files:
+                self.meta_path_dict[mf] = base_path
+        
+        file_size = 250000
+        self.chunks = np.array([file_size] * len(self.files))
+        self.chunk_cumsum = np.cumsum(self.chunks)
+        self.cache, self.meta_cache = None, None
+        
+        # randomly permute files list
+        self.files = np.random.permutation(self.files)
+        gc.collect()
 
     def __len__(self):
-        return self.dataset_size
+        return (
+            self.chunk_cumsum[-1]
+            if self.reduce_size < 0
+            else int(self.reduce_size * self.chunk_cumsum[-1])
+        )
 
-    def __getitem__(self, i):
-        if i < 0 or i >= self.cumulative_lengths[-1]:
-            raise IndexError("Index out of range")
-        file_index = np.searchsorted(self.cumulative_lengths, i+1)
-        true_idx = i - (self.cumulative_lengths[file_index-1] if file_index > 0 else 0)
-                
-        if self.current_file != self.files[file_index]:
-            self.current_file = self.files[file_index]
-            self.current_data = ak.from_parquet(self.files[file_index])
-            
-        if len(self.current_event) > 0:
-            return torch.from_numpy(self.current_event.pop(0)).float()
-        else:
-            event = self.current_data[true_idx]
-            pos_t = np.array([event.photons.sensor_pos_x.to_numpy(),
-                        event.photons.sensor_pos_y.to_numpy(),
-                        event.photons.sensor_pos_z.to_numpy(),
-                        event.photons.string_id.to_numpy(),
-                        event.photons.sensor_id.to_numpy(),
-                        event.photons.t.to_numpy() - event.photons.t.to_numpy().min()]).T
-            unique_coords_dict = defaultdict(list)
-            for i, coord in enumerate(pos_t[:, :5]):
-                unique_coords_dict[tuple(coord)].append(i)
-            for coord, indices in unique_coords_dict.items():
-                mask = np.zeros(pos_t.shape[0], dtype=bool)
-                mask[indices] = True
-                
-                dom_times = pos_t[:,-1][mask]
-                first_dom_hit = dom_times.min()
-                
-                # bin hits on individual sensors
-                num_bins = self.num_bins
-                max_time = self.max_time
-                bin_edges = np.linspace(0, max_time, num_bins + 1, endpoint=True)
-                
-                dom_times = dom_times - first_dom_hit # shift by first hit time
-                
-                # do not consider hits with time > max_time
-                max_time_mask = (dom_times < max_time)
-                
-                binned_times = np.digitize(dom_times[max_time_mask], bin_edges, right=True)
-                binned_time_counts = np.histogram(binned_times, bins=bin_edges)[0]
-                
-                # put hits with time > max_time in the last bin
-                binned_time_counts[-1] += np.sum(~max_time_mask)
-                self.current_event.append(binned_time_counts.astype(np.int32))
-            return torch.from_numpy(self.current_event.pop(0)).float()
+    def load_data(self, fname):
+        
+        if self.cache is None:
+            self.cache = OrderedDict()
+        if self.meta_cache is None:
+            self.meta_cache = OrderedDict()
+        
+        if fname not in self.cache:
+            df = ak.from_parquet(os.path.join(self.path_dict[fname], fname))
+            self.cache[fname] = df
+            if len(self.cache) > self.cache_size:
+                del self.cache[list(self.cache.keys())[0]]
 
-class ParquetFileSampler(torch.utils.data.Sampler):
-    def __init__(self, data_source, parquet_file_idxs, batch_size):
-       self.data_source = data_source
-       self.parquet_file_idxs = parquet_file_idxs
-       self.batch_size = batch_size
+    def __getitem__(self, idx0):
+        fidx = bisect_right(self.chunk_cumsum, idx0)
+        fname = self.files[fidx]
+        idx = int(idx0 - self.chunk_cumsum[fidx - 1]) if fidx > 0 else idx0        
+        
+        self.load_data(fname)
+        data = self.cache[fname][idx]
+        time_series = data.binned_time_counts.to_numpy()
+        time_series = np.log(time_series + 1)
 
-    def __iter__(self):
-        # Determine the number of batches in each parquet file
-        num_entries_per_file = [end - start for start, end in zip(self.parquet_file_idxs[:-1], self.parquet_file_idxs[1:])]
-      
-        # Create an array of file indices, repeated by the number of entries in each file
-        file_indices = np.repeat(np.arange(len(num_entries_per_file)), num_entries_per_file)
-      
-        # Shuffle the file indices
-        np.random.shuffle(file_indices)
+        return torch.from_numpy(time_series).float()
+        
 
-        for file_index in file_indices:
-            start_idx, end_idx = self.parquet_file_idxs[file_index], self.parquet_file_idxs[file_index + 1]
-            indices = np.random.permutation(np.arange(start_idx, end_idx))
-            
-            # Yield batches of indices ensuring all entries are seen
-            for i in range(0, len(indices), self.batch_size):
-                yield from indices[i:i+self.batch_size].tolist()
-
-    def __len__(self):
-       return len(self.data_source)
+        

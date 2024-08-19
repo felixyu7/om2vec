@@ -58,15 +58,16 @@ if __name__=="__main__":
                     cfg['model_options']['latent_dim'],
                     cfg['model_options']['beta_factor'],
                     cfg['model_options']['beta_peak_epoch'],
+                    cfg['model_options']['positional_encoding'],
                     np.ceil(dataset_size / cfg['training_options']['batch_size']),
                     cfg['training_options']['batch_size'],
                     cfg['training_options']['lr'],
                     cfg['training_options']['lr_schedule'],
                     cfg['training_options']['weight_decay'])
-
+    
     if cfg['training']:
         # initialise the wandb logger and name your wandb project
-        os.environ["WANDB_DIR"] = os.path.abspath("/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/felixyu/nt_vae_projects/wandb")
+        os.environ["WANDB_DIR"] = os.path.abspath("/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/felixyu/nt_vae_projects2/wandb")
         wandb_logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'], log_model='all')
 
         # add your batch size to the wandb config
@@ -85,7 +86,7 @@ if __name__=="__main__":
                             #  overfit_batches=10,
                              gradient_clip_val=0.5,
                              logger=wandb_logger, 
-                             callbacks=[lr_monitor, checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr'])],
+                             callbacks=[lr_monitor, checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr'], annealing_epochs=cfg['training_options']['swa_annealing_epochs'])],
                              num_sanity_val_steps=0)
         trainer.fit(model=net, datamodule=dm)
     else:
