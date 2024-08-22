@@ -56,6 +56,7 @@ if __name__=="__main__":
     else:
         net = NT_VAE(cfg['model_options']['in_features'],
                     cfg['model_options']['latent_dim'],
+                    cfg['model_options']['embed_dim'],
                     cfg['model_options']['beta_factor'],
                     cfg['model_options']['beta_peak_epoch'],
                     cfg['model_options']['positional_encoding'],
@@ -86,7 +87,7 @@ if __name__=="__main__":
                             #  overfit_batches=10,
                              gradient_clip_val=0.5,
                              logger=wandb_logger, 
-                             callbacks=[lr_monitor, checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr'], annealing_epochs=cfg['training_options']['swa_annealing_epochs'])],
+                             callbacks=[checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr'], annealing_epochs=cfg['training_options']['swa_annealing_epochs']), lr_monitor],
                              num_sanity_val_steps=0)
         trainer.fit(model=net, datamodule=dm)
     else:

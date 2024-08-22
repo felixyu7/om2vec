@@ -21,13 +21,13 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         if self.cfg['training']:
             train_files = get_file_names(self.cfg['data_options']['train_data_files'], self.cfg['data_options']['train_data_file_ranges'])
-            self.train_dataset = PrometheusTimeSeriesDataset(cache_size=64,
+            self.train_dataset = PrometheusTimeSeriesDataset(cache_size=32,
                                            reduce_size=-1,
                                            resource_path='/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/GNN/software/src/nunet/resources',
                                            paths=train_files)
             
         valid_files = get_file_names(self.cfg['data_options']['valid_data_files'], self.cfg['data_options']['valid_data_file_ranges'])
-        self.valid_dataset = PrometheusTimeSeriesDataset(cache_size=64,
+        self.valid_dataset = PrometheusTimeSeriesDataset(cache_size=32,
                                         reduce_size=-1,
                                         resource_path='/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/GNN/software/src/nunet/resources',
                                         paths=valid_files)
@@ -123,7 +123,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             self.meta_cache = OrderedDict()
         
         if fname not in self.cache:
-            df = ak.from_parquet(os.path.join(self.path_dict[fname], fname))
+            df = ak.from_parquet(os.path.join(self.path_dict[fname], fname)).binned_time_counts.to_numpy().astype(np.float32)
             self.cache[fname] = df
             if len(self.cache) > self.cache_size:
                 del self.cache[list(self.cache.keys())[0]]
@@ -134,8 +134,8 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         idx = int(idx0 - self.chunk_cumsum[fidx - 1]) if fidx > 0 else idx0        
         
         self.load_data(fname)
-        data = self.cache[fname][idx]
-        time_series = data.binned_time_counts.to_numpy()
+        time_series = self.cache[fname][idx]
+        # time_series = data.binned_time_counts.to_numpy()
         time_series = np.log(time_series + 1)
 
         return torch.from_numpy(time_series).float()

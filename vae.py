@@ -5,12 +5,16 @@ import torch.nn.functional as F
 
 import lightning.pytorch as pl
 
+from scipy.stats import kstest
+from scipy import interpolate
+from scipy.special import rel_entr
 import time
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
                  in_features=5000,
                  latent_dim=128,
+                 embed_dim=32,
                  beta_factor=1e-5,
                  beta_peak_epoch=4,
                  positional_encoding=True,
@@ -22,7 +26,6 @@ class NT_VAE(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         
-        embed_dim = 32
         self.embedding = nn.Linear(1, embed_dim)
         self.initial_downsample = nn.Sequential(nn.Linear(in_features, latent_dim*16),
                                                 nn.LeakyReLU())
@@ -75,6 +78,8 @@ class NT_VAE(pl.LightningModule):
         self.iter = 0
         self.beta_factor = beta_factor
         self.total_steps = dataset_size * beta_peak_epoch
+        
+        self.test_step_results = {'num_hits': [], 'p_values': [], 'kl_div': []}
 
     def encode(self, inputs):
         inputs = self.initial_downsample(inputs)
@@ -166,16 +171,55 @@ class NT_VAE(pl.LightningModule):
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss)
         
-        np.save(f"./results/outputs_{time.time()}.npy", outputs.cpu().detach().numpy())
-        np.save(f"./results/inputs_{time.time()}.npy", inputs.cpu().detach().numpy())
-        import pdb; pdb.set_trace()
+        # np.save(f"./results/outputs_{time.time()}.npy", outputs.cpu().detach().numpy())
+        # np.save(f"./results/inputs_{time.time()}.npy", inputs.cpu().detach().numpy())
+        
+        # chi2 test
+        counts = (torch.exp(inputs) - 1).detach().cpu().numpy().astype(np.float64)
+        pdfs = outputs.detach().cpu().numpy().astype(np.float64)
+        expected_counts = pdfs * counts.sum(axis=-1, keepdims=True)
+        # normalize
+        expected_counts = (expected_counts / expected_counts.sum(axis=-1, keepdims=True)) * counts.sum(axis=-1, keepdims=True)
+        
+        # Perform the kstest
+        p_values = []
+        kl_divs = []
+        num_hits = []
+        for i in range(counts.shape[0]):
+            nonzero_indices = np.nonzero(counts[i].astype(np.int32))[0]
+            time_series = np.repeat(nonzero_indices, counts[i].astype(np.int32)[nonzero_indices])
+            cdf = np.cumsum(pdfs[i])
+            cdf = cdf / cdf[-1]
+            
+            bin_edges = np.arange(0, len(cdf)+1)
+            # Interpolated CDF function
+            cdf_function = interpolate.interp1d(bin_edges[:-1], cdf, 
+                                                bounds_error=False, 
+                                                fill_value=(0.0, 1.0))
+            def custom_cdf(x):
+                return cdf_function(x)
+        
+            res = kstest(time_series, custom_cdf)
+            p_value = res.pvalue
+            
+            counts_prob = counts[i] / np.sum(counts[i])
+            kl_divergence = np.sum(rel_entr(counts_prob, pdfs[i]))
+            p_values.append(p_value)
+            kl_divs.append(kl_divergence)
+            num_hits.append(counts[i].sum())
+            
+        self.test_step_results['p_values'].extend(p_values)
+        self.test_step_results['kl_div'].extend(kl_divs)
+        self.test_step_results['num_hits'].extend(num_hits)
+        
+    def on_test_epoch_end(self):
+        np.save(f"./results/vae_metrics_v2_cascades_{time.time()}.npy", self.test_step_results)
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, self.hparams.lr_schedule, gamma=0.1)
         return [optimizer], [scheduler]
 
-@torch.compile
 class Transformer_VAE_Enc(nn.Module):
     def __init__(self, dim=256,
                  num_heads=8,
@@ -198,8 +242,7 @@ class Transformer_VAE_Enc(nn.Module):
         x = self.downsample(x)
         x = x.permute(0, 2, 1)
         return x
-    
-@torch.compile
+
 class Transformer_VAE_Dec(nn.Module):
     def __init__(self, dim=256,
                  num_heads=8,
