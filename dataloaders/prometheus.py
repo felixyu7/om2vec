@@ -63,7 +63,7 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
                                             persistent_workers=True,
                                             num_workers=self.cfg['training_options']['num_workers']-1,
                                             prefetch_factor=2)
-         
+
 class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -124,6 +124,8 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         
         if fname not in self.cache:
             df = ak.from_parquet(os.path.join(self.path_dict[fname], fname)).binned_time_counts.to_numpy().astype(np.float32)
+            # df = polars.read_parquet(os.path.join(self.path_dict[fname], fname), low_memory=True)['binned_time_counts'].to_numpy()
+            # df = np.vstack(df).astype(np.float32)
             self.cache[fname] = df
             if len(self.cache) > self.cache_size:
                 del self.cache[list(self.cache.keys())[0]]
@@ -131,7 +133,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx0):
         fidx = bisect_right(self.chunk_cumsum, idx0)
         fname = self.files[fidx]
-        idx = int(idx0 - self.chunk_cumsum[fidx - 1]) if fidx > 0 else idx0        
+        idx = int(idx0 - self.chunk_cumsum[fidx - 1]) if fidx > 0 else idx0
         
         self.load_data(fname)
         time_series = self.cache[fname][idx]

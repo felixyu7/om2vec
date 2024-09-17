@@ -178,8 +178,8 @@ class FileCache(torch.utils.data.Dataset):
         pos = self.geometry[sensor_id]
         
         # bin hits on individual sensors
-        num_bins = 4096
-        max_time = 4096 * 3 # 3ns time bins
+        num_bins = 6400
+        max_time = 6400 * 1 # 1ns time bins
         bin_edges = np.linspace(0, max_time, num_bins + 1, endpoint=True)
         
         dom_times = df["time"][0].to_numpy() - min_time # shift by first hit time

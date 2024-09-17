@@ -8,7 +8,10 @@ import lightning.pytorch as pl
 from scipy.stats import kstest
 from scipy import interpolate
 from scipy.special import rel_entr
+from scipy.spatial.distance import jensenshannon
 import time
+
+from utils import nll_poisson_loss, PositionalEmbedding
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -17,8 +20,8 @@ class NT_VAE(pl.LightningModule):
                  embed_dim=32,
                  beta_factor=1e-5,
                  beta_peak_epoch=4,
-                 positional_encoding=True,
-                 dataset_size=98314,
+                 sensor_positional_encoding=True,
+                 dataset_size=-1,
                  batch_size=128,
                  lr=1e-3, 
                  lr_schedule=[2, 20],
@@ -27,59 +30,56 @@ class NT_VAE(pl.LightningModule):
         self.save_hyperparameters()
         
         self.embedding = nn.Linear(1, embed_dim)
-        self.initial_downsample = nn.Sequential(nn.Linear(in_features, latent_dim*16),
+        self.initial_downsample = nn.Sequential(nn.Linear(in_features, 1024),
                                                 nn.LeakyReLU())
         self.encoder = nn.Sequential(Transformer_VAE_Enc(dim=embed_dim,
                                                         num_heads=4,
-                                                        ff_dim=256,
-                                                        seq_len_in=latent_dim*16, 
-                                                        seq_len_out=latent_dim*8),
+                                                        seq_len_in=1024, 
+                                                        seq_len_out=512),
                                      Transformer_VAE_Enc(dim=embed_dim,
                                                         num_heads=4,
-                                                        ff_dim=256,
-                                                        seq_len_in=latent_dim*8, 
-                                                        seq_len_out=latent_dim*4),
+                                                        seq_len_in=512,
+                                                        seq_len_out=256),
                                      Transformer_VAE_Enc(dim=embed_dim,
                                                         num_heads=4,
-                                                        ff_dim=256,
-                                                        seq_len_in=latent_dim*4, 
+                                                        seq_len_in=256, 
                                                         seq_len_out=latent_dim*2)
                                      )
         self.latent_output = nn.Linear(embed_dim, 1)
+        self.fc_mu = nn.Linear(latent_dim*2, latent_dim)
+        self.fc_logvar = nn.Linear(latent_dim*2, latent_dim)
+        
         self.decoder_embedding = nn.Linear(1, embed_dim)
-        
-        self.tgt_embedding = nn.Parameter(torch.randn(latent_dim, embed_dim))
-        
+        self.mem_embedding = nn.Parameter(torch.randn(latent_dim, embed_dim))
         self.decoder = nn.Sequential(Transformer_VAE_Dec(dim=embed_dim,
                                                         num_heads=4,
-                                                        ff_dim=256,
                                                         seq_len_in=latent_dim, 
-                                                        seq_len_out=latent_dim*4),
+                                                        seq_len_out=256),
+                                    Transformer_VAE_Dec(dim=embed_dim,
+                                                        num_heads=4,
+                                                        seq_len_in=256, 
+                                                        seq_len_out=512),
                                      Transformer_VAE_Dec(dim=embed_dim,
                                                         num_heads=4,
-                                                        ff_dim=256,
-                                                        seq_len_in=latent_dim*4, 
-                                                        seq_len_out=latent_dim*16),
+                                                        seq_len_in=512, 
+                                                        seq_len_out=1024),
                                      Transformer_VAE_Dec(dim=embed_dim,
                                                         num_heads=4,
-                                                        ff_dim=256,
-                                                        seq_len_in=latent_dim*16, 
+                                                        seq_len_in=1024, 
                                                         seq_len_out=in_features)
                                      )
         self.output = nn.Linear(embed_dim, 1)
         
-        self.fc_mu = nn.Linear(latent_dim*2, latent_dim)
-        self.fc_logvar = nn.Linear(latent_dim*2, latent_dim)                   
-        
-        if positional_encoding:
-            self.positional_encoding = nn.Linear(3, in_features)
+        if sensor_positional_encoding:
+            self.sensor_positional_encoding = nn.Linear(3, in_features)
         
         self.beta = 0.
+        # self.iter = 0
         self.iter = 0
         self.beta_factor = beta_factor
         self.total_steps = dataset_size * beta_peak_epoch
         
-        self.test_step_results = {'num_hits': [], 'p_values': [], 'kl_div': []}
+        self.test_step_results = {'num_hits': [], 'js_divs': []}
 
     def encode(self, inputs):
         inputs = self.initial_downsample(inputs)
@@ -98,15 +98,15 @@ class NT_VAE(pl.LightningModule):
     
     def decode(self, z):
         z = self.decoder_embedding(z.unsqueeze(-1))
-        tgt = self.tgt_embedding.unsqueeze(0).expand(z.size(0), -1, -1)
+        mem = self.mem_embedding.unsqueeze(0).expand(z.size(0), -1, -1)
         for layer in self.decoder:
-            z = layer(z, tgt)
+            z = layer(z, mem)
         outputs = self.output(z)
         return outputs.squeeze()
     
     def forward(self, inputs, pos=None):
-        if self.hparams.positional_encoding:
-            inputs = inputs + self.positional_encoding(pos)
+        if self.hparams.sensor_positional_encoding:
+            inputs = inputs + self.sensor_positional_encoding(pos)
         mu, logvar = self.encode(inputs)
         z = self.reparameterize(mu, logvar)
         outputs = self.decode(z)
@@ -117,7 +117,7 @@ class NT_VAE(pl.LightningModule):
         return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
     def training_step(self, batch, batch_idx):
-        if self.hparams.positional_encoding:
+        if self.hparams.sensor_positional_encoding:
             inputs, pos = batch
             outputs, mu, logvar = self(inputs, pos)
         else:
@@ -141,7 +141,7 @@ class NT_VAE(pl.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
-        if self.hparams.positional_encoding:
+        if self.hparams.sensor_positional_encoding:
             inputs, pos = batch
             outputs, mu, logvar = self(inputs, pos)
         else:
@@ -160,7 +160,7 @@ class NT_VAE(pl.LightningModule):
         return loss
     
     def test_step(self, batch, batch_idx):
-        if self.hparams.positional_encoding:
+        if self.hparams.sensor_positional_encoding:
             inputs, pos = batch
             outputs, mu, logvar = self(inputs, pos)
         else:
@@ -182,38 +182,19 @@ class NT_VAE(pl.LightningModule):
         expected_counts = (expected_counts / expected_counts.sum(axis=-1, keepdims=True)) * counts.sum(axis=-1, keepdims=True)
         
         # Perform the kstest
-        p_values = []
-        kl_divs = []
+        js_divs = []
         num_hits = []
         for i in range(counts.shape[0]):
-            nonzero_indices = np.nonzero(counts[i].astype(np.int32))[0]
-            time_series = np.repeat(nonzero_indices, counts[i].astype(np.int32)[nonzero_indices])
-            cdf = np.cumsum(pdfs[i])
-            cdf = cdf / cdf[-1]
-            
-            bin_edges = np.arange(0, len(cdf)+1)
-            # Interpolated CDF function
-            cdf_function = interpolate.interp1d(bin_edges[:-1], cdf, 
-                                                bounds_error=False, 
-                                                fill_value=(0.0, 1.0))
-            def custom_cdf(x):
-                return cdf_function(x)
-        
-            res = kstest(time_series, custom_cdf)
-            p_value = res.pvalue
-            
             counts_prob = counts[i] / np.sum(counts[i])
-            kl_divergence = np.sum(rel_entr(counts_prob, pdfs[i]))
-            p_values.append(p_value)
-            kl_divs.append(kl_divergence)
+            js_divergence = jensenshannon(counts_prob, expected_counts[i])
+            js_divs.append(js_divergence)
             num_hits.append(counts[i].sum())
             
-        self.test_step_results['p_values'].extend(p_values)
-        self.test_step_results['kl_div'].extend(kl_divs)
+        self.test_step_results['js_divs'].extend(js_divs)
         self.test_step_results['num_hits'].extend(num_hits)
         
     def on_test_epoch_end(self):
-        np.save(f"./results/vae_metrics_v2_cascades_{time.time()}.npy", self.test_step_results)
+        np.save(f"./results/vae_js_divs_cascades_{time.time()}.npy", self.test_step_results)
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
@@ -265,23 +246,3 @@ class Transformer_VAE_Dec(nn.Module):
         x = self.upsample(x)
         x = x.permute(0, 2, 1)
         return x
-
-@torch.compile
-def nll_poisson_loss(x, x_recon):
-    # x: Actual binned counts (integer values)
-    # x_recon: Reconstructed probability distribution (values between 0 and 1, summing to 1)
-    
-    x = torch.exp(x) - 1
-    
-    # Calculate the rate parameter lambda for each bin
-    N = x.sum(dim=-1, keepdim=True)  # Total count per sample
-    lambda_ = x_recon * N  # Scale probabilities by total count
-    
-    # Poisson log-likelihood
-    log_factorial_x = torch.lgamma(x + 1)  # log(x!)
-    log_likelihood = x * torch.log(lambda_ + 1e-8) - lambda_ - log_factorial_x
-    
-    # Negative log-likelihood
-    nll = -torch.sum(log_likelihood, dim=-1)
-    
-    return nll.mean()  # Mean over all samples in the batch

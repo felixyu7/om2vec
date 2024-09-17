@@ -59,7 +59,7 @@ if __name__=="__main__":
                     cfg['model_options']['embed_dim'],
                     cfg['model_options']['beta_factor'],
                     cfg['model_options']['beta_peak_epoch'],
-                    cfg['model_options']['positional_encoding'],
+                    cfg['model_options']['sensor_positional_encoding'],
                     np.ceil(dataset_size / cfg['training_options']['batch_size']),
                     cfg['training_options']['batch_size'],
                     cfg['training_options']['lr'],
@@ -85,11 +85,15 @@ if __name__=="__main__":
                              max_epochs=cfg['training_options']['epochs'], 
                              log_every_n_steps=1, 
                             #  overfit_batches=10,
-                             gradient_clip_val=0.5,
+                             gradient_clip_val=0.1,
                              logger=wandb_logger, 
-                             callbacks=[checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr'], annealing_epochs=cfg['training_options']['swa_annealing_epochs']), lr_monitor],
+                             callbacks=[checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr']), lr_monitor],
                              num_sanity_val_steps=0)
-        trainer.fit(model=net, datamodule=dm)
+        if cfg['resume_training']:
+            print("Resuming training from checkpoint ", cfg['checkpoint'])
+            trainer.fit(model=net, datamodule=dm, ckpt_path=cfg['checkpoint'])
+        else:
+            trainer.fit(model=net, datamodule=dm)
     else:
         logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'])
         logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
