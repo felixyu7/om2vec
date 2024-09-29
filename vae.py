@@ -5,7 +5,6 @@ import torch.nn.functional as F
 
 import lightning.pytorch as pl
 
-from scipy.spatial.distance import jensenshannon
 import time
 
 from utils import nll_poisson_loss
@@ -71,7 +70,6 @@ class NT_VAE(pl.LightningModule):
             self.sensor_positional_encoding = nn.Linear(3, in_features)
         
         self.beta = 0.
-        # self.iter = 0
         self.iter = 0
         self.beta_factor = beta_factor
         self.total_steps = dataset_size * beta_peak_epoch
@@ -122,7 +120,6 @@ class NT_VAE(pl.LightningModule):
             outputs, mu, logvar = self(inputs)
             
         reconstruction_loss = nll_poisson_loss(inputs, outputs)
-        # reconstruction_loss = F.mse_loss(inputs, outputs)
         kl_loss = self.kl_divergence(mu, logvar)
         
         loss = reconstruction_loss + (self.beta*kl_loss)
@@ -146,7 +143,6 @@ class NT_VAE(pl.LightningModule):
             outputs, mu, logvar = self(inputs)
 
         reconstruction_loss = nll_poisson_loss(inputs, outputs)
-        # reconstruction_loss = F.mse_loss(inputs, outputs)
         kl_loss = self.kl_divergence(mu, logvar)
         
         loss = reconstruction_loss + (self.beta*kl_loss)
@@ -168,30 +164,10 @@ class NT_VAE(pl.LightningModule):
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss)
         
-        # np.save(f"./results/outputs_{time.time()}.npy", outputs.cpu().detach().numpy())
-        # np.save(f"./results/inputs_{time.time()}.npy", inputs.cpu().detach().numpy())
-        
-        # chi2 test
-        counts = (torch.exp(inputs) - 1).detach().cpu().numpy().astype(np.float64)
-        pdfs = outputs.detach().cpu().numpy().astype(np.float64)
-        expected_counts = pdfs * counts.sum(axis=-1, keepdims=True)
-        # normalize
-        expected_counts = (expected_counts / expected_counts.sum(axis=-1, keepdims=True)) * counts.sum(axis=-1, keepdims=True)
-        
-        # Perform the kstest
-        js_divs = []
-        num_hits = []
-        for i in range(counts.shape[0]):
-            counts_prob = counts[i] / np.sum(counts[i])
-            js_divergence = jensenshannon(counts_prob, expected_counts[i])
-            js_divs.append(js_divergence)
-            num_hits.append(counts[i].sum())
-            
-        self.test_step_results['js_divs'].extend(js_divs)
-        self.test_step_results['num_hits'].extend(num_hits)
-        
-    def on_test_epoch_end(self):
-        np.save(f"./results/vae_js_divs_cascades_{time.time()}.npy", self.test_step_results)
+        self.log("test_loss", loss, batch_size=self.hparams.batch_size)
+        self.log("test_kl_loss", kl_loss, batch_size=self.hparams.batch_size)
+        self.log("test_reco_loss", reconstruction_loss, batch_size=self.hparams.batch_size)
+        return loss
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)

@@ -34,7 +34,7 @@ def main(input_path, output_path, checkpoint_path, chunk_size=5000, max_time=640
                 ts
             ]).T
             
-            # 8 unique DOMs cut
+            # 8 unique OMs cut, adjustable as needed
             if np.unique(pos_t[:, :2], axis=0).shape[0] < 8:
                 continue
             
@@ -70,6 +70,7 @@ def main(input_path, output_path, checkpoint_path, chunk_size=5000, max_time=640
                 # put hits with time > max_time in the last bin
                 binned_time_counts[-1] += np.sum(~max_time_mask)
                 event_binned_time_counts.append(binned_time_counts)
+                
             event_binned_time_counts = np.array(event_binned_time_counts)
             event_binned_time_counts = torch.from_numpy(event_binned_time_counts).float().to(device)
             inputs = torch.log(event_binned_time_counts + 1)
@@ -82,10 +83,10 @@ def main(input_path, output_path, checkpoint_path, chunk_size=5000, max_time=640
             res['photons'].append(event.photons)
             res['latents'].append(latents)
             if len(res['mc_truth']) >= chunk_size:
-                ak.to_parquet(ak.Array(res), os.path.join(output_path, f"chunk_round1_{chunk_iter}.parquet"))
+                ak.to_parquet(ak.Array(res), os.path.join(output_path, f"chunk_{chunk_iter}.parquet"))
                 chunk_iter += 1
                 res = {'mc_truth': [], 'photons': [], 'latents': []}
-    ak.to_parquet(ak.Array(res), os.path.join(output_path, f"chunk_round1_{chunk_iter}.parquet"))
+    ak.to_parquet(ak.Array(res), os.path.join(output_path, f"chunk_{chunk_iter}.parquet"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process events stored in Parquet files into latent space.')
