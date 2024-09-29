@@ -1,5 +1,4 @@
 # om2vec
-A neutrino telescope event encoder using transformer-based VAEs
 
 ## Overview
 
