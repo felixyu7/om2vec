@@ -1,18 +1,11 @@
-import argparse
-import os
+import argparse, os, glob
 import awkward as ak
 
 import torch
 import numpy as np
 from vae import NT_VAE
 
-import time
-import glob
-from collections import defaultdict
-
-import gc
-
-def main(input_path, output_path, checkpoint_path, chunk_size=5000):
+def main(input_path, output_path, checkpoint_path, chunk_size=5000, max_time=6400, num_bins=6400):
     model = NT_VAE.load_from_checkpoint(checkpoint_path)
     model = model.eval()
     
@@ -24,10 +17,9 @@ def main(input_path, output_path, checkpoint_path, chunk_size=5000):
     model = model.to(device)
     files = sorted(glob.glob(os.path.join(input_path, "*.parquet")))
     chunk_iter = 0
-    max_time = 6400
-    num_bins = 6400
     res = {'mc_truth': [], 'photons': [], 'latents': []}
     for file in files:
+        print(f"Processing {file}")
         data = ak.from_parquet(file)
         for event in data:
             if len(event.photons.t) == 0:
@@ -78,11 +70,13 @@ def main(input_path, output_path, checkpoint_path, chunk_size=5000):
                 # put hits with time > max_time in the last bin
                 binned_time_counts[-1] += np.sum(~max_time_mask)
                 event_binned_time_counts.append(binned_time_counts)
-            event_binned_time_counts = torch.tensor(event_binned_time_counts).float().to(device)
+            event_binned_time_counts = np.array(event_binned_time_counts)
+            event_binned_time_counts = torch.from_numpy(event_binned_time_counts).float().to(device)
             inputs = torch.log(event_binned_time_counts + 1)
             latents, _ = model.encode(inputs)
             
-            unique_coords_list = torch.tensor(unique_coords_list).float().to(device)
+            unique_coords_list = np.array(unique_coords_list)
+            unique_coords_list = torch.from_numpy(unique_coords_list).float().to(device)
             latents = torch.hstack((unique_coords_list, latents)).cpu().detach().numpy()
             res['mc_truth'].append(event.mc_truth)
             res['photons'].append(event.photons)
@@ -98,6 +92,9 @@ if __name__ == "__main__":
     parser.add_argument('--input_dir', type=str, help='Path to the input Parquet files.')
     parser.add_argument('--output_dir', type=str, help='Path to save the output Parquet files.')
     parser.add_argument('--ckpt', type=str, help='Model checkpoint path.')
+    parser.add_argument('--chunk_size', type=int, default=5000, help='Number of events to process at once.')
+    parser.add_argument('--max_time', type=int, default=6400, help='Maximum time value.')
+    parser.add_argument('--num_bins', type=int, default=6400, help='Number of bins for time histogram')
 
     args = parser.parse_args()
     main(args.input_dir, args.output_dir, args.ckpt)

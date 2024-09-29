@@ -5,13 +5,10 @@ import torch.nn.functional as F
 
 import lightning.pytorch as pl
 
-from scipy.stats import kstest
-from scipy import interpolate
-from scipy.special import rel_entr
 from scipy.spatial.distance import jensenshannon
 import time
 
-from utils import nll_poisson_loss, PositionalEmbedding
+from utils import nll_poisson_loss
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,

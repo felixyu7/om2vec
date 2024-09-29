@@ -1,9 +1,8 @@
 import torch
 import numpy as np
 import lightning.pytorch as pl
-import wandb
 import os
-from lightning.pytorch.loggers import WandbLogger, CSVLogger
+from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, StochasticWeightAveraging
 
 from vae import NT_VAE
@@ -36,9 +35,6 @@ if __name__=="__main__":
     if cfg['dataloader'] == 'prometheus':
         from dataloaders.prometheus import PrometheusTimeSeriesDataModule
         dm = PrometheusTimeSeriesDataModule(cfg)
-    elif cfg['dataloader'] == 'icecube':
-        from dataloaders.icecube_parquet import ICTimeSeriesDataModule
-        dm = ICTimeSeriesDataModule(cfg)
     else:
         print("Unknown dataloader!")
         exit()
@@ -68,7 +64,7 @@ if __name__=="__main__":
     
     if cfg['training']:
         # initialise the wandb logger and name your wandb project
-        os.environ["WANDB_DIR"] = os.path.abspath("/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/felixyu/nt_vae_projects2/wandb")
+        os.environ["WANDB_DIR"] = os.path.abspath(cfg['project_save_dir'])
         wandb_logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'], log_model='all')
 
         # add your batch size to the wandb config
