@@ -23,6 +23,16 @@ om2vec/
 └── vae.py
 ```
 
+## Requirements
+
+- PyTorch
+- PyTorch Lightning
+- NumPy
+- Awkward Arrays
+- yaml
+
+You can install the requirements by running `pip install -r requirements.txt`.
+
 ## Pre-trained checkpoints
 
 Download pre-trained checkpoints here:
@@ -35,7 +45,7 @@ You can convert your existing Prometheus Parquet data files into om2vec latents 
 
 Provide the path to the directory containing the Prometheus datasets, the path to the output directory, and the path to the model checkpoint (you can train your own or use the provided pre-trained checkpoints above), like so
 
-'python convert_to_latents.py --input_dir /PATH_TO_PROMETHEUS_DATASETS/ --output_dir /PATH_TO_OUTPUT_DIR/ --ckpt /PATH_TO_CHECKPOINT/'
+`python convert_to_latents.py --input_dir /PATH_TO_PROMETHEUS_DATASETS/ --output_dir /PATH_TO_OUTPUT_DIR/ --ckpt /PATH_TO_CHECKPOINT/`
 
 Additional optional arguments to the script are detailed below:
 
@@ -43,11 +53,13 @@ Additional optional arguments to the script are detailed below:
 - `max_time`: maximum time (in ns) when binning the hits from Prometheus (default: 6400)
 - `num_bins`: number of bins to use when binning the hits from Prometheus (default: 6400)
 
-IMPORTANT NOTE: `max_time` and `num_bins` should match with what the model checkpoint was trained with (pre-trained checkpoints are trained with the default values of 6400)
+**IMPORTANT NOTE**: `max_time` and `num_bins` should match with what the model checkpoint was trained with (pre-trained checkpoints are trained with the default values of 6400)
+
+
 
 ### Training
 
 #### Pre-process Prometheus events
 
-
+#### Configuration
 
