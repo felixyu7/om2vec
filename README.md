@@ -16,6 +16,7 @@ om2vec/
 │   └── prometheus.py
 ├── LICENSE
 ├── README.md
+├── requirements.txt
 ├── run.py
 ├── scripts/
 │   └── preprocess_prometheus.py
