@@ -2,4 +2,4 @@ torch
 pytorch-lightning
 numpy
 awkward
-pyyaml
+yaml
