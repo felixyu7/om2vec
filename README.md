@@ -85,7 +85,7 @@ Each latent representation of an OM contains [string_id, sensor_id, latents...].
 
 Use `run.py` and a configuration file to run training and/or inference.
 
-`python run.py -c ./configs/train_prometheus.cfg`
+`python run.py -c ./configs/example.cfg`
 
 #### Pre-process Prometheus events
 
