@@ -49,7 +49,6 @@ Provide the path to the directory containing the Prometheus datasets, the path t
 `python convert_to_latents.py --input_dir /PATH_TO_PROMETHEUS_DATASETS/ --output_dir /PATH_TO_OUTPUT_DIR/ --ckpt /PATH_TO_CHECKPOINT/`
 
 Additional optional arguments to the script are detailed below:
-
 - `chunk_size`: number of events per Parquet file in the output (default: 5000)
 - `max_time`: maximum time (in ns) when binning the hits from Prometheus (default: 6400)
 - `num_bins`: number of bins to use when binning the hits from Prometheus (default: 6400)
@@ -86,7 +85,34 @@ Each latent representation of an OM contains [string_id, sensor_id, latents...].
 
 Use `run.py` and a configuration file to run training and/or inference.
 
+`python run.py -c ./configs/train_prometheus.cfg`
+
 #### Pre-process Prometheus events
+
+Before training, you will need to pre-process events from raw Prometheus output. See `scripts/preprocess_prometheus.py`. This script will generate Parquet files of individual binned OM timing distributions from Prometheus events. You need to provide an `input_dir` containing the Prometheus parquet files and an `output_dir`.
+
+`python scripts/preprocess_prometheus.py --input_dir /PATH_TO_PROMETHEUS_DATASETS/ --output_dir /PATH_TO_OUTPUT_DIR/`
+
+You can also provide the following optional arguments:
+- `chunk_size`: Number of individual binned OM timing distributions per file (Default: 250000)
+- `max_time`: maximum time (in ns) when binning the hits from Prometheus (default: 6400)
+- `num_bins`: number of bins to use when binning the hits from Prometheus (default: 6400)
 
 #### Configuration
 
+We provide an example configuration file in `configs/example.cfg`. See details on the options below:
+- `accelerator`: type of PyTorch Lightning accelerator to use (e.g. 'gpu')
+- `num_devices`: number of devices to deploy model on
+- `training`: boolean for training mode. Use `False` to run in test/inference mode.
+- `dataloader`: type of dataloader to use. Implemented dataloaders: 'prometheus'
+- `checkpoint`: path to checkpoint file if loading model from checkpoint
+- `resume_training`: Set to `True` if loading from a checkpoint and resuming training
+- `project_name`: wandb project name
+- `project_save_dir`: wandb project save directory
+- `model_options`: arguments to be passed into the om2vec network initialization
+- `data_options.train_data_files`: list of paths to directories containing the training data (pre-processed)
+- `data_options.train_data_file_ranges`: list of ranges ([x, y]) indicating which/how many files in each directory to use. must be same length as `train_data_files`
+- `data_options.valid_data_files`: list of paths to directories containing the validation data (pre-processed)
+- `data_options.valid_data_file_ranges`: list of ranges ([x, y]) indicating which/how many files in each directory to use. must be same length as `valid_data_files`
+- `data_options.file_chunk_size`: number of timing distributions per file. set to same as `chunk_size` during pre-processing
+- `training_options`: various training hyperparameters
