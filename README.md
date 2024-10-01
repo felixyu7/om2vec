@@ -36,7 +36,7 @@ You can install the requirements by running `pip install -r requirements.txt`.
 
 ## Pre-trained checkpoints
 
-Download pre-trained checkpoints here:
+Download pre-trained checkpoints here: [Google Drive](https://drive.google.com/drive/folders/1xSpbDQEmTRJ45xJNLwFkJnQAjgkjs4aB?usp=sharing)
 
 ## Usage
 
