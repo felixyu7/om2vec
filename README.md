@@ -9,7 +9,7 @@ This repo contains an implementation of om2vec as described in the paper [ARXIV 
 ```
 om2vec/
 ├── configs/
-│   └── train_prometheus.cfg
+│   └── example.cfg
 ├── convert_to_latents.py
 ├── dataloaders/
 │   ├── data_utils.py
