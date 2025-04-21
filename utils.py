@@ -1,6 +1,6 @@
 import torch
 
-@torch.compile
+# @torch.compile # Removed for broader compatibility (requires torch>=2.0)
 def nll_poisson_loss(x, x_recon, reduction='mean'):
     # x: Actual binned counts (integer values)
     # x_recon: Reconstructed probability distribution (values between 0 and 1, summing to 1)
