@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
 
-from ..utils import nll_poisson_loss
+from utils import nll_poisson_loss
 
 class FCAE(pl.LightningModule):
     """Fully Connected Autoencoder (AE) / Variational Autoencoder (VAE).

@@ -7,7 +7,7 @@ import lightning.pytorch as pl
 
 import time
 
-from ..utils import nll_poisson_loss # Relative import
+from utils import nll_poisson_loss # Relative import
 
 class TransformerAE(pl.LightningModule): # Renamed class
     """Transformer Autoencoder (AE) / Variational Autoencoder (VAE).

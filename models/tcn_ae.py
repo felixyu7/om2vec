@@ -5,7 +5,7 @@ from torch.nn.utils import weight_norm
 import lightning.pytorch as pl
 import numpy as np
 
-from ..utils import nll_poisson_loss # Using Poisson NLL for consistency
+from utils import nll_poisson_loss # Using Poisson NLL for consistency
 
 # ────────────────────────────
 #  Causal‑TCN building blocks (Moved from tcn_ae.py)
