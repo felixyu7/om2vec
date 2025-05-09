@@ -13,43 +13,9 @@ import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# nflows imports for CNF Decoder
-from nflows.flows.base import Flow
-from nflows.distributions.normal import StandardNormal
-from nflows.transforms.base import CompositeTransform
-from nflows.transforms.splines.rational_quadratic import rational_quadratic_spline
-from nflows.transforms.coupling import PiecewiseRationalQuadraticCouplingTransform
-from nflows.utils import torchutils
-
 # Now this import should work when script is run directly
 from utils.om_processing import calculate_summary_statistics, preprocess_photon_sequence, sinusoidal_positional_encoding
-
-# Helper module for nflows transform_net
-class ContextualNet(nn.Module):
-    def __init__(self, in_features, context_features, hidden_dims, out_features):
-        super().__init__()
-        self.in_features = in_features
-        self.context_features = context_features
-        
-        layers = []
-        current_dim = in_features + context_features
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.GELU())
-            current_dim = hidden_dim
-        
-        final_linear_layer = nn.Linear(current_dim, out_features)
-        # Initialize weights of the final layer to be small and bias to zero
-        nn.init.uniform_(final_linear_layer.weight, -1e-3, 1e-3)
-        nn.init.zeros_(final_linear_layer.bias)
-        layers.append(final_linear_layer)
-        # Removing Tanh as small weight init should be more direct for nflows
-        # layers.append(nn.Tanh())
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, inputs, context):
-        combined_input = torch.cat((inputs, context), dim=-1)
-        return self.mlp(combined_input)
+from models.flows import NeuralSplineFlow # Import our custom NSF
 
 class FiLMLayer(nn.Module):
     """
@@ -167,35 +133,13 @@ class Om2vecModel(pl.LightningModule):
         # self.cnf_conditions_on_sensor_pos is no longer used as CNF does not condition on sensor position.
         # The cnf_context_dim is solely based on z_summary and z_learned.
 
-        # Define the CNF transformations
-        transforms = []
-        for _ in range(self.model_cfg.get('cnf_num_layers', 5)):
-            transforms.append(PiecewiseRationalQuadraticCouplingTransform(
-                mask=torch.ones(self.model_cfg.get('cnf_base_dist_dim', 1)), # For 1D time data
-                transform_net_create_fn=(
-                    lambda in_features, out_features: ContextualNet(
-                        in_features=in_features, # This will be features_to_transform (e.g., 0 if mask is all ones for 1D)
-                        context_features=self.cnf_context_dim,
-                        hidden_dims=self.model_cfg.get('cnf_hidden_dims_hypernet', [128, 128]),
-                        out_features=out_features
-                    )
-                ),
-                num_bins=self.model_cfg.get('cnf_num_bins_spline', 10),
-                tails='linear', # Default, can be configured
-                tail_bound=self.model_cfg.get('cnf_spline_tail_bound', 5.0)
-            ))
-            # Could add permutations here if cnf_base_dist_dim > 1, e.g., nflows.transforms.permutations.RandomPermutation
-        
-        # Base distribution for the flow (e.g., standard normal for time)
-        base_distribution = StandardNormal(shape=[self.model_cfg.get('cnf_base_dist_dim', 1)])
-        
-        # Combine transformations into a composite transform
-        cnf_transform = CompositeTransform(transforms)
-        
-        # Create the flow object
-        self.cnf_decoder = Flow(
-            transform=cnf_transform,
-            distribution=base_distribution
+        # Instantiate our custom NeuralSplineFlow
+        self.cnf_decoder = NeuralSplineFlow(
+            input_dim=self.model_cfg.get('cnf_base_dist_dim', 1),
+            context_dim=self.cnf_context_dim,
+            num_layers=self.model_cfg.get('cnf_num_layers', 5),
+            num_bins=self.model_cfg.get('cnf_num_bins_spline', 10),
+            hidden_dims_hypernet=self.model_cfg.get('cnf_hidden_dims_hypernet', [128, 128])
         )
 
         # KL Annealing factor
@@ -290,7 +234,8 @@ class Om2vecModel(pl.LightningModule):
             all_valid_photon_contexts_cat = torch.cat(all_valid_photon_contexts_list, dim=0) # Shape: (Total_valid_photons, context_dim)
             
             # Normalize target times for CNF: t_norm = log(t_raw + offset)
-            norm_target_times_cat = torch.log(all_valid_photon_times_cat.clamp(min=0) + 1)
+            tq_log_norm_offset = self.data_cfg.get('tq_log_norm_offset', 1.0)
+            norm_target_times_cat = torch.log(all_valid_photon_times_cat.clamp(min=0) + tq_log_norm_offset)
 
             log_probs_norm_times = self.cnf_decoder.log_prob(
                 inputs=norm_target_times_cat, # CNF sees normalized times
@@ -303,7 +248,7 @@ class Om2vecModel(pl.LightningModule):
             # No, it's -log(t_raw + offset_for_jacobian_correction).
             # The derivative dt_norm/dt_raw = 1 / (t_raw + offset). So log_abs_det_jacobian = -log(t_raw + offset).
             # We must use the same offset for this correction as used in the transformation.
-            log_abs_det_jacobian = -torch.log(all_valid_photon_times_cat.clamp(min=0) + 1).squeeze(-1) # Squeeze from (N,1) to (N,)
+            log_abs_det_jacobian = -torch.log(all_valid_photon_times_cat.clamp(min=0) + tq_log_norm_offset).squeeze(-1) # Squeeze from (N,1) to (N,)
 
             # Corrected log probability for raw times
             log_probs_photons_corrected = log_probs_norm_times + log_abs_det_jacobian
