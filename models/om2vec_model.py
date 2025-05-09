@@ -286,16 +286,29 @@ class Om2vecModel(pl.LightningModule):
         if not all_valid_photon_times_list:
             total_reconstruction_log_prob = torch.tensor(0.0, device=device)
         else:
-            all_valid_photon_times_cat = torch.cat(all_valid_photon_times_list, dim=0)
-            all_valid_photon_contexts_cat = torch.cat(all_valid_photon_contexts_list, dim=0)
+            all_valid_photon_times_cat = torch.cat(all_valid_photon_times_list, dim=0) # Shape: (Total_valid_photons, 1)
+            all_valid_photon_contexts_cat = torch.cat(all_valid_photon_contexts_list, dim=0) # Shape: (Total_valid_photons, context_dim)
             
-            log_probs_photons = self.cnf_decoder.log_prob(
-                inputs=all_valid_photon_times_cat,
-                context=all_valid_photon_contexts_cat
-            )
-            total_reconstruction_log_prob = torch.sum(log_probs_photons)
+            # Normalize target times for CNF: t_norm = log(t_raw + offset)
+            norm_target_times_cat = torch.log(all_valid_photon_times_cat.clamp(min=0) + 1)
 
-        import pdb; pdb.set_trace()
+            log_probs_norm_times = self.cnf_decoder.log_prob(
+                inputs=norm_target_times_cat, # CNF sees normalized times
+                context=all_valid_photon_contexts_cat
+            ) # Shape: (Total_valid_photons,)
+
+            # Jacobian correction for the transformation t_norm = log(t_raw + offset)
+            # log P(t_raw|z) = log P(t_norm|z) - log(t_raw + offset)
+            # The subtraction term is -log(t_raw + offset), which is -norm_target_times_cat (if offset is same as used for norm_target_times_cat)
+            # No, it's -log(t_raw + offset_for_jacobian_correction).
+            # The derivative dt_norm/dt_raw = 1 / (t_raw + offset). So log_abs_det_jacobian = -log(t_raw + offset).
+            # We must use the same offset for this correction as used in the transformation.
+            log_abs_det_jacobian = -torch.log(all_valid_photon_times_cat.clamp(min=0) + 1).squeeze(-1) # Squeeze from (N,1) to (N,)
+
+            # Corrected log probability for raw times
+            log_probs_photons_corrected = log_probs_norm_times + log_abs_det_jacobian
+            
+            total_reconstruction_log_prob = torch.sum(log_probs_photons_corrected)
 
         return {
             "reconstruction_log_prob": total_reconstruction_log_prob,
@@ -497,24 +510,32 @@ class Om2vecModel(pl.LightningModule):
                 raise ValueError("times_to_evaluate has incorrect shape.")
 
         # 4. Calculate log P(t | context) using CNF
-        log_pdf_values_flat = self.cnf_decoder.log_prob(
-            inputs=eval_times_flat,
+        # eval_times_flat contains raw times. Normalize them before passing to CNF.
+        tq_log_norm_offset = self.data_cfg.get('tq_log_norm_offset', 1.0)
+        norm_eval_times_flat = torch.log(eval_times_flat.clamp(min=0) + tq_log_norm_offset)
+
+        log_pdf_norm_times_flat = self.cnf_decoder.log_prob(
+            inputs=norm_eval_times_flat, # CNF sees normalized times
             context=contexts_flat
         ) # (N_oms * num_eval_points,)
 
-        log_pdf_values = log_pdf_values_flat.view(output_eval_times_shape) # Reshape to (N_oms, num_eval_points)
+        # Jacobian correction
+        log_abs_det_jacobian_decode = -torch.log(eval_times_flat.clamp(min=0) + tq_log_norm_offset).squeeze(-1) # Squeeze from (N,1) to (N,)
+        
+        log_pdf_values_corrected_flat = log_pdf_norm_times_flat + log_abs_det_jacobian_decode
+        
+        log_pdf_values = log_pdf_values_corrected_flat.view(output_eval_times_shape) # Reshape to (N_oms, num_eval_points)
         
         # Prepare original eval_times in the (N_oms, num_eval_points) shape for returning
+        # This part remains the same as it's about the shape of the `eval_times` being returned, not their values fed to CNF.
         if times_to_evaluate is None:
-             # This was generated per OM and then flattened, so reconstruct
             eval_times_per_om = torch.linspace(time_range[0], time_range[1], num_time_bins, device=device)
             final_eval_times = eval_times_per_om.unsqueeze(0).expand(N_oms, -1)
         elif times_to_evaluate.ndim == 1:
             final_eval_times = times_to_evaluate.unsqueeze(0).expand(N_oms, -1)
         else: # times_to_evaluate.ndim == 2
             final_eval_times = times_to_evaluate
-
-
+            
         return final_eval_times, log_pdf_values
 
     def _shared_step(self, batch: dict, batch_idx: int, stage: str):
