@@ -6,8 +6,10 @@ from importlib import import_module
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger, CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+import torch
 
 def main(cfg_path):
+    torch.set_float32_matmul_precision('medium')
     # Add project root to sys.path to allow for internal imports
     project_root = os.path.dirname(os.path.abspath(__file__))
     if project_root not in sys.path:
@@ -106,7 +108,7 @@ def main(cfg_path):
             'logger': logger,
             'callbacks': callbacks,
             'log_every_n_steps': 1,
-            'deterministic': cfg.get('seed') is not None # Ensure deterministic behavior if seed is set
+            'overfit_batches': 1
         }
         
         # Add gradient clipping if specified

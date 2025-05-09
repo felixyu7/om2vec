@@ -23,33 +23,33 @@ data_options:
 
 model_options:
   # VAE-Transformer Encoder
-  input_embedding_dim: 64
-  transformer_hidden_dim: 256
+  input_embedding_dim: 128
+  transformer_hidden_dim: 512
   transformer_num_heads: 8
-  transformer_num_layers: 6
+  transformer_num_layers: 8
   transformer_dropout: 0.1
+  transformer_norm_first: true
   pooling_strategy: "mean" # "cls" or "mean"
-  latent_learned_dim: 16   # Dimensionality of z_learned (total z_dim = 9 summary_stats + latent_learned_dim)
+  latent_learned_dim: 23   # Dimensionality of z_learned (total z_dim = 9 summary_stats + latent_learned_dim)
   # Sensor position integration
-  sensor_pos_embedding_dim: 32 # If sensor_pos is embedded before use in Transformer/CNF
+  sensor_pos_embedding_dim: 64 # If sensor_pos is embedded before use in Transformer/CNF
   sensor_integration_type: "film" # Options: "film", "cross_attention", "concat_to_transformer_input", "decoder_only", "none"
 
   # CNF Decoder (using nflows)
-  cnf_condition_on_sensor_pos: false # CNF will not condition on sensor position
   cnf_base_dist_dim: 1 # Univariate time t
-  cnf_num_layers: 5    # Number of NSF layers
-  cnf_hidden_dims_hypernet: [128, 128] # For hypernetwork generating spline params for nflows
+  cnf_num_layers: 8    # Number of NSF layers
+  cnf_hidden_dims_hypernet: [256, 256] # For hypernetwork generating spline params for nflows
   cnf_num_bins_spline: 10 # Number of bins for rational quadratic splines in nflows
   # cnf_context_dim will be dynamically calculated in the model:
   # latent_learned_dim + 9 (summary_stats) + (sensor_pos_embedding_dim if used for CNF conditioning)
 
 training_options:
-  batch_size: 32 # Number of events per batch
-  lr: 0.0001
-  lr_schedule_t_max: 500 # For CosineAnnealingLR (e.g., total epochs)
-  lr_schedule_eta_min: 0.000001 # Target LR for CosineAnnealingLR
+  batch_size: 16 # Number of events per batch
+  lr: 0.001
+  lr_schedule_t_max: 1000 # For CosineAnnealingLR (e.g., total epochs)
+  lr_schedule_eta_min: 0.001 # Target LR for CosineAnnealingLR
   weight_decay: 0.01
-  epochs: 500
+  epochs: 1000
   save_epochs: 1 # Save checkpoint every N epochs
   num_workers: 4  # Dataloader workers
   precision: "bf16-mixed" # "32-true", "16-mixed", "bf16-mixed"
@@ -59,5 +59,5 @@ training_options:
   # KL Annealing for VAE
   kl_beta_initial_value: 0.0
   kl_beta_final_value: 1.0
-  kl_anneal_epochs: 50 # Number of epochs to reach kl_beta_final_value from initial_value
+  kl_anneal_epochs: 500 # Number of epochs to reach kl_beta_final_value from initial_value
   kl_anneal_schedule: "linear" # "linear", "cosine" (initially linear)

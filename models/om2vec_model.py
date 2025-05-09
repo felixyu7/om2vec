@@ -35,7 +35,7 @@ class ContextualNet(nn.Module):
         current_dim = in_features + context_features
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.ReLU())
+            layers.append(nn.GELU())
             current_dim = hidden_dim
         
         final_linear_layer = nn.Linear(current_dim, out_features)
@@ -140,7 +140,7 @@ class Om2vecModel(pl.LightningModule):
             nhead=self.model_cfg['transformer_num_heads'],
             dim_feedforward=self.model_cfg.get('transformer_feedforward_dim', transformer_feature_dim * 4), # Often 4*d_model
             dropout=self.model_cfg['transformer_dropout'],
-            activation=self.model_cfg.get('transformer_activation', 'relu'), # 'relu' or 'gelu'
+            activation=self.model_cfg.get('transformer_activation', 'gelu'), # 'relu' or 'gelu'
             batch_first=True,
             norm_first=self.model_cfg.get('transformer_norm_first', False)
         )
@@ -190,11 +190,11 @@ class Om2vecModel(pl.LightningModule):
         base_distribution = StandardNormal(shape=[self.model_cfg.get('cnf_base_dist_dim', 1)])
         
         # Combine transformations into a composite transform
-        self.cnf_transform = CompositeTransform(transforms)
+        cnf_transform = CompositeTransform(transforms)
         
         # Create the flow object
         self.cnf_decoder = Flow(
-            transform=self.cnf_transform,
+            transform=cnf_transform,
             distribution=base_distribution
         )
 
@@ -563,17 +563,17 @@ class Om2vecModel(pl.LightningModule):
 
         # Logging
         batch_size_events = batch['all_om_hits'].shape[0] # Number of events in the batch
-        self.log(f'{stage}/loss', loss, on_step=(stage=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size_events)
-        self.log(f'{stage}/recon_log_prob_avg_per_om', avg_reconstruction_log_prob, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
-        self.log(f'{stage}/kl_div_avg_per_om', avg_kl_divergence, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
-        self.log(f'{stage}/num_valid_oms_total', float(num_valid_oms), on_step=False, on_epoch=True, logger=True, batch_size=batch_size_events) # Total valid OMs in batch
+        self.log(f'{stage}_loss', loss, on_step=(stage=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}_recon_log_prob_avg_per_om', avg_reconstruction_log_prob, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}_kl_div_avg_per_om', avg_kl_divergence, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}_num_valid_oms_total', float(num_valid_oms), on_step=False, on_epoch=True, logger=True, batch_size=batch_size_events) # Total valid OMs in batch
         
         # Log average number of valid OMs per event in the batch
         avg_valid_oms_per_event = float(num_valid_oms) / batch_size_events if batch_size_events > 0 else 0
-        self.log(f'{stage}/num_valid_oms_avg_per_event', avg_valid_oms_per_event, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}_num_valid_oms_avg_per_event', avg_valid_oms_per_event, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
 
         if stage == 'train':
-           self.log('hyperparameters/kl_beta', self.current_kl_beta, on_step=False, on_epoch=True, logger=True)
+           self.log('kl_beta', self.current_kl_beta, on_step=False, on_epoch=True, logger=True)
         
         return loss
 
