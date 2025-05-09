@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Now this import should work when script is run directly
 from utils.om_processing import calculate_summary_statistics, preprocess_photon_sequence, sinusoidal_positional_encoding
-from models.flows import NeuralSplineFlow # Import our custom NSF
+from models.flows import Glow1D # Import Glow1D
 
 class FiLMLayer(nn.Module):
     """
@@ -133,13 +133,13 @@ class Om2vecModel(pl.LightningModule):
         # self.cnf_conditions_on_sensor_pos is no longer used as CNF does not condition on sensor position.
         # The cnf_context_dim is solely based on z_summary and z_learned.
 
-        # Instantiate our custom NeuralSplineFlow
-        self.cnf_decoder = NeuralSplineFlow(
+        # Instantiate Glow1D
+        self.cnf_decoder = Glow1D(
             input_dim=self.model_cfg.get('cnf_base_dist_dim', 1),
             context_dim=self.cnf_context_dim,
-            num_layers=self.model_cfg.get('cnf_num_layers', 5),
-            num_bins=self.model_cfg.get('cnf_num_bins_spline', 10),
-            hidden_dims_hypernet=self.model_cfg.get('cnf_hidden_dims_hypernet', [128, 128])
+            num_steps=self.model_cfg.get('cnf_num_layers', 5), # Renamed cnf_num_layers to num_steps for Glow
+            hidden_dims_s_t_net=self.model_cfg.get('cnf_hidden_dims_hypernet', [128, 128]),
+            # activation_s_t_net can be added to config if needed, defaults to "relu" in Glow1D
         )
 
         # KL Annealing factor

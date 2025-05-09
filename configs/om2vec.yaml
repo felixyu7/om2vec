@@ -38,8 +38,8 @@ model_options:
   # CNF Decoder (using nflows)
   cnf_base_dist_dim: 1 # Univariate time t
   cnf_num_layers: 8    # Number of NSF layers
-  cnf_hidden_dims_hypernet: [256, 256] # For hypernetwork generating spline params for nflows
-  cnf_num_bins_spline: 10 # Number of bins for rational quadratic splines in nflows
+  cnf_hidden_dims_hypernet: [256, 256] # For hypernetwork generating s and t in Glow
+  # cnf_num_bins_spline: 10 # Number of bins for rational quadratic splines in nflows (REMOVED FOR GLOW)
   # cnf_context_dim will be dynamically calculated in the model:
   # latent_learned_dim + 9 (summary_stats) + (sensor_pos_embedding_dim if used for CNF conditioning)
 
