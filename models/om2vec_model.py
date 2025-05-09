@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Now this import should work when script is run directly
 from utils.om_processing import calculate_summary_statistics, preprocess_photon_sequence, sinusoidal_positional_encoding
-from models.flows import Glow1D # Import Glow1D
+from models.flows import RealNVP1D # Import RealNVP1D
 
 class FiLMLayer(nn.Module):
     """
@@ -133,13 +133,13 @@ class Om2vecModel(pl.LightningModule):
         # self.cnf_conditions_on_sensor_pos is no longer used as CNF does not condition on sensor position.
         # The cnf_context_dim is solely based on z_summary and z_learned.
 
-        # Instantiate Glow1D
-        self.cnf_decoder = Glow1D(
+        # Instantiate RealNVP1D
+        self.cnf_decoder = RealNVP1D(
             input_dim=self.model_cfg.get('cnf_base_dist_dim', 1),
             context_dim=self.cnf_context_dim,
-            num_steps=self.model_cfg.get('cnf_num_layers', 5), # Renamed cnf_num_layers to num_steps for Glow
+            num_coupling_layers=self.model_cfg.get('cnf_num_layers', 5), # cnf_num_layers maps to num_coupling_layers
             hidden_dims_s_t_net=self.model_cfg.get('cnf_hidden_dims_hypernet', [128, 128]),
-            # activation_s_t_net can be added to config if needed, defaults to "relu" in Glow1D
+            activation_s_t_net=self.model_cfg.get('cnf_activation_s_t_net', 'relu') # Allow configuring activation
         )
 
         # KL Annealing factor
