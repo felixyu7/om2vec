@@ -295,6 +295,8 @@ class Om2vecModel(pl.LightningModule):
             )
             total_reconstruction_log_prob = torch.sum(log_probs_photons)
 
+        import pdb; pdb.set_trace()
+
         return {
             "reconstruction_log_prob": total_reconstruction_log_prob,
             "kl_divergence": total_kl_divergence,
@@ -541,13 +543,13 @@ class Om2vecModel(pl.LightningModule):
         # Logging
         batch_size_events = batch['all_om_hits'].shape[0] # Number of events in the batch
         self.log(f'{stage}/loss', loss, on_step=(stage=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size_events)
-        self.log(f'{stage}/recon_log_prob_avg_per_om', avg_reconstruction_log_prob, on_step=False, on_epoch=True, logger=True, batch_size=batch_size_events)
-        self.log(f'{stage}/kl_div_avg_per_om', avg_kl_divergence, on_step=False, on_epoch=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}/recon_log_prob_avg_per_om', avg_reconstruction_log_prob, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}/kl_div_avg_per_om', avg_kl_divergence, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
         self.log(f'{stage}/num_valid_oms_total', float(num_valid_oms), on_step=False, on_epoch=True, logger=True, batch_size=batch_size_events) # Total valid OMs in batch
         
         # Log average number of valid OMs per event in the batch
         avg_valid_oms_per_event = float(num_valid_oms) / batch_size_events if batch_size_events > 0 else 0
-        self.log(f'{stage}/num_valid_oms_avg_per_event', avg_valid_oms_per_event, on_step=False, on_epoch=True, logger=True, batch_size=batch_size_events)
+        self.log(f'{stage}/num_valid_oms_avg_per_event', avg_valid_oms_per_event, on_step=(stage=='train'), on_epoch=True, logger=True, batch_size=batch_size_events)
 
         if stage == 'train':
            self.log('hyperparameters/kl_beta', self.current_kl_beta, on_step=False, on_epoch=True, logger=True)

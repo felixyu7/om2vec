@@ -88,7 +88,7 @@ def main(cfg_path):
             checkpoint_callback = ModelCheckpoint(
                 dirpath=os.path.join(cfg['project_save_dir'], cfg['project_name'], "checkpoints"),
                 filename='{epoch}-{val_loss:.2f}', # Example filename
-                save_top_k=cfg.get('training_options', {}).get('save_top_k', 1),
+                save_top_k=cfg.get('training_options', {}).get('save_top_k', 3),
                 monitor=cfg.get('training_options', {}).get('checkpoint_monitor', 'val_loss'), # Metric to monitor
                 mode=cfg.get('training_options', {}).get('checkpoint_mode', 'min'), # 'min' or 'max'
                 every_n_epochs=cfg.get('training_options', {}).get('save_epochs')
@@ -105,6 +105,7 @@ def main(cfg_path):
             'max_epochs': cfg.get('training_options', {}).get('epochs', 100),
             'logger': logger,
             'callbacks': callbacks,
+            'log_every_n_steps': 1,
             'deterministic': cfg.get('seed') is not None # Ensure deterministic behavior if seed is set
         }
         

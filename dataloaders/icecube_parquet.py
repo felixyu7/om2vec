@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 import random
 from collections import defaultdict
 
-from .data_utils import get_file_names, IrregularDataCollator
+from .data_utils import get_file_names, IrregularDataCollator, ParquetFileSampler
 
 class IcecubeParquetDataModule(pl.LightningDataModule):
     """
@@ -55,8 +55,7 @@ class IcecubeParquetDataModule(pl.LightningDataModule):
         batch_size = training_options.get('batch_size', 32)
         num_workers = training_options.get('num_workers', 0)
         
-        # Use BatchedCacheParquetSampler for full randomization across cache
-        sampler = BatchedCacheParquetSampler(self.train_dataset, batch_size, shuffle=True)
+        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, batch_size)
         collate_fn = IrregularDataCollator()
         
         return torch.utils.data.DataLoader(
@@ -75,7 +74,7 @@ class IcecubeParquetDataModule(pl.LightningDataModule):
         batch_size = training_options.get('batch_size', 32)
         num_workers = training_options.get('num_workers', 0)
         
-        sampler = BatchedCacheParquetSampler(self.valid_dataset, batch_size, shuffle=False)
+        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, batch_size)
         collate_fn = IrregularDataCollator()
         
         return torch.utils.data.DataLoader(
@@ -91,39 +90,6 @@ class IcecubeParquetDataModule(pl.LightningDataModule):
     def test_dataloader(self):
         """Returns the test dataloader."""
         return self.val_dataloader()
-        
-class BatchedCacheParquetSampler(torch.utils.data.Sampler):
-    """
-    Sampler that loads files in batches and completely randomizes events across those files.
-    When events from one batch of files are exhausted, it loads the next batch.
-    This ensures complete randomization while maintaining efficient caching.
-    """
-    def __init__(self, dataset, batch_size, shuffle=True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        
-    def __iter__(self):
-        file_indices = list(range(len(self.dataset.files)))
-        if self.shuffle:
-            random.shuffle(file_indices)
-
-        cache_size = self.dataset.cache_size
-        for i in range(0, len(file_indices), cache_size):
-            cached_files = file_indices[i:i+cache_size]
-            # Build a pool of (file_idx, local_event_idx) tuples
-            pools = {f: list(range(
-                        self.dataset.cumulative_lengths[f],
-                        self.dataset.cumulative_lengths[f+1])) for f in cached_files}
-
-            while pools:                          # until every cached file is exhausted
-                f = random.choice(list(pools))    # pick a random file in the cache
-                yield pools[f].pop()              # yield one event from it
-                if not pools[f]:                  # file empty → remove
-                    pools.pop(f)
-        
-    def __len__(self):
-        return len(self.dataset)
 
 class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
     """
@@ -136,8 +102,7 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         self.files = files
         self.cfg = cfg
         self.data_options = cfg['data_options']
-        
-        self.cache_size = min(self.data_options.get('cache_size', 20), len(files))
+
         self.max_oms_per_event = self.data_options.get('max_oms_per_event', 50)
         self.max_photons_per_om = self.data_options.get('max_photons_per_om', 128)
 
@@ -154,22 +119,11 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         self.cumulative_lengths = np.concatenate(([0], np.cumsum(self.num_events_per_file)))
         self.dataset_size = self.cumulative_lengths[-1]
         
-        # Simple dict-based cache (much faster than LRU tracking for each access)
-        self.file_cache = {}
+        self.current_file = ''
+        self.current_data = None
         
     def __len__(self):
         return self.dataset_size
-    
-    def _get_event(self, file_index, event_index):
-        # Check if file is already loaded in cache
-        if file_index not in self.file_cache:
-            # If cache is full, evict only one file (the first key)
-            if len(self.file_cache) >= self.cache_size:
-                key_to_remove = next(iter(self.file_cache))
-                del self.file_cache[key_to_remove]
-            # Load the file into cache
-            self.file_cache[file_index] = ak.from_parquet(self.files[file_index])
-        return self.file_cache[file_index][event_index]
     
     def __getitem__(self, i):
         """
@@ -189,11 +143,15 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         """
         if i < 0 or i >= self.dataset_size:
             raise IndexError("Index out of range")
-        
-        file_index = np.searchsorted(self.cumulative_lengths, i + 1) - 1
+        file_index = np.searchsorted(self.cumulative_lengths, i+1) - 1
         true_idx = i - self.cumulative_lengths[file_index]
+                
+        # Load file if it's not already loaded
+        if self.current_file != self.files[file_index]:
+            self.current_file = self.files[file_index]
+            self.current_data = ak.from_parquet(self.files[file_index])
         
-        event = self._get_event(file_index, true_idx)
+        event = self.current_data[true_idx]
 
         # Initialize output tensors
         all_om_hits = torch.zeros((self.max_oms_per_event, self.max_photons_per_om, 2), dtype=torch.float32)
@@ -203,13 +161,9 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
 
         # Extract MC truth information (event-level label)
         direction = event.mc_truth.primary_direction.to_numpy() # Should be (3,)
-        energy = np.log10(event.mc_truth.primary_energy.to_numpy()) # Scalar
+        energy = np.log10(event.mc_truth.primary_energy) # Scalar
         
-        energy_min = self.data_options.get('energy_norm_min', 2.0) # Default log10(100 GeV)
-        energy_max = self.data_options.get('energy_norm_max', 8.0) # Default log10(100 PeV)
-        energy_norm = 2 * (energy - energy_min) / (energy_max - energy_min) - 1
-        
-        label_list = [energy_norm] + direction.tolist()
+        label_list = [energy] + direction.tolist()
         label_tensor = torch.tensor(label_list, dtype=torch.float32)
 
         # Process pulses for each OM
