@@ -6,6 +6,7 @@ from pytorch_lightning.loggers import WandbLogger, CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 import sys
 import os
+import torch
 
 from models.om2vec_model import Om2vecModel
 
@@ -15,6 +16,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 def main():
+    torch.set_float32_matmul_precision('medium')
     parser = argparse.ArgumentParser(description="Run om2vec model training or testing.")
     parser.add_argument('--config', type=str, required=True, help="Path to the YAML configuration file.")
     args = parser.parse_args()
@@ -78,8 +80,10 @@ def main():
             devices=cfg.get('num_devices', 1),
             precision=cfg.get('training_options', {}).get('precision', '32-true'),
             max_epochs=cfg.get('training_options', {}).get('epochs', 10),
+            gradient_clip_val=cfg.get('training_options', {}).get('gradient_clip_val', 1.0),
             logger=logger,
-            callbacks=callbacks
+            callbacks=callbacks,
+            log_every_n_steps=1,
             # Add other trainer options from cfg as needed
         )
         

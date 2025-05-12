@@ -165,6 +165,108 @@ class Om2vecModel(pl.LightningModule):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    # --- PyTorch Lightning Methods ---
+    def forward(self, batch):
+        # For training/validation/test steps
+        input_tq_sequence = batch["input_tq_sequence"]     # (N, S, 2), normalized, padded
+        attention_mask = batch["attention_mask"]            # (N, S), True for valid
+        z_summary_norm_batch = batch["z_summary"]           # (N, 10), normalized
+        sensor_pos_norm_batch = batch["sensor_position"]    # (N, 3), normalized
+
+        mu_z_learned, log_sigma_sq_z_learned = self._encode_transformer_to_latent_params(
+            input_tq_sequence,
+            attention_mask
+        )
+        z_learned_sampled = self.reparameterize(mu_z_learned, log_sigma_sq_z_learned) # (N, latent_dim_learned)
+        
+        # Apply FiLM using sensor_pos_norm_batch
+        film_gamma, film_beta = self.film_layer(sensor_pos_norm_batch) # (N, latent_dim_learned), (N, latent_dim_learned)
+        z_learned_modulated = film_gamma * z_learned_sampled + film_beta
+        
+        context_for_cnf = torch.cat([z_summary_norm_batch, z_learned_modulated], dim=1)
+        
+        return mu_z_learned, log_sigma_sq_z_learned, context_for_cnf
+
+    def _shared_step(self, batch, batch_idx, stage_name):
+        target_tq_pairs_for_loss = batch["input_tq_sequence"] # (N, S, 2), norm, padded
+        # active_entries_count is the number of valid pulses/bins in target_tq_pairs_for_loss for each item
+        # Shape (N), float tensor from dataloader.
+        active_entries_count_for_masking = batch["active_entries_count"]
+
+        mu_z_learned, log_sigma_sq_z_learned, context_for_cnf = self.forward(batch)
+
+        # Expand context for sequence broadcasting: (batch_size, context_dim) -> (batch_size, 1, context_dim)
+        context_for_cnf_expanded = context_for_cnf.unsqueeze(1)
+        log_p_tq_given_context = self.cnf_decoder(context_for_cnf_expanded).log_prob(target_tq_pairs_for_loss)
+        # log_p_tq_given_context shape: (batch_size, max_seq_len)
+
+        # Create mask for reconstruction loss based on active_entries_count_for_masking
+        # Mask should be (batch_size, max_seq_len)
+        seq_indices = torch.arange(target_tq_pairs_for_loss.size(1), device=self.device)[None, :] # (1, max_seq_len)
+        # active_entries_count_for_masking is (batch_size), needs to be (batch_size, 1) for broadcasting
+        reconstruction_mask = seq_indices < active_entries_count_for_masking[:, None]
+        
+        # Apply mask and sum over sequence dimension
+        masked_log_p = log_p_tq_given_context * reconstruction_mask
+        reconstruction_loss_per_item = -torch.sum(masked_log_p, dim=1) # Sum over seq_len
+        
+        reconstruction_loss = reconstruction_loss_per_item.mean() # Average over batch
+
+        # KL Divergence (for z_learned)
+        kl_div = -0.5 * torch.sum(1 + log_sigma_sq_z_learned - mu_z_learned.pow(2) - log_sigma_sq_z_learned.exp(), dim=1)
+        kl_div = kl_div.mean() # Mean over batch
+
+        # Total ELBO Loss (negative ELBO to minimize) with beta annealing
+        t_opts = self.hparams.training_options
+        beta_final = t_opts.get('beta_kl', 1.0)
+        beta_start = t_opts.get('beta_kl_start', 0.0)
+        warmup = t_opts.get('beta_kl_warmup_epochs', 0)
+        if warmup > 0:
+            progress = min(self.current_epoch / warmup, 1.0)
+            beta = beta_start + progress * (beta_final - beta_start)
+        else:
+            beta = beta_final
+        loss = reconstruction_loss + beta * kl_div
+        # Log current beta value
+        self.log(f'{stage_name}_beta', beta, on_step=(stage_name=='train'), on_epoch=True, logger=True)
+
+        self.log(f'{stage_name}_loss', loss, on_step=(stage_name=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=target_tq_pairs_for_loss.shape[0])
+        self.log(f'{stage_name}_recon_loss', reconstruction_loss, on_step=(stage_name=='train'), on_epoch=True, logger=True, batch_size=target_tq_pairs_for_loss.shape[0])
+        self.log(f'{stage_name}_kl_div', kl_div, on_step=(stage_name=='train'), on_epoch=True, logger=True, batch_size=target_tq_pairs_for_loss.shape[0])
+        if stage_name == 'train':
+            self.log('learning_rate', self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False, logger=True)
+
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, 'train')
+
+    def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, 'val')
+
+    def test_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, 'test')
+
+    def configure_optimizers(self):
+        opt_cfg = self.hparams.training_options
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=opt_cfg.get('lr', 1e-4),
+            weight_decay=opt_cfg.get('weight_decay', 0.01)
+        )
+        
+        scheduler_params = opt_cfg.get('lr_schedule', None)
+        if scheduler_params and isinstance(scheduler_params, list) and len(scheduler_params) == 2:
+            T_max_epochs = self.hparams.training_options.get('epochs', 100)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=T_max_epochs, # Or calculate total steps: self.trainer.estimated_stepping_batches
+                eta_min=1e-6
+            )
+            return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}] # "step" or "epoch"
+        
+        return optimizer
+    
     # --- Public API Methods ---
     def encode(self, t_values_raw, q_values_raw, sensor_pos_raw, sample_z_learned=False):
         """ User-facing method to get latent representation from raw inputs for a single sensor or batch. """
@@ -289,15 +391,6 @@ class Om2vecModel(pl.LightningModule):
             # If N_to_generate is not provided, use the first element of z_summary_part
             N_to_generate = z_summary_part[:, 0].long()
         max_n = N_to_generate.max().item() # Maximum number of samples to generate
-
-        # .sample() returns shape (sample_shape, features)
-        # For NSF, context is (batch, context_features), sample_shape is (max_n)
-        # Resulting samples_norm will be (max_n, batch, features=2)
-        # We want (batch, max_n, features=2) for easier processing.
-        # So, we might need to sample one by one or permute.
-        # Zuko's NSF(context).sample(shape) -> samples have shape (*shape, *self.shape)
-        # Here self.shape is (features=2). context is (batch_size, context_dim_cnf)
-        # If we pass sample_shape=torch.Size([max_n]), output is (max_n, batch_size, 2)
         
         # Expand context for sequence broadcasting: (batch_size, context_dim) -> (batch_size, 1, context_dim)
         context_for_decode_expanded = context_for_decode.unsqueeze(1)
@@ -326,166 +419,3 @@ class Om2vecModel(pl.LightningModule):
                 output_tq_list.append(torch.empty((0,2), device=self.device, dtype=torch.float32))
         
         return output_tq_list if is_batched else output_tq_list[0]
-
-    def sample(self, z_summary_raw, sensor_pos_raw, num_generations_per_context=1):
-        """ User-facing method for generation from raw summary stats and sensor position. """
-        self.eval()
-
-        if not isinstance(z_summary_raw, torch.Tensor): z_summary_raw = torch.tensor(z_summary_raw, dtype=torch.float32)
-        if not isinstance(sensor_pos_raw, torch.Tensor): sensor_pos_raw = torch.tensor(sensor_pos_raw, dtype=torch.float32)
-        
-        z_summary_raw = z_summary_raw.to(self.device)
-        sensor_pos_raw = sensor_pos_raw.to(self.device)
-
-        is_batched = z_summary_raw.ndim > 1
-        if not is_batched:
-            z_summary_raw = z_summary_raw.unsqueeze(0)
-            sensor_pos_raw = sensor_pos_raw.unsqueeze(0)
-        
-        batch_size = z_summary_raw.shape[0]
-
-        # Normalize inputs
-        z_summary_norm = self.normalize_z_summary(z_summary_raw)
-        sensor_pos_norm = self.normalize_sensor_pos(sensor_pos_raw)
-
-        # Extract N_to_generate from z_summary_raw (unnormalized N_true is at index 0)
-        # Ensure it's integer and clamped at 0 minimum.
-        N_to_generate = torch.clamp(z_summary_raw[:, 0].long(), min=0)
-
-        # Prepare for num_generations_per_context
-        effective_batch_size = batch_size * num_generations_per_context
-        
-        repeated_z_summary_norm = z_summary_norm.repeat_interleave(num_generations_per_context, dim=0)
-        repeated_sensor_pos_norm = sensor_pos_norm.repeat_interleave(num_generations_per_context, dim=0)
-        repeated_N_to_generate = N_to_generate.repeat_interleave(num_generations_per_context, dim=0)
-
-        # Sample z_learned from prior N(0,I)
-        z_learned_samples = torch.randn(
-            effective_batch_size,
-            self.latent_dim_learned,
-            device=self.device
-        )
-        
-        z_full_representation_norm = torch.cat([repeated_z_summary_norm, z_learned_samples], dim=-1)
-        
-        raw_tq_samples_list = self.decode(
-            z_full_representation_norm,
-            repeated_sensor_pos_norm,
-            repeated_N_to_generate
-        )
-        
-        # If not originally batched and num_generations_per_context is 1, return single item not list
-        if not is_batched and num_generations_per_context == 1:
-            return raw_tq_samples_list[0]
-        return raw_tq_samples_list # List of tensors
-
-    # --- PyTorch Lightning Methods ---
-    def forward(self, batch):
-        # For training/validation/test steps
-        input_tq_sequence = batch["input_tq_sequence"]     # (N, S, 2), normalized, padded
-        attention_mask = batch["attention_mask"]            # (N, S), True for valid
-        z_summary_norm_batch = batch["z_summary"]           # (N, 10), normalized
-        sensor_pos_norm_batch = batch["sensor_position"]    # (N, 3), normalized
-
-        mu_z_learned, log_sigma_sq_z_learned = self._encode_transformer_to_latent_params(
-            input_tq_sequence,
-            attention_mask
-        )
-        z_learned_sampled = self.reparameterize(mu_z_learned, log_sigma_sq_z_learned) # (N, latent_dim_learned)
-        
-        # Apply FiLM using sensor_pos_norm_batch
-        film_gamma, film_beta = self.film_layer(sensor_pos_norm_batch) # (N, latent_dim_learned), (N, latent_dim_learned)
-        z_learned_modulated = film_gamma * z_learned_sampled + film_beta
-        
-        context_for_cnf = torch.cat([z_summary_norm_batch, z_learned_modulated], dim=1)
-        
-        return mu_z_learned, log_sigma_sq_z_learned, context_for_cnf
-
-    def _shared_step(self, batch, batch_idx, stage_name):
-        target_tq_pairs_for_loss = batch["input_tq_sequence"] # (N, S, 2), norm, padded
-        # active_entries_count is the number of valid pulses/bins in target_tq_pairs_for_loss for each item
-        # Shape (N), float tensor from dataloader.
-        active_entries_count_for_masking = batch["active_entries_count"]
-
-        mu_z_learned, log_sigma_sq_z_learned, context_for_cnf = self.forward(batch)
-
-        # Reconstruction Loss (CNF log-likelihood)
-        # target_tq_pairs_for_loss is (batch, seq_len, 2)
-        # context_for_cnf is (batch, context_dim)
-        # cnf_decoder(context).log_prob(values) expects values (batch, features) or (batch, seq_len, features)
-        # if context is (batch, context_dim) and values is (batch, seq_len, features)
-        # then log_prob output is (batch, seq_len)
-
-        # Expand context for sequence broadcasting: (batch_size, context_dim) -> (batch_size, 1, context_dim)
-        context_for_cnf_expanded = context_for_cnf.unsqueeze(1)
-        log_p_tq_given_context = self.cnf_decoder(context_for_cnf_expanded).log_prob(target_tq_pairs_for_loss)
-        # log_p_tq_given_context shape: (batch_size, max_seq_len)
-
-        # Create mask for reconstruction loss based on active_entries_count_for_masking
-        # Mask should be (batch_size, max_seq_len)
-        seq_indices = torch.arange(target_tq_pairs_for_loss.size(1), device=self.device)[None, :] # (1, max_seq_len)
-        # active_entries_count_for_masking is (batch_size), needs to be (batch_size, 1) for broadcasting
-        reconstruction_mask = seq_indices < active_entries_count_for_masking[:, None]
-        
-        # Apply mask and sum over sequence dimension
-        masked_log_p = log_p_tq_given_context * reconstruction_mask
-        reconstruction_loss_per_item = -torch.sum(masked_log_p, dim=1) # Sum over seq_len
-        
-        # Average over items that have at least one pulse to avoid NaN from 0/0 if an item has 0 pulses
-        # Or average over batch size. If active_entries_count_for_masking can be 0, need to handle.
-        # Sum of active_entries_count_for_masking is total number of actual pulses/bins in batch.
-        # Normalizing by batch_size is common for ELBO's reconstruction term.
-        reconstruction_loss = reconstruction_loss_per_item.mean() # Average over batch
-
-        # KL Divergence (for z_learned)
-        # D_KL(q(z_l|X) || p(z_l)) where p(z_l) is N(0,I)
-        # kl = -0.5 * sum(1 + log_sigma_sq - mu_sq - sigma_sq) per latent dim, then sum over latent_dims, then mean over batch
-        kl_div = -0.5 * torch.sum(1 + log_sigma_sq_z_learned - mu_z_learned.pow(2) - log_sigma_sq_z_learned.exp(), dim=1)
-        kl_div = kl_div.mean() # Mean over batch
-
-        # Total ELBO Loss (negative ELBO to minimize)
-        # Consider beta-VAE: loss = reconstruction_loss + self.hparams.get('beta', 1.0) * kl_div
-        beta = self.hparams.training_options.get('beta_kl', 1.0)
-        loss = reconstruction_loss + beta * kl_div
-        
-        self.log(f'{stage_name}/loss', loss, on_step=(stage_name=='train'), on_epoch=True, prog_bar=True, logger=True, batch_size=target_tq_pairs_for_loss.shape[0])
-        self.log(f'{stage_name}/recon_loss', reconstruction_loss, on_step=(stage_name=='train'), on_epoch=True, logger=True, batch_size=target_tq_pairs_for_loss.shape[0])
-        self.log(f'{stage_name}/kl_div', kl_div, on_step=(stage_name=='train'), on_epoch=True, logger=True, batch_size=target_tq_pairs_for_loss.shape[0])
-        if stage_name == 'train':
-            self.log('learning_rate', self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False, logger=True)
-
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        return self._shared_step(batch, batch_idx, 'train')
-
-    def validation_step(self, batch, batch_idx):
-        return self._shared_step(batch, batch_idx, 'val')
-
-    def test_step(self, batch, batch_idx):
-        return self._shared_step(batch, batch_idx, 'test')
-
-    def configure_optimizers(self):
-        opt_cfg = self.hparams.training_options
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=opt_cfg.get('lr', 1e-4),
-            weight_decay=opt_cfg.get('weight_decay', 0.01)
-        )
-        
-        scheduler_params = opt_cfg.get('lr_schedule', None)
-        if scheduler_params and isinstance(scheduler_params, list) and len(scheduler_params) == 2:
-            # Assuming [T_max, eta_min] for CosineAnnealingLR
-            # T_max often set to total epochs or total steps
-            # For simplicity, let's use epochs from config if T_max is not directly total steps
-            T_max_epochs = self.hparams.training_options.get('epochs', 100)
-            # If using total steps: T_max = self.trainer.estimated_stepping_batches
-            
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=T_max_epochs, # Or calculate total steps: self.trainer.estimated_stepping_batches
-                eta_min=scheduler_params[1] # eta_min
-            )
-            return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}] # "step" or "epoch"
-        
-        return optimizer
