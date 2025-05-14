@@ -122,7 +122,7 @@ class PrometheusDataset(torch.utils.data.Dataset):
 
         # ---------- raw per-hit arrays ----------
         time_column = self.cfg['data_options'].get('time_column', 't') # Get time column from config
-        raw_t = np.asarray(row['photons'][time_column], dtype=np.float32)
+        raw_t = np.asarray(row[time_column], dtype=np.float32)
         raw_q = np.ones_like(raw_t, dtype=np.float32)      # unit charge per hit, becomes count after binning
 
         # Prometheus-specific features (sensor_pos, z_summary) are removed for om2vec

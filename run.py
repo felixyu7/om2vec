@@ -9,6 +9,7 @@ from pytorch_lightning.loggers import WandbLogger, CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 def main(cfg_path):
+    torch.set_float32_matmul_precision('medium') # Set precision for float32 matrix multiplication
     # Add project root to sys.path to allow for absolute imports
     project_root = os.path.dirname(os.path.abspath(__file__))
     if project_root not in sys.path:
@@ -66,20 +67,6 @@ def main(cfg_path):
     else: # Training or resuming training
         model = model_class(cfg)
 
-    # Apply torch.compile() for potential speedup (PyTorch 2.0+)
-    # This can be made conditional based on PyTorch version or a config flag if needed.
-    # For simplicity, applying it directly. Add try-except if compatibility with older PyTorch is a concern.
-    try:
-        if hasattr(torch, 'compile') and callable(torch.compile):
-            print("Attempting to compile the model with torch.compile()...")
-            model = torch.compile(model)
-            print("Model compiled successfully.")
-        else:
-            print("torch.compile() not available or not callable (requires PyTorch 2.0+). Proceeding without compiling.")
-    except Exception as e:
-        print(f"torch.compile() failed with error: {e}. Proceeding without compiling.")
-
-
     if cfg['training']:
         if cfg.get('logger', 'wandb') == 'csv': # Default to wandb if 'logger' not specified
             logger = CSVLogger(
@@ -102,7 +89,7 @@ def main(cfg_path):
                 save_top_k=3,
                 monitor='val_loss',
                 mode='min',
-                every_n_epochs=cfg['training_options']['save_epochs']
+                every_n_epochs=cfg['training_options']['save_epochs'],
             )
             callbacks.append(checkpoint_callback)
         
@@ -115,7 +102,8 @@ def main(cfg_path):
             precision=cfg['training_options'].get('precision', '32-true'),
             max_epochs=cfg['training_options']['epochs'],
             logger=logger,
-            callbacks=callbacks
+            callbacks=callbacks,
+            log_every_n_steps=1,
         )
         
         ckpt_path_resume = cfg.get('checkpoint') if cfg.get('resume_training', False) else None

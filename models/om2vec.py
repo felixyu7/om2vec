@@ -255,8 +255,9 @@ class Om2vecModel(pl.LightningModule):
         self.log(f"{stage_name}_kl_beta", kl_beta, on_step=(stage_name=="train"), on_epoch=True, prog_bar=False, logger=True)
         self.log(f"{stage_name}_kl_div_scaled", kl_beta * kl_divergence, on_step=(stage_name=="train"), on_epoch=True, prog_bar=True, logger=True)
         self.log(f"{stage_name}_loss", loss, on_step=(stage_name=="train"), on_epoch=True, prog_bar=True, logger=True)
-        if stage_name == "train":
-             self.log("lr", self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        if stage_name == "train":  
+            self.log("lr", self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
+                
         return loss
 
     def training_step(self, batch, batch_idx):
