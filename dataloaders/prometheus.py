@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 import awkward as ak
 import pyarrow.parquet as pq
 
-from utils import utils as project_utils # Added import
+from utils.utils import log_transform # Updated import
 from dataloaders.data_utils import get_file_names, ParquetFileSampler
 
 class PrometheusDataModule(pl.LightningDataModule):
@@ -121,19 +121,11 @@ class PrometheusDataset(torch.utils.data.Dataset):
         row = self.current_data[true_idx]
 
         # ---------- raw per-hit arrays ----------
-        raw_t = np.asarray(row["hits_t"], dtype=np.float32)
-        raw_q = np.ones_like(raw_t, dtype=np.float32)      # unit charge per hit
+        time_column = self.cfg['data_options'].get('time_column', 't') # Get time column from config
+        raw_t = np.asarray(row['photons'][time_column], dtype=np.float32)
+        raw_q = np.ones_like(raw_t, dtype=np.float32)      # unit charge per hit, becomes count after binning
 
-        # ---------- static sensor position ----------
-        raw_sensor_pos = np.array(
-            [ float(row["sensor_pos_x"]),
-            float(row["sensor_pos_y"]),
-            float(row["sensor_pos_z"]) ],
-            dtype=np.float32
-        )
-
-        # ---------- summary statistics on *all* hits ----------
-        raw_z_summary = project_utils.calculate_summary_statistics(raw_t, raw_q)
+        # Prometheus-specific features (sensor_pos, z_summary) are removed for om2vec
 
         max_len = self.max_seq_len
         cur_len = len(raw_t)
@@ -181,24 +173,16 @@ class PrometheusDataset(torch.utils.data.Dataset):
             active_entries_count = cur_len
 
         # ---------- normalise ----------
-        norm_t = project_utils.normalize_tq(work_t.float())
-        norm_q = project_utils.normalize_tq(work_q.float())
-        norm_sensor_pos = project_utils.normalize_sensor_pos(
-            torch.from_numpy(raw_sensor_pos)
-        )
-        norm_z_summary = project_utils.normalize_z_summary(
-            torch.from_numpy(raw_z_summary)
-        )
+        norm_t = log_transform(work_t.float()) # Use log_transform
+        norm_q = log_transform(work_q.float()) # Use log_transform
+        
+        # norm_sensor_pos and norm_z_summary removed
 
         input_tq_sequence = torch.stack([norm_t, norm_q], dim=1)  # (max_len, 2)
 
         return {
-            "input_tq_sequence":   input_tq_sequence,                      # (L,2)
-            "attention_mask":     attention_mask,                         # (L,)
-            "z_summary":          norm_z_summary,                         # (10,)
-            "sensor_position":    norm_sensor_pos,                        # (3,)
-            "active_entries_count": torch.tensor(
-                active_entries_count, dtype=torch.float32
-            ),
+            "input_tq_sequence":   input_tq_sequence,      # (L,2)
+            "attention_mask":      attention_mask,         # (L,)
+            "active_entries_count": torch.tensor(active_entries_count, dtype=torch.float32) # Crucial for z[0]
         }
         
