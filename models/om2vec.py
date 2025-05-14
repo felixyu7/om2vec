@@ -1,118 +1,120 @@
 import torch
 import torch.nn as nn
+import math
 import pytorch_lightning as pl
 from torch.distributions import LogNormal, Normal
-# Ensure utils.utils can be imported. If run.py adds project root to sys.path, this should work.
 from utils.utils import log_transform, inverse_log_transform
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model) # Changed to [1, max_len, d_model] for easier broadcasting
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe) # shape (1, max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, embedding_dim] (batch_first=True)
+        """
+        # x is (batch_size, seq_len, d_model)
+        # self.pe is (1, max_len, d_model)
+        # We need to add pe[:, :x.size(1), :] to x
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
 class Om2vecModel(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
-        # Save the entire config dictionary as hyperparameters.
-        # This makes all config values accessible via self.hparams.
         self.save_hyperparameters(cfg)
-        # It's also common to store cfg directly if preferred for direct access,
-        # but self.hparams is the PyTorch Lightning way.
-        # self.cfg = cfg 
-
         model_options = self.hparams['model_options']
-        data_options = self.hparams['data_options'] # For max_seq_len
+        data_options = self.hparams['data_options']
 
-        # ---- Encoder ----
-        self.encoder_input_embed_dim_time = model_options['encoder_input_embed_dim_time']
-        self.encoder_input_embed_dim_charge = model_options['encoder_input_embed_dim_charge']
-        combined_embed_dim_enc = self.encoder_input_embed_dim_time + self.encoder_input_embed_dim_charge
-
-        self.time_embed_enc = nn.Linear(1, self.encoder_input_embed_dim_time)
-        self.charge_embed_enc = nn.Linear(1, self.encoder_input_embed_dim_charge)
-
-        # Hardcoding to LSTM as per user feedback
-        self.encoder_rnn = nn.LSTM(
-            input_size=combined_embed_dim_enc,
-            hidden_size=model_options['encoder_hidden_dim'],
-            num_layers=model_options['encoder_num_layers'],
-            batch_first=True
-        )
+        d_model = model_options['d_model']
+        n_head = model_options['n_head']
+        dim_feedforward = model_options['dim_feedforward']
+        dropout_rate = model_options['dropout'] # Renamed from 'dropout' to avoid conflict with nn.Dropout module
         
-        # Latent dim for z[1:] (learned part)
-        self.learned_latent_dim = model_options['latent_dim'] - 1
-        if self.learned_latent_dim <= 0:
-            raise ValueError("model_options['latent_dim'] must be > 1 to accommodate the learned part.")
-
-        self.fc_mu_rest = nn.Linear(model_options['encoder_hidden_dim'], self.learned_latent_dim)
-        self.fc_logvar_rest = nn.Linear(model_options['encoder_hidden_dim'], self.learned_latent_dim)
-
-        # ---- Decoder (NTPP) ----
-        self.latent_to_decoder_hidden = nn.Linear(model_options['latent_dim'], model_options['decoder_hidden_dim'])
-        
-        # Decoder RNN input: previous (embedded_delta_t, embedded_charge)
-        # Using same embedding dimensions for decoder as encoder for simplicity
-        self.decoder_input_embed_dim_time = model_options['encoder_input_embed_dim_time']
-        self.decoder_input_embed_dim_charge = model_options['encoder_input_embed_dim_charge']
-        combined_embed_dim_dec = self.decoder_input_embed_dim_time + self.decoder_input_embed_dim_charge
-
-        self.time_embed_dec = nn.Linear(1, self.decoder_input_embed_dim_time)
-        self.charge_embed_dec = nn.Linear(1, self.decoder_input_embed_dim_charge)
-
-        # Hardcoding to LSTM as per user feedback
-        self.decoder_rnn = nn.LSTM(
-            input_size=combined_embed_dim_dec,
-            hidden_size=model_options['decoder_hidden_dim'],
-            num_layers=model_options['decoder_num_layers'],
-            batch_first=True
-        )
-
-        # Output layers for NTPP parameters
-        self.fc_delta_t_loc = nn.Linear(model_options['decoder_hidden_dim'], 1)
-        self.fc_delta_t_scale = nn.Linear(model_options['decoder_hidden_dim'], 1)
-        self.fc_charge_loc = nn.Linear(model_options['decoder_hidden_dim'], 1)
-        self.fc_charge_scale = nn.Linear(model_options['decoder_hidden_dim'], 1)
-
         self.max_seq_len = data_options['max_seq_len']
 
-        # KL Annealing parameters
-        self.kl_beta_start = model_options.get('kl_beta_start', 1.0) # Default to 1.0 if not specified
+        # Input embedding: projects 2 features (time, charge) to d_model
+        # This will be used for both encoder input and decoder input (target sequence)
+        self.feature_embed = nn.Linear(2, d_model) 
+        
+        self.pos_encoder = PositionalEncoding(d_model, dropout_rate, max_len=self.max_seq_len)
+
+        # ---- Encoder ----
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=n_head, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout_rate, 
+            batch_first=True,
+            activation='relu' # Standard activation
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=model_options['encoder_n_layers'])
+        
+        self.learned_latent_dim = model_options['latent_dim'] - 1
+        if self.learned_latent_dim <= 0:
+            raise ValueError("model_options['latent_dim'] must be > 1 for the learned part.")
+        
+        self.fc_mu_rest = nn.Linear(d_model, self.learned_latent_dim)
+        self.fc_logvar_rest = nn.Linear(d_model, self.learned_latent_dim)
+
+        # ---- Decoder (NTPP) ----
+        self.latent_to_memory_transform = nn.Linear(model_options['latent_dim'], d_model)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, 
+            nhead=n_head, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout_rate, 
+            batch_first=True,
+            activation='relu' # Standard activation
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=model_options['decoder_n_layers'])
+
+        self.fc_delta_t_loc = nn.Linear(d_model, 1)
+        self.fc_delta_t_scale = nn.Linear(d_model, 1)
+        self.fc_charge_loc = nn.Linear(d_model, 1)
+        self.fc_charge_scale = nn.Linear(d_model, 1)
+
+        self.kl_beta_start = model_options.get('kl_beta_start', 1.0)
         self.kl_beta_end = model_options.get('kl_beta_end', 1.0)
-        self.kl_anneal_epochs = model_options.get('kl_anneal_epochs', 0) # Default to 0 epochs (no annealing)
+        self.kl_anneal_epochs = model_options.get('kl_anneal_epochs', 0)
+
+    def _generate_square_subsequent_mask(self, sz: int, device: torch.device) -> torch.Tensor:
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
 
     def encode(self, input_tq_sequence, attention_mask):
-        # input_tq_sequence: (batch, seq_len, 2) [norm_abs_t, norm_abs_q]
-        norm_t = input_tq_sequence[:, :, 0:1]
-        norm_q = input_tq_sequence[:, :, 1:2]
-
-        embedded_t = torch.relu(self.time_embed_enc(norm_t))
-        embedded_q = torch.relu(self.charge_embed_enc(norm_q))
-        encoder_input = torch.cat([embedded_t, embedded_q], dim=2)
-
-        # Using attention_mask to get actual lengths for packing
-        # Ensure sequence_lengths are on CPU for pack_padded_sequence if it requires it,
-        # but typically lengths should be on the same device as the input tensor.
-        # The .sum() will be on the same device as attention_mask.
-        # Ensure lengths are > 0. If a sequence has 0 length, it might cause issues.
-        # The dataloader should ensure active_entries_count >= 1, which implies attention_mask.sum() >= 1.
-        sequence_lengths = attention_mask.sum(dim=1).long()
+        # input_tq_sequence: (B, L, 2) [norm_abs_t, norm_abs_q]
+        # attention_mask: (B, L) boolean mask, True for valid entries, False for padding
         
-        # Handle cases where a sequence might have zero length if attention_mask is all False.
-        # Clamp lengths to be at least 1 for packing, as pack_padded_sequence expects positive lengths.
-        # This scenario (all-False mask) should ideally be prevented by the dataloader ensuring min 1 active entry.
-        clamped_lengths = torch.clamp(sequence_lengths, min=1)
+        src = self.feature_embed(input_tq_sequence) # (B, L, d_model)
+        src = src * math.sqrt(self.hparams['model_options']['d_model'])
+        src = self.pos_encoder(src)
 
-        packed_input = nn.utils.rnn.pack_padded_sequence(
-            encoder_input, clamped_lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
-        
-        # packed_output is a PackedSequence object, hidden_state contains final states
-        packed_output, hidden_state = self.encoder_rnn(packed_input)
-        
-        # hidden_state for LSTM is a tuple (h_n, c_n)
-        # h_n is of shape (num_layers * num_directions, batch, hidden_size)
-        # We want the final hidden state of the last layer for each sequence in the batch.
-        # For batch_first=True, hidden_state[0] is h_n.
-        # hidden_state[0][-1] gives the last layer's h_n for all sequences.
-        final_hidden = hidden_state[0][-1] # (batch, hidden_size)
+        # src_key_padding_mask: (B, L), True for padded elements (inverse of attention_mask)
+        src_key_padding_mask = ~attention_mask 
 
-        mu_rest = self.fc_mu_rest(final_hidden)
-        logvar_rest = self.fc_logvar_rest(final_hidden)
+        encoder_output = self.transformer_encoder(src, src_key_padding_mask=src_key_padding_mask)
+        # encoder_output shape: (B, L, d_model)
+        
+        # Use the output of the first element (like a CLS token) for VAE parameters
+        # This assumes the first token aggregates sequence information.
+        # Alternative: mean pooling over non-padded elements.
+        # pooled_output = encoder_output.masked_fill(src_key_padding_mask.unsqueeze(-1), 0.0).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        pooled_output = encoder_output[:, 0, :] # (B, d_model)
+
+        mu_rest = self.fc_mu_rest(pooled_output)
+        logvar_rest = self.fc_logvar_rest(pooled_output)
         return mu_rest, logvar_rest
 
     def reparameterize(self, mu_rest, logvar_rest):
@@ -120,88 +122,79 @@ class Om2vecModel(pl.LightningModule):
         eps_rest = torch.randn_like(std_rest)
         return mu_rest + eps_rest * std_rest
 
-    def decode(self, z, ground_truth_sequence_for_teacher_forcing=None):
-        # z: (batch, total_latent_dim)
-        # ground_truth_sequence_for_teacher_forcing: (batch, seq_len, 2) [norm_delta_t, norm_charge]
+    def decode(self, z, decoder_input_sequence, tgt_key_padding_mask):
+        # z: (B, total_latent_dim) - full latent vector
+        # decoder_input_sequence: (B, L_tgt, 2) [shifted_norm_delta_t, shifted_norm_charge] for teacher forcing
+        # tgt_key_padding_mask: (B, L_tgt) boolean, True for padded elements in decoder_input_sequence
         
-        batch_size = z.size(0)
-        
-        # Initial hidden state for decoder RNN from full z
-        decoder_h0 = self.latent_to_decoder_hidden(z)
-        decoder_h0 = decoder_h0.unsqueeze(0).repeat(self.hparams['model_options']['decoder_num_layers'], 1, 1)
-        # self.decoder_rnn is now always nn.LSTM
-        decoder_hidden = (decoder_h0, torch.zeros_like(decoder_h0, device=z.device)) # (h_0, c_0)
+        seq_len_tgt = decoder_input_sequence.size(1)
 
-        # Initial input for the first step (start token)
-        current_delta_t_input = torch.zeros(batch_size, 1, 1, device=z.device)
-        current_charge_input = torch.zeros(batch_size, 1, 1, device=z.device)
+        memory_latent = self.latent_to_memory_transform(z) # (B, d_model)
+        # Expand memory to be (B, 1, d_model) to act as a single memory item for the decoder to attend to.
+        # The TransformerDecoder will attend to this single memory vector across all target positions.
+        memory = memory_latent.unsqueeze(1) # (B, 1, d_model)
+        # No memory_key_padding_mask needed as memory is a single, always valid item.
 
-        all_dt_locs, all_dt_scales = [], []
-        all_charge_locs, all_charge_scales = [], []
+        tgt = self.feature_embed(decoder_input_sequence) # (B, L_tgt, d_model)
+        tgt = tgt * math.sqrt(self.hparams['model_options']['d_model'])
+        tgt = self.pos_encoder(tgt)
 
-        for k in range(self.max_seq_len): # Decoder runs for max_seq_len for training
-            embedded_dt = torch.relu(self.time_embed_dec(current_delta_t_input))
-            embedded_q = torch.relu(self.charge_embed_dec(current_charge_input))
-            decoder_input_k = torch.cat([embedded_dt, embedded_q], dim=2)
+        tgt_mask = self._generate_square_subsequent_mask(seq_len_tgt, device=z.device) # (L_tgt, L_tgt)
 
-            rnn_output_k, decoder_hidden = self.decoder_rnn(decoder_input_k, decoder_hidden)
+        decoder_output = self.transformer_decoder(
+            tgt, 
+            memory, 
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=None # Memory is a single item, always unpadded
+        )
+        # decoder_output shape: (B, L_tgt, d_model)
             
-            dt_loc = self.fc_delta_t_loc(rnn_output_k)
-            dt_scale = torch.exp(self.fc_delta_t_scale(rnn_output_k)) # Ensure scale is positive
-            charge_loc = self.fc_charge_loc(rnn_output_k)
-            charge_scale = torch.exp(self.fc_charge_scale(rnn_output_k))
-
-            all_dt_locs.append(dt_loc)
-            all_dt_scales.append(dt_scale)
-            all_charge_locs.append(charge_loc)
-            all_charge_scales.append(charge_scale)
-
-            if ground_truth_sequence_for_teacher_forcing is not None: # Teacher forcing
-                current_delta_t_input = ground_truth_sequence_for_teacher_forcing[:, k:k+1, 0:1]
-                current_charge_input = ground_truth_sequence_for_teacher_forcing[:, k:k+1, 1:2]
-            else: # Inference/Generation (not used in ELBO calculation directly)
-                # Sample from LogNormal(dt_loc, dt_scale) and Normal(charge_loc, charge_scale)
-                # This logic is for the .generate() method
-                dist_dt_k = LogNormal(dt_loc, dt_scale.clamp(min=1e-6))
-                current_delta_t_input = dist_dt_k.sample()
-                dist_charge_k = Normal(charge_loc, charge_scale.clamp(min=1e-6))
-                current_charge_input = dist_charge_k.sample()
-
-
-        return (torch.cat(all_dt_locs, dim=1), torch.cat(all_dt_scales, dim=1),
-                torch.cat(all_charge_locs, dim=1), torch.cat(all_charge_scales, dim=1))
+        dt_locs = self.fc_delta_t_loc(decoder_output)
+        dt_scales = torch.exp(self.fc_delta_t_scale(decoder_output))
+        charge_locs = self.fc_charge_loc(decoder_output)
+        charge_scales = torch.exp(self.fc_charge_scale(decoder_output))
+        
+        return dt_locs, dt_scales, charge_locs, charge_scales
 
     def forward(self, batch):
-        input_tq_sequence = batch["input_tq_sequence"] # (B, L, 2) [abs_norm_t, abs_norm_q]
-        attention_mask = batch["attention_mask"]       # (B, L)
-        active_entries_count = batch["active_entries_count"].float() # (B,)
+        input_tq_sequence = batch["input_tq_sequence"] 
+        attention_mask = batch["attention_mask"]      
+        active_entries_count = batch["active_entries_count"].float()
 
-        # z[0] component: log-normalized true length
-        z0_true_log_len = torch.log(active_entries_count + 1.0).unsqueeze(1) # (B, 1)
+        z0_true_log_len = torch.log(active_entries_count + 1.0).unsqueeze(1)
 
         mu_rest, logvar_rest = self.encode(input_tq_sequence, attention_mask)
-        z_rest = self.reparameterize(mu_rest, logvar_rest) # (B, learned_latent_dim)
+        z_rest = self.reparameterize(mu_rest, logvar_rest)
         
-        z = torch.cat([z0_true_log_len, z_rest], dim=1) # (B, total_latent_dim)
+        z = torch.cat([z0_true_log_len, z_rest], dim=1)
 
-        # Prepare target for decoder: (norm_delta_t, norm_charge)
         abs_norm_t = input_tq_sequence[:, :, 0:1]
-        norm_q = input_tq_sequence[:, :, 1:2] # This is already the charge per bin
-
+        norm_q = input_tq_sequence[:, :, 1:2]
         delta_norm_t = torch.zeros_like(abs_norm_t)
-        delta_norm_t[:, 0, :] = abs_norm_t[:, 0, :] # delta_t_1 = t_1 (assuming t_0 = 0)
-        if self.max_seq_len > 1: # Avoid issues if max_seq_len is 1
+        delta_norm_t[:, 0, :] = abs_norm_t[:, 0, :]
+        if self.max_seq_len > 1:
             delta_norm_t[:, 1:, :] = abs_norm_t[:, 1:, :] - abs_norm_t[:, :-1, :]
         
-        # Mask out deltas where the time difference is due to padding (t_k is 0 and t_{k-1} was also 0)
-        # This can be complex. A simpler way is to ensure that padded times are large negative or use the loss mask.
-        # The loss mask will handle not penalizing these.
+        decoder_target_for_loss = torch.cat([delta_norm_t, norm_q], dim=2)
 
-        decoder_target_sequence = torch.cat([delta_norm_t, norm_q], dim=2)
-
-        dt_locs, dt_scales, charge_locs, charge_scales = self.decode(z, decoder_target_sequence)
+        start_token_features = torch.zeros(input_tq_sequence.size(0), 1, 2, device=input_tq_sequence.device)
+        decoder_input_for_decode = torch.cat([start_token_features, decoder_target_for_loss[:, :-1, :]], dim=1)
         
-        return dt_locs, dt_scales, charge_locs, charge_scales, mu_rest, logvar_rest, decoder_target_sequence, z0_true_log_len
+        # tgt_key_padding_mask for decoder_input_for_decode
+        # If true_lengths_for_loss is L_true (number of actual events in target_for_loss),
+        # then decoder_input_for_decode has L_true valid entries (start_token + L_true-1 items).
+        # The mask should be True for padded elements.
+        true_lengths_for_input = torch.round(torch.exp(z0_true_log_len.squeeze(dim=-1)) - 1.0).long()
+        true_lengths_for_input = torch.clamp(true_lengths_for_input, min=1, max=self.max_seq_len)
+        # The decoder_input_for_decode has `true_lengths_for_input` valid elements.
+        # So, elements from index `true_lengths_for_input` onwards are padding.
+        tgt_key_padding_mask = torch.arange(self.max_seq_len, device=z.device)[None, :] >= true_lengths_for_input[:, None]
+
+
+        dt_locs, dt_scales, charge_locs, charge_scales = self.decode(z, decoder_input_for_decode, tgt_key_padding_mask)
+        
+        return dt_locs, dt_scales, charge_locs, charge_scales, mu_rest, logvar_rest, decoder_target_for_loss, z0_true_log_len
 
     def _shared_step(self, batch, batch_idx, stage_name):
         dt_locs, dt_scales, charge_locs, charge_scales, mu_rest, logvar_rest, target_sequence, z0_true_log_len = self.forward(batch)
@@ -209,44 +202,35 @@ class Om2vecModel(pl.LightningModule):
         target_delta_t = target_sequence[:, :, 0:1]
         target_charge = target_sequence[:, :, 1:2]
 
-        # Determine actual lengths for loss masking from z0_true_log_len
         true_lengths_for_loss = torch.round(torch.exp(z0_true_log_len.squeeze(dim=-1)) - 1.0).long()
         true_lengths_for_loss = torch.clamp(true_lengths_for_loss, min=1, max=self.max_seq_len)
 
         loss_mask_seq = torch.arange(self.max_seq_len, device=target_sequence.device)[None, :] < true_lengths_for_loss[:, None]
-        loss_mask = loss_mask_seq.unsqueeze(-1) # (B, L, 1) to broadcast with (B, L, 1) log_probs
+        loss_mask = loss_mask_seq.unsqueeze(-1) 
 
-        # Reconstruction Loss (Negative Log Likelihood)
-        # For delta_t (LogNormal) - ensure target_delta_t is positive for log_prob
         dist_dt = LogNormal(dt_locs, dt_scales.clamp(min=1e-6))
         log_prob_dt = dist_dt.log_prob(target_delta_t.clamp(min=1e-6)) 
         
-        # For charge (Normal)
         dist_charge = Normal(charge_locs, charge_scales.clamp(min=1e-6))
         log_prob_charge = dist_charge.log_prob(target_charge)
 
         masked_log_prob_dt = log_prob_dt * loss_mask
         masked_log_prob_charge = log_prob_charge * loss_mask
-
-        # Sum over seq_len and feature_dim (1), then mean over batch dimension
-        # For NLL, we want to maximize log_prob, so minimize -log_prob
-        # Sum over active entries only. Divide by number of active entries in batch for mean.
+        
         active_elements_per_batch = loss_mask.sum()
         
         recon_loss_dt = -masked_log_prob_dt.sum() / active_elements_per_batch.clamp(min=1)
         recon_loss_charge = -masked_log_prob_charge.sum() / active_elements_per_batch.clamp(min=1)
         reconstruction_loss = recon_loss_dt + recon_loss_charge
 
-        # KL Divergence for z[1:] (learned part)
         kl_divergence = -0.5 * torch.sum(1 + logvar_rest - mu_rest.pow(2) - logvar_rest.exp(), dim=1).mean()
         
-        # Calculate KL beta for annealing
-        if self.kl_anneal_epochs > 0 and self.current_epoch < self.kl_anneal_epochs:
-            kl_beta = self.kl_beta_start + (self.kl_beta_end - self.kl_beta_start) * (self.current_epoch / self.kl_anneal_epochs)
-        elif self.kl_anneal_epochs > 0 and self.current_epoch >= self.kl_anneal_epochs:
+        if self.kl_anneal_epochs > 0 and self.trainer.current_epoch < self.kl_anneal_epochs: # Use self.trainer.current_epoch
+            kl_beta = self.kl_beta_start + (self.kl_beta_end - self.kl_beta_start) * (self.trainer.current_epoch / self.kl_anneal_epochs)
+        elif self.kl_anneal_epochs > 0 and self.trainer.current_epoch >= self.kl_anneal_epochs:
             kl_beta = self.kl_beta_end
-        else: # No annealing or annealing finished
-            kl_beta = self.kl_beta_end # Use end value (could be 1.0 if not specified for annealing)
+        else: 
+            kl_beta = self.kl_beta_end 
 
         loss = reconstruction_loss + kl_beta * kl_divergence
 
@@ -276,67 +260,73 @@ class Om2vecModel(pl.LightningModule):
             lr=opt_cfg['lr'],
             weight_decay=opt_cfg['weight_decay']
         )
-        # Example of adding a scheduler from config if present
         if "lr_schedule" in opt_cfg and opt_cfg["lr_schedule"]:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=opt_cfg["lr_schedule"][0], eta_min=opt_cfg["lr_schedule"][1]
             )
             return [optimizer], [scheduler]
+        return optimizer
 
     @torch.no_grad()
     def generate(self, num_samples: int, z_vectors_provided: torch.Tensor, device: torch.device):
-        # z_vectors_provided: (num_samples, total_latent_dim), where z_vectors_provided[:, 0] is log(N_gen + 1)
         self.eval()
+        d_model = self.hparams['model_options']['d_model']
         
         all_generated_sequences_t_norm = []
         all_generated_sequences_q_norm = []
 
         for i in range(num_samples):
-            z_sample_i = z_vectors_provided[i:i+1, :].to(device) # (1, total_latent_dim)
+            z_sample_i = z_vectors_provided[i:i+1, :].to(device) 
 
             n_steps_for_this_sample = torch.round(torch.exp(z_sample_i[:, 0]) - 1.0).int().item()
             n_steps_for_this_sample = max(1, min(n_steps_for_this_sample, self.max_seq_len))
 
-            # Initial hidden state for decoder RNN from z_sample_i
-            decoder_h0_gen = self.latent_to_decoder_hidden(z_sample_i)
-            decoder_h0_gen = decoder_h0_gen.unsqueeze(0).repeat(self.hparams['model_options']['decoder_num_layers'], 1, 1)
-            # self.decoder_rnn is now always nn.LSTM
-            decoder_hidden_gen = (decoder_h0_gen, torch.zeros_like(decoder_h0_gen, device=device))
-            
-            current_delta_t_input = torch.zeros(1, 1, 1, device=device) # Start token
-            current_charge_input = torch.zeros(1, 1, 1, device=device)  # Start token
+            memory_latent_i = self.latent_to_memory_transform(z_sample_i) 
+            memory = memory_latent_i.unsqueeze(1) # (1, 1, d_model) - Global memory context
 
-            generated_sequence_t_single_norm = []
-            generated_sequence_q_single_norm = []
+            # Start with a start-of-sequence token (batch_size=1, seq_len=1, features=2)
+            # Features are (delta_t, charge), initially zeros.
+            generated_tokens_features = torch.zeros(1, 1, 2, device=device) 
+            
+            current_generated_t_single_norm = []
+            current_generated_q_single_norm = []
 
             for _ in range(n_steps_for_this_sample):
-                embedded_dt = torch.relu(self.time_embed_dec(current_delta_t_input))
-                embedded_q = torch.relu(self.charge_embed_dec(current_charge_input))
-                decoder_input_k = torch.cat([embedded_dt, embedded_q], dim=2)
+                # Embed current sequence of generated tokens
+                embedded_tgt = self.feature_embed(generated_tokens_features) # (1, current_len, d_model)
+                embedded_tgt = embedded_tgt * math.sqrt(d_model)
+                embedded_tgt = self.pos_encoder(embedded_tgt)
 
-                rnn_output_k, decoder_hidden_gen = self.decoder_rnn(decoder_input_k, decoder_hidden_gen)
+                tgt_mask_gen = self._generate_square_subsequent_mask(embedded_tgt.size(1), device)
+                
+                decoder_output_step = self.transformer_decoder(
+                    embedded_tgt, 
+                    memory, 
+                    tgt_mask=tgt_mask_gen
+                    # No tgt_key_padding_mask needed as we build the sequence one by one without padding
+                )
+                
+                last_token_output = decoder_output_step[:, -1:, :] # (1, 1, d_model)
 
-                dt_loc = self.fc_delta_t_loc(rnn_output_k)
-                dt_scale = torch.exp(self.fc_delta_t_scale(rnn_output_k))
-                charge_loc = self.fc_charge_loc(rnn_output_k)
-                charge_scale = torch.exp(self.fc_charge_scale(rnn_output_k))
+                dt_loc = self.fc_delta_t_loc(last_token_output)
+                dt_scale = torch.exp(self.fc_delta_t_scale(last_token_output))
+                charge_loc = self.fc_charge_loc(last_token_output)
+                charge_scale = torch.exp(self.fc_charge_scale(last_token_output))
 
-                next_delta_t_norm = LogNormal(dt_loc, dt_scale.clamp(min=1e-6)).sample()
+                next_delta_t_norm = LogNormal(dt_loc, dt_scale.clamp(min=1e-6)).sample() 
                 next_charge_norm = Normal(charge_loc, charge_scale.clamp(min=1e-6)).sample()
                 
-                generated_sequence_t_single_norm.append(next_delta_t_norm.squeeze())
-                generated_sequence_q_single_norm.append(next_charge_norm.squeeze())
+                current_generated_t_single_norm.append(next_delta_t_norm.squeeze().clone()) # Use .clone()
+                current_generated_q_single_norm.append(next_charge_norm.squeeze().clone())
 
-                current_delta_t_input = next_delta_t_norm
-                current_charge_input = next_charge_norm
+                next_feature_pair = torch.cat([next_delta_t_norm, next_charge_norm], dim=2) # (1,1,2)
+                generated_tokens_features = torch.cat([generated_tokens_features, next_feature_pair], dim=1)
             
-            if generated_sequence_t_single_norm:
-                all_generated_sequences_t_norm.append(torch.stack(generated_sequence_t_single_norm))
-                all_generated_sequences_q_norm.append(torch.stack(generated_sequence_q_single_norm))
-            else: # Should not happen if n_steps_for_this_sample >= 1
+            if current_generated_t_single_norm:
+                all_generated_sequences_t_norm.append(torch.stack(current_generated_t_single_norm))
+                all_generated_sequences_q_norm.append(torch.stack(current_generated_q_single_norm))
+            else:
                 all_generated_sequences_t_norm.append(torch.tensor([], device=device))
                 all_generated_sequences_q_norm.append(torch.tensor([], device=device))
-
-        # Return lists of normalized sequences. Unnormalization and conversion to absolute times
-        # would typically be done by the caller or a post-processing utility.
+        
         return all_generated_sequences_t_norm, all_generated_sequences_q_norm
