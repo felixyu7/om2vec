@@ -7,7 +7,8 @@ import awkward as ak
 import pyarrow.parquet as pq
 
 from utils.utils import log_transform # Updated import
-from dataloaders.data_utils import get_file_names, ParquetFileSampler
+from dataloaders.data_utils import get_file_names, ParquetFileSampler, variable_length_collate_fn # Import new collate_fn
+from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusDataModule(pl.LightningDataModule):
     """
@@ -44,35 +45,52 @@ class PrometheusDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         """Returns the training dataloader."""
-        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
-        dataloader = torch.utils.data.DataLoader(self.train_dataset, 
-                                            batch_size = self.cfg['training_options']['batch_size'], 
-                                            sampler=sampler,
+        # Using standard shuffle and new collate_fn
+        # sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        
+        # Get max_seq_len_padding from config for the collate function
+        max_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        collate_fn_with_padding = partial(variable_length_collate_fn, max_seq_len_padding=max_len_padding)
+
+        dataloader = torch.utils.data.DataLoader(self.train_dataset,
+                                            batch_size = self.cfg['training_options']['batch_size'],
+                                            shuffle=True, # Use standard shuffle
+                                            collate_fn=collate_fn_with_padding, # Use new collate_fn
                                             pin_memory=True,
-                                            persistent_workers=True,
+                                            persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
                                             num_workers=self.cfg['training_options']['num_workers'])
         return dataloader
-    
+
     def val_dataloader(self):
         """Returns the validation dataloader."""
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
-        return torch.utils.data.DataLoader(self.valid_dataset, 
-                                           batch_size = self.cfg['training_options']['batch_size'], 
-                                           sampler=sampler,
+        # sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        
+        max_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        collate_fn_with_padding = partial(variable_length_collate_fn, max_seq_len_padding=max_len_padding)
+
+        return torch.utils.data.DataLoader(self.valid_dataset,
+                                           batch_size = self.cfg['training_options']['batch_size'],
+                                           shuffle=False, # No shuffle for validation
+                                           collate_fn=collate_fn_with_padding, # Use new collate_fn
                                            pin_memory=True,
-                                           persistent_workers=True,
+                                           persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
                                            num_workers=self.cfg['training_options']['num_workers'])
 
     def test_dataloader(self):
         """Returns the test dataloader (same as validation for now)."""
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
-        return torch.utils.data.DataLoader(self.valid_dataset, 
-                                           batch_size = self.cfg['training_options']['batch_size'], 
-                                           sampler=sampler,
-                                           pin_memory=True,
-                                           persistent_workers=True,
-                                           num_workers=self.cfg['training_options']['num_workers'])
+        # sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
         
+        max_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        collate_fn_with_padding = partial(variable_length_collate_fn, max_seq_len_padding=max_len_padding)
+        
+        return torch.utils.data.DataLoader(self.valid_dataset,
+                                           batch_size = self.cfg['training_options']['batch_size'],
+                                           shuffle=False, # No shuffle for test
+                                           collate_fn=collate_fn_with_padding, # Use new collate_fn
+                                           pin_memory=True,
+                                           persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
+                                           num_workers=self.cfg['training_options']['num_workers'])
+
 class PrometheusDataset(torch.utils.data.Dataset):
     """
     Dataset class for Prometheus data.
@@ -82,7 +100,8 @@ class PrometheusDataset(torch.utils.data.Dataset):
     def __init__(self, files, cfg): # Added cfg
         self.files = files
         self.cfg = cfg # Store cfg
-        self.max_seq_len = self.cfg['data_options']['max_seq_len']
+        # self.max_seq_len is no longer used here, padding handled by collate_fn
+        self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0) # Get from cfg
         
         # Count number of events in each file
         num_events = []
@@ -103,8 +122,9 @@ class PrometheusDataset(torch.utils.data.Dataset):
         """
         Return one training example.
 
-        The photon sequence is *never* truncated: if it is longer than
-        self.max_seq_len the hits are binned down to that length by time.
+        Photon hits are grouped into `grouping_window_ns` (e.g., 2ns) windows.
+        Each group becomes an event with (time_of_first_hit_in_group, num_hits_in_group).
+        Outputs variable-length sequences. Padding is handled by collate_fn.
         """
         # ---------- index bookkeeping ----------
         if i < 0 or i >= self.dataset_size:
@@ -121,68 +141,60 @@ class PrometheusDataset(torch.utils.data.Dataset):
         row = self.current_data[true_idx]
 
         # ---------- raw per-hit arrays ----------
-        time_column = self.cfg['data_options'].get('time_column', 't') # Get time column from config
+        time_column = self.cfg['data_options'].get('time_column', 't')
         raw_t = np.asarray(row[time_column], dtype=np.float32)
-        raw_q = np.ones_like(raw_t, dtype=np.float32)      # unit charge per hit, becomes count after binning
 
-        # Prometheus-specific features (sensor_pos, z_summary) are removed for om2vec
-
-        max_len = self.max_seq_len
-        cur_len = len(raw_t)
-
-        # ---------- BIN if sequence is too long ----------
-        if cur_len > max_len:
-            # build max_len equal-width bins between the first and last hit
-            t_min, t_max = raw_t.min(), raw_t.max()
-            bin_edges = np.linspace(t_min, t_max, max_len + 1, dtype=np.float32)
-
-            # which bin does every hit belong to?
-            # np.searchsorted gives 1…max_len; subtract 1 → 0…max_len-1
-            bin_idx = np.searchsorted(bin_edges, raw_t, side="right") - 1
-            bin_idx = np.clip(bin_idx, 0, max_len - 1)
-
-            # aggregate charge (counts) with bincount
-            binned_q = np.bincount(
-                bin_idx, weights=raw_q, minlength=max_len
-            ).astype(np.float32)
-
-            # aggregate mean time per bin:
-            #   mean =   Σ t  /  n  ;  keep n so empty bins → 0
-            sums_t   = np.bincount(bin_idx, weights=raw_t, minlength=max_len)
-            counts   = np.bincount(bin_idx, minlength=max_len)
-            # avoid /0 by using where(counts>0)
-            binned_t = np.zeros(max_len, dtype=np.float32)
-            non_empty = counts > 0
-            binned_t[non_empty] = (sums_t[non_empty] / counts[non_empty]).astype(np.float32)
-
-            # the binned sequence is now the working sequence
-            work_t = torch.from_numpy(binned_t)
-            work_q = torch.from_numpy(binned_q)
-            attention_mask = torch.ones(max_len, dtype=torch.bool)
-            active_entries_count = max_len
+        if len(raw_t) == 0: # Handle empty sequences
+            grouped_times_np = np.array([], dtype=np.float32)
+            grouped_counts_np = np.array([], dtype=np.float32)
         else:
-            # ---------- original (≤ max_len) path ----------
-            work_t = torch.from_numpy(raw_t)
-            work_q = torch.from_numpy(raw_q)
-            attention_mask = torch.ones(max_len, dtype=torch.bool)
-            pad = max_len - cur_len
-            if pad:                             # zero-pad to max_len
-                work_t = torch.cat([work_t, torch.zeros(pad)], 0)
-                work_q = torch.cat([work_q, torch.zeros(pad)], 0)
-                attention_mask[cur_len:] = False
-            active_entries_count = cur_len
+            # Sort times for grouping
+            sorted_indices = np.argsort(raw_t)
+            raw_t_sorted = raw_t[sorted_indices]
 
-        # ---------- normalise ----------
-        norm_t = log_transform(work_t.float()) # Use log_transform
-        norm_q = log_transform(work_q.float()) # Use log_transform
-        
-        # norm_sensor_pos and norm_z_summary removed
+            grouped_times = []
+            grouped_counts = []
+            
+            current_window_start_time = raw_t_sorted[0]
+            current_window_count = 0
 
-        input_tq_sequence = torch.stack([norm_t, norm_q], dim=1)  # (max_len, 2)
+            for t_hit in raw_t_sorted:
+                if t_hit < current_window_start_time + self.grouping_window_ns:
+                    current_window_count += 1
+                else:
+                    # Finalize previous window
+                    grouped_times.append(current_window_start_time)
+                    grouped_counts.append(current_window_count)
+                    # Start new window
+                    current_window_start_time = t_hit
+                    current_window_count = 1
+            
+            # Add the last window
+            if current_window_count > 0:
+                grouped_times.append(current_window_start_time)
+                grouped_counts.append(current_window_count)
+
+            grouped_times_np = np.array(grouped_times, dtype=np.float32)
+            grouped_counts_np = np.array(grouped_counts, dtype=np.float32)
+
+        # ---------- Convert to Tensors and normalise ----------
+        raw_grouped_times_tensor = torch.from_numpy(grouped_times_np).float()
+        raw_grouped_counts_tensor = torch.from_numpy(grouped_counts_np).float()
+
+        # Apply log_transform (ensure log_transform handles empty tensors or zero values appropriately)
+        # For empty sequences, log_transform might need adjustment or these will be empty tensors.
+        if raw_grouped_times_tensor.numel() > 0:
+            norm_t = log_transform(raw_grouped_times_tensor)
+            norm_q = log_transform(raw_grouped_counts_tensor)
+        else:
+            norm_t = torch.empty(0, dtype=torch.float32)
+            norm_q = torch.empty(0, dtype=torch.float32)
 
         return {
-            "input_tq_sequence":   input_tq_sequence,      # (L,2)
-            "attention_mask":      attention_mask,         # (L,)
-            "active_entries_count": torch.tensor(active_entries_count, dtype=torch.float32) # Crucial for z[0]
+            "times": norm_t,  # Log-transformed absolute times of grouped events
+            "counts": norm_q, # Log-transformed counts of grouped events
+            "raw_times": raw_grouped_times_tensor, # Non-transformed, for calculating inter-event times later
+            "raw_counts": raw_grouped_counts_tensor, # Non-transformed counts
+            "sequence_length": torch.tensor(len(grouped_times_np), dtype=torch.long)
         }
         
