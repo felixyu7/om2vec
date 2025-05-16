@@ -1,138 +1,198 @@
+import os
+import glob
 import torch
 import numpy as np
-import lightning.pytorch as pl
-import gc, os, glob
-from collections import OrderedDict
-
+import pytorch_lightning as pl
 import awkward as ak
-from bisect import bisect_right
+import pyarrow.parquet as pq
 
-from dataloaders.data_utils import get_file_names, RandomChunkSampler
+from .data_utils import get_file_names, ParquetFileSampler, variable_length_collate_fn # Import new collate_fn
+from functools import partial # For passing max_seq_len_padding to collate_fn
 
-class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
-    def __init__(self, cfg, field='mc_truth'):
+class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
+    """
+    PyTorch Lightning data module for Prometheus dataset.
+    """
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.field = field
         
     def prepare_data(self):
+        """Called only once and on 1 GPU."""
         pass
     
     def setup(self, stage=None):
-        if self.cfg['training']:
-            train_files = get_file_names(self.cfg['data_options']['train_data_files'], 
-                                         self.cfg['data_options']['train_data_file_ranges'])
-            self.train_dataset = PrometheusTimeSeriesDataset(cache_size=32,
-                                           reduce_size=-1,
-                                           file_chunk_size=self.cfg['data_options']['file_chunk_size'],
-                                           paths=train_files)
-            
-        valid_files = get_file_names(self.cfg['data_options']['valid_data_files'], 
-                                     self.cfg['data_options']['valid_data_file_ranges'])
-        self.valid_dataset = PrometheusTimeSeriesDataset(cache_size=32,
-                                        reduce_size=-1,
-                                        file_chunk_size=self.cfg['data_options']['file_chunk_size'],
-                                        paths=valid_files)
+        """
+        Called on each GPU separately - shards data to all GPUs.
         
+        Sets up train and validation datasets.
+        """
+        if self.cfg['training']:
+            train_files = get_file_names(
+                self.cfg['data_options']['train_data_files'], 
+                self.cfg['data_options']['train_data_file_ranges'],
+                self.cfg['data_options']['shuffle_files']
+            )
+            self.train_dataset = PrometheusTimeSeriesDataset(train_files, self.cfg) # Pass cfg, Renamed
+            
+        valid_files = get_file_names(
+            self.cfg['data_options']['valid_data_files'],
+            self.cfg['data_options']['valid_data_file_ranges'],
+            self.cfg['data_options']['shuffle_files']
+        )
+        self.valid_dataset = PrometheusTimeSeriesDataset(valid_files, self.cfg) # Pass cfg, Renamed
+
     def train_dataloader(self):
-        sampler = RandomChunkSampler(self.train_dataset, 
-                                     batch_size=self.cfg['training_options']['batch_size'], 
-                                     chunks=self.train_dataset.chunks)
-        dataloader = torch.utils.data.DataLoader(self.train_dataset, 
-                                            batch_size = self.cfg['training_options']['batch_size'], 
-                                            # shuffle=True,
-                                            sampler=sampler,
+        """Returns the training dataloader."""
+        # Using standard shuffle and new collate_fn
+        # sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        
+        # Get max_seq_len_padding from config for the collate function
+        max_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        collate_fn_with_padding = partial(variable_length_collate_fn, max_seq_len_padding=max_len_padding)
+
+        dataloader = torch.utils.data.DataLoader(self.train_dataset,
+                                            batch_size = self.cfg['training_options']['batch_size'],
+                                            shuffle=True, # Use standard shuffle
+                                            collate_fn=collate_fn_with_padding, # Use new collate_fn
                                             pin_memory=True,
-                                            persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers']-1,
-                                            prefetch_factor=2)
+                                            persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
+                                            num_workers=self.cfg['training_options']['num_workers'])
         return dataloader
-    
+
     def val_dataloader(self):
-        sampler = RandomChunkSampler(self.valid_dataset, 
-                                     batch_size=self.cfg['training_options']['batch_size'], 
-                                     chunks=self.valid_dataset.chunks)
-        return torch.utils.data.DataLoader(self.valid_dataset, 
-                                            batch_size = self.cfg['training_options']['batch_size'], 
-                                            # shuffle=True,
-                                            sampler=sampler,
-                                            pin_memory=True,
-                                            persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers']-1,
-                                            prefetch_factor=2)
+        """Returns the validation dataloader."""
+        # sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        
+        max_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        collate_fn_with_padding = partial(variable_length_collate_fn, max_seq_len_padding=max_len_padding)
+
+        return torch.utils.data.DataLoader(self.valid_dataset,
+                                           batch_size = self.cfg['training_options']['batch_size'],
+                                           shuffle=False, # No shuffle for validation
+                                           collate_fn=collate_fn_with_padding, # Use new collate_fn
+                                           pin_memory=True,
+                                           persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
+                                           num_workers=self.cfg['training_options']['num_workers'])
 
     def test_dataloader(self):
-        return torch.utils.data.DataLoader(self.valid_dataset, 
-                                            batch_size = self.cfg['training_options']['batch_size'], 
-                                            shuffle=False,
-                                            pin_memory=True,
-                                            persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers']-1,
-                                            prefetch_factor=2)
+        """Returns the test dataloader (same as validation for now)."""
+        # sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        
+        max_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        collate_fn_with_padding = partial(variable_length_collate_fn, max_seq_len_padding=max_len_padding)
+        
+        return torch.utils.data.DataLoader(self.valid_dataset,
+                                           batch_size = self.cfg['training_options']['batch_size'],
+                                           shuffle=False, # No shuffle for test
+                                           collate_fn=collate_fn_with_padding, # Use new collate_fn
+                                           pin_memory=True,
+                                           persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
+                                           num_workers=self.cfg['training_options']['num_workers'])
 
-class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        cache_size=32,
-        reduce_size=-1,
-        file_chunk_size=250000,
-        paths=[]
-    ):  
-        self.reduce_size, self.cache_size = reduce_size, cache_size
-
-        self.path_dict = {}  # keep track of which folder the files are in
+class PrometheusTimeSeriesDataset(torch.utils.data.Dataset): # Renamed from PrometheusDataset
+    """
+    Dataset class for Prometheus data.
+    
+    Handles loading data from parquet files and preprocessing it for the model.
+    """
+    def __init__(self, files, cfg): # Added cfg
+        self.files = files
+        self.cfg = cfg # Store cfg
+        # self.max_seq_len is no longer used here, padding handled by collate_fn
+        self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0) # Get from cfg
         
-        self.chunks = []
-        self.files = []
-        self.paths = paths
+        # Count number of events in each file
+        num_events = []
+        for file in self.files:
+            data = pq.ParquetFile(file)
+            num_events.append(data.metadata.num_rows)
+        num_events = np.array(num_events)
+        self.cumulative_lengths = np.concatenate(([0], np.cumsum(num_events)))
+        self.dataset_size = self.cumulative_lengths[-1]
         
-        for path in self.paths:
-            # Get the number of events in each folder
-            base_path = '/' + os.path.join(*path.split('/')[:-1])
-            
-            # Get the file names
-            _files = [p.split('/')[-1] for p in sorted(glob.glob(path))]
-            self.files += _files
-            for f in _files:
-                self.path_dict[f] = base_path
+        self.current_file = ''
+        self.current_data = None
         
-        file_size = file_chunk_size
-        self.chunks = np.array([file_size] * len(self.files))
-        self.chunk_cumsum = np.cumsum(self.chunks)
-        self.cache, self.meta_cache = None, None
-        
-        # randomly permute files list
-        self.files = np.random.permutation(self.files)
-        gc.collect()
-
     def __len__(self):
-        return (
-            self.chunk_cumsum[-1]
-            if self.reduce_size < 0
-            else int(self.reduce_size * self.chunk_cumsum[-1])
-        )
+        return self.dataset_size
+    
+    def __getitem__(self, i: int):
+        """
+        Return one training example.
 
-    def load_data(self, fname):
-        
-        if self.cache is None:
-            self.cache = OrderedDict()
-        
-        if fname not in self.cache:
-            df = ak.from_parquet(os.path.join(self.path_dict[fname], fname)).binned_time_counts.to_numpy().astype(np.float32)
-            self.cache[fname] = df
-            if len(self.cache) > self.cache_size:
-                del self.cache[list(self.cache.keys())[0]]
+        Photon hits are grouped into `grouping_window_ns` (e.g., 2ns) windows.
+        Each group becomes an event with (time_of_first_hit_in_group, num_hits_in_group).
+        Outputs variable-length sequences. Padding is handled by collate_fn.
+        """
+        # ---------- index bookkeeping ----------
+        if i < 0 or i >= self.dataset_size:
+            raise IndexError("Index out of range")
 
-    def __getitem__(self, idx0):
-        fidx = bisect_right(self.chunk_cumsum, idx0)
-        fname = self.files[fidx]
-        idx = int(idx0 - self.chunk_cumsum[fidx - 1]) if fidx > 0 else idx0
-        
-        self.load_data(fname)
-        time_series = self.cache[fname][idx]
-        time_series = np.log(time_series + 1)
+        file_index = np.searchsorted(self.cumulative_lengths, i + 1) - 1
+        true_idx   = i - self.cumulative_lengths[file_index]
 
-        return torch.from_numpy(time_series).float()
-        
+        # ---------- lazy-load current parquet ----------
+        if self.current_file != self.files[file_index]:
+            self.current_file = self.files[file_index]
+            self.current_data = ak.from_parquet(self.current_file)
 
-        
+        row = self.current_data[true_idx]
+
+        # ---------- raw per-hit arrays ----------
+        time_column = self.cfg['data_options'].get('time_column', 't')
+        raw_t = np.asarray(row[time_column], dtype=np.float32)
+
+        if len(raw_t) == 0: # Handle empty sequences
+            grouped_times_np = np.array([], dtype=np.float32)
+            grouped_counts_np = np.array([], dtype=np.float32)
+        else:
+            # Sort times for grouping
+            sorted_indices = np.argsort(raw_t)
+            raw_t_sorted = raw_t[sorted_indices]
+
+            grouped_times = []
+            grouped_counts = []
+            
+            current_window_start_time = raw_t_sorted[0]
+            current_window_count = 0
+
+            for t_hit in raw_t_sorted:
+                if t_hit < current_window_start_time + self.grouping_window_ns:
+                    current_window_count += 1
+                else:
+                    # Finalize previous window
+                    grouped_times.append(current_window_start_time)
+                    grouped_counts.append(current_window_count)
+                    # Start new window
+                    current_window_start_time = t_hit
+                    current_window_count = 1
+            
+            # Add the last window
+            if current_window_count > 0:
+                grouped_times.append(current_window_start_time)
+                grouped_counts.append(current_window_count)
+
+            grouped_times_np = np.array(grouped_times, dtype=np.float32)
+            grouped_counts_np = np.array(grouped_counts, dtype=np.float32)
+
+        # ---------- Convert to Tensors and normalise ----------
+        raw_grouped_times_tensor = torch.from_numpy(grouped_times_np).float()
+        raw_grouped_counts_tensor = torch.from_numpy(grouped_counts_np).float()
+
+        # Apply log_transform (ensure log_transform handles empty tensors or zero values appropriately)
+        # For empty sequences, log_transform might need adjustment or these will be empty tensors.
+        if raw_grouped_times_tensor.numel() > 0:
+            norm_t = torch.log(raw_grouped_times_tensor + 1)
+            norm_q = torch.log(raw_grouped_counts_tensor + 1)
+        else:
+            norm_t = torch.empty(0, dtype=torch.float32)
+            norm_q = torch.empty(0, dtype=torch.float32)
+
+        return {
+            "times": norm_t,  # Log-transformed absolute times of grouped events
+            "counts": norm_q, # Log-transformed counts of grouped events
+            "raw_times": raw_grouped_times_tensor, # Non-transformed, for calculating inter-event times later
+            "raw_counts": raw_grouped_counts_tensor, # Non-transformed counts
+            "sequence_length": torch.tensor(len(grouped_times_np), dtype=torch.long)
+        }

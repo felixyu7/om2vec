@@ -1,9 +1,9 @@
 import torch
 import numpy as np
-import lightning.pytorch as pl
+import pytorch_lightning as pl
 import os
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, StochasticWeightAveraging
+from pytorch_lightning.loggers import WandbLogger, CSVLogger
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from vae import NT_VAE
 
@@ -50,28 +50,52 @@ if __name__=="__main__":
         print("Loading checkpoint: ", cfg['checkpoint'])
         net = NT_VAE.load_from_checkpoint(cfg['checkpoint'])
     else:
-        net = NT_VAE(cfg['model_options']['in_features'],
-                    cfg['model_options']['latent_dim'],
-                    cfg['model_options']['embed_dim'],
-                    cfg['model_options']['beta_factor'],
-                    cfg['model_options']['beta_peak_epoch'],
-                    cfg['model_options']['sensor_positional_encoding'],
-                    np.ceil(dataset_size / cfg['training_options']['batch_size']),
-                    cfg['training_options']['batch_size'],
-                    cfg['training_options']['lr'],
-                    cfg['training_options']['lr_schedule'],
-                    cfg['training_options']['weight_decay'])
+        # Pass model_options and relevant data_options directly
+        # The VAE's __init__ will use self.hparams to access these
+        model_hparams = {**cfg['model_options'], **cfg['training_options']}
+        # Add max_seq_len_padding from data_options as it's needed by the model
+        model_hparams['max_seq_len_padding'] = cfg['data_options']['max_seq_len_padding']
+        # The dataset_size for beta annealing will be handled differently or passed via datamodule
+        # For now, remove direct dataset_size/batch_size from VAE constructor if they are for beta annealing steps
+        
+        # Consolidate all necessary hparams for NT_VAE
+        # NT_VAE will access them via self.hparams
+        vae_init_args = {
+            "latent_dim": cfg['model_options']['latent_dim'],
+            "embed_dim": cfg['model_options']['embed_dim'],
+            "beta_factor": cfg['model_options']['beta_factor'],
+            "beta_peak_epoch": cfg['model_options']['beta_peak_epoch'],
+            "sensor_positional_encoding": cfg['model_options']['sensor_positional_encoding'],
+            "max_seq_len_padding": cfg['data_options']['max_seq_len_padding'],
+            "transformer_encoder_layers": cfg['model_options']['transformer_encoder_layers'],
+            "transformer_encoder_heads": cfg['model_options']['transformer_encoder_heads'],
+            "transformer_encoder_ff_dim": cfg['model_options']['transformer_encoder_ff_dim'],
+            "transformer_encoder_dropout": cfg['model_options']['transformer_encoder_dropout'],
+            "flow_transforms": cfg['model_options']['flow_transforms'],
+            "flow_bins": cfg['model_options']['flow_bins'],
+            "flow_hidden_dim": cfg['model_options']['flow_hidden_dim'],
+            "flow_hidden_layers": cfg['model_options']['flow_hidden_layers'],
+            "batch_size": cfg['training_options']['batch_size'], # Add batch_size for VAE hparams
+            "lr": cfg['training_options']['lr'],
+            "lr_schedule": cfg['training_options']['lr_schedule'],
+            "weight_decay": cfg['training_options']['weight_decay'],
+        }
+
+        net = NT_VAE(**vae_init_args)
     
     if cfg['training']:
-        # initialise the wandb logger and name your wandb project
-        os.environ["WANDB_DIR"] = os.path.abspath(cfg['project_save_dir'])
-        wandb_logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'], log_model='all')
+        if cfg['logger'] == 'wandb':
+            # initialise the wandb logger and name your wandb project
+            os.environ["WANDB_DIR"] = os.path.abspath(cfg['project_save_dir'])
+            wandb_logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'], log_model='all')
 
-        # add your batch size to the wandb config
-        wandb_logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
+            # add your batch size to the wandb config
+            wandb_logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
+        else:
+            wandb_logger = CSVLogger(cfg['project_save_dir'], name=cfg['project_name'])
 
         lr_monitor = LearningRateMonitor(logging_interval='step')
-        checkpoint_callback = ModelCheckpoint(dirpath=cfg['project_save_dir'] + '/' + cfg['project_name'] + '/' + wandb_logger.version + '/checkpoints',
+        checkpoint_callback = ModelCheckpoint(dirpath=cfg['project_save_dir'] + '/' + cfg['project_name'] + '/checkpoints',
                                               filename='model-{epoch:02d}-{val_loss:.2f}.ckpt', 
                                               every_n_epochs=cfg['training_options']['save_epochs'],
                                               save_on_train_epoch_end=True)
@@ -83,7 +107,7 @@ if __name__=="__main__":
                             #  overfit_batches=10,
                              gradient_clip_val=0.1,
                              logger=wandb_logger, 
-                             callbacks=[checkpoint_callback, StochasticWeightAveraging(swa_lrs=cfg['training_options']['lr']), lr_monitor],
+                             callbacks=[checkpoint_callback, lr_monitor],
                              num_sanity_val_steps=0)
         if cfg['resume_training']:
             print("Resuming training from checkpoint ", cfg['checkpoint'])
