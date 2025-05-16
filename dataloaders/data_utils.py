@@ -27,7 +27,9 @@ def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files:
         filtered_files.extend(
             all_files[file_range[0]:file_range[1]]
         )
-    return sorted(filtered_files)
+    if shuffle_files:
+        random.shuffle(filtered_files)
+    return filtered_files
 
 class ParquetFileSampler(Sampler):
     """
@@ -57,91 +59,47 @@ class ParquetFileSampler(Sampler):
     def __len__(self) -> int:
        return len(self.data_source)
 
-def variable_length_collate_fn(
-    batch: List[Dict[str, torch.Tensor]],
-    max_seq_len_padding: int | None = None,
+def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
 ) -> Dict[str, torch.Tensor]:
     """
-    Optimised collate-fn for variable-length time-series.
-    Keeps the original semantics (including the “merge-nearest-events”
-    truncation rule) while trimming Python & allocation overhead.
+    Collate after all per-item shortening is done in __getitem__.
+    Pads to the longest sequence in the mini-batch and builds attention-mask.
     """
 
-    bsz               = len(batch)
-    device            = batch[0]["raw_times"].device
-    dtype             = batch[0]["raw_times"].dtype
-    processed_items   = []
-    max_len_in_batch  = 0                       # longest sequence *after* any truncation
+    bsz      = len(batch)
+    device   = batch[0]["times"].device
+    dtype    = batch[0]["times"].dtype
 
-    # ------------------------------------------------------------------
-    # 1. PER–ITEM PRE-PROCESS + OPTIONAL TRUNCATION
-    # ------------------------------------------------------------------
-    for item in batch:
-        rt  = item["raw_times"]    # (L,)
-        rc  = item["raw_counts"]
-        L   = int(item["sequence_length"])
+    seq_lens = torch.tensor([it["sequence_length"].item() for it in batch],
+                            dtype=torch.long, device=device)
+    max_len  = int(seq_lens.max().item()) if bsz else 0
 
-        # ---- optional “adaptive regroup” to respect max_seq_len_padding ----
-        if max_seq_len_padding is not None and L > max_seq_len_padding:
-            merges_needed = L - max_seq_len_padding
-            # keep everything on torch (index-deletions are still cheap on 1-D tensors)
-            for _ in range(merges_needed):
-                # argmin() on diff is O(L), but L only shrinks; still faster
-                # (and simpler) than a Python heap for the usual scale (<1k).
-                idx = torch.argmin(torch.diff(rt))
-                rc[idx] += rc[idx + 1]         # merge counts
-                rt      = torch.cat((rt[:idx + 1],  rt[idx + 2:]))
-                rc      = torch.cat((rc[:idx + 1],  rc[idx + 2:]))
-                L      -= 1
+    # ---------- pre-allocate padded buffers ----------
+    shape      = (bsz, max_len)
+    zeros_f32  = dict(size=shape, dtype=dtype, device=device)
 
-        # ---- book-keeping & log-space tensors ----
-        item["raw_times"]       = rt
-        item["raw_counts"]      = rc
-        item["times"]           = torch.log(rt + 1)
-        item["counts"]          = torch.log(rc + 1)
-        item["sequence_length"] = torch.tensor(L, dtype=torch.long, device=device)
+    times_pad   = torch.zeros(**zeros_f32)
+    counts_pad  = torch.zeros_like(times_pad)
+    raw_t_pad   = torch.zeros_like(times_pad)
+    raw_c_pad   = torch.zeros_like(times_pad)
+    attn_mask   = torch.zeros(bsz, max_len, dtype=torch.bool, device=device)
 
-        processed_items.append(item)
-        max_len_in_batch = max(max_len_in_batch, L)
-
-    # final target length (= longest sequence, optionally capped)
-    pad_len = max_len_in_batch
-    if max_seq_len_padding is not None:
-        pad_len = min(pad_len, max_seq_len_padding)
-
-    # ------------------------------------------------------------------
-    # 2. PRE-ALLOCATE PADDED BUFFERS
-    # ------------------------------------------------------------------
-    shape               = (bsz, pad_len)
-    zeros               = dict(size=shape, dtype=dtype, device=device)
-    times_padded        = torch.zeros(**zeros)
-    counts_padded       = torch.zeros_like(times_padded)
-    raw_times_padded    = torch.zeros_like(times_padded)
-    raw_counts_padded   = torch.zeros_like(times_padded)
-    attention_mask      = torch.zeros(bsz, pad_len, dtype=torch.bool, device=device)
-    seq_lens_tensor     = torch.empty(bsz, dtype=torch.long, device=device)
-
-    # ------------------------------------------------------------------
-    # 3. WRITE EACH SEQUENCE INTO THE PRE-ALLOCATED BUFFERS
-    # ------------------------------------------------------------------
-    for row, item in enumerate(processed_items):
+    # ---------- write each sequence ----------
+    for row, item in enumerate(batch):
         L = int(item["sequence_length"])
-        if L == 0:                       # nothing to write
-            seq_lens_tensor[row] = 0
+        if L == 0:
             continue
-
-        times_padded[row,       :L] = item["times"]
-        counts_padded[row,      :L] = item["counts"]
-        raw_times_padded[row,   :L] = item["raw_times"]
-        raw_counts_padded[row,  :L] = item["raw_counts"]
-        attention_mask[row,     :L] = True
-        seq_lens_tensor[row]         = L
+        times_pad[row,  :L] = item["times"]
+        counts_pad[row, :L] = item["counts"]
+        raw_t_pad[row,  :L] = item["raw_times"]
+        raw_c_pad[row,  :L] = item["raw_counts"]
+        attn_mask[row,  :L] = True
 
     return {
-        "times_padded":     times_padded,
-        "counts_padded":    counts_padded,
-        "raw_times_padded": raw_times_padded,
-        "raw_counts_padded": raw_counts_padded,
-        "attention_mask":   attention_mask,
-        "sequence_lengths": seq_lens_tensor,
+        "times_padded":     times_pad,
+        "counts_padded":    counts_pad,
+        "raw_times_padded": raw_t_pad,
+        "raw_counts_padded": raw_c_pad,
+        "attention_mask":   attn_mask,
+        "sequence_lengths": seq_lens,
     }
