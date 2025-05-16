@@ -51,9 +51,14 @@ class NT_VAE(pl.LightningModule):
         self.to_latent_mu = nn.Linear(self.hparams.embed_dim, self.hparams.latent_dim)
         self.to_latent_logvar = nn.Linear(self.hparams.embed_dim, self.hparams.latent_dim)
         
-        # Decoder: Conditional Neural Spline Flow (Zuko)
+        # Decoder: Conditional Neural Spline Flow (Zuko) with learnable input affine transform
+        self.flow_input_affine = nn.Linear(1, 1)
+        # Initialize affine transform to identity (weight=1, bias=0)
+        torch.nn.init.ones_(self.flow_input_affine.weight)
+        torch.nn.init.zeros_(self.flow_input_affine.bias)
+
         self.conditional_flow = zuko.flows.NSF(
-            features=1, # Modeling univariate distribution of raw_times_padded at each step
+            features=1, # Modeling univariate distribution of affinely transformed raw_times
             context=self.hparams.latent_dim,
             transforms=self.hparams.flow_transforms,
             bins=self.hparams.flow_bins,
@@ -105,30 +110,42 @@ class NT_VAE(pl.LightningModule):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode_log_prob(self, target_log_times, z, attention_mask):
-        # target_log_times: (B, S), e.g., batch['times_padded'] (log-transformed)
+    def decode_log_prob(self, target_raw_times, z, attention_mask):
+        # target_raw_times: (B, S), e.g., batch['raw_times_padded'] (original raw scale)
         # z: (B, latent_dim)
         # attention_mask: (B, S), boolean, True for valid tokens
 
-        B, S = target_log_times.shape
-        target_flat = target_log_times.reshape(-1, 1).float() # (B*S, 1)
+        B, S = target_raw_times.shape
+        target_raw_flat = target_raw_times.reshape(-1, 1).float() # (B*S, 1)
 
+        # Apply learnable affine transformation: y = ax + b
+        target_affine_flat = self.flow_input_affine(target_raw_flat) # (B*S, 1)
+        
         context_expanded = z.unsqueeze(1).expand(-1, S, -1) # (B, S, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*S, latent_dim)
 
-        # distribution object from flow conditioned on context
+        # Flow models p_Y(y | z)
         dist = self.conditional_flow(context_flat)
-        log_probs_flat = dist.log_prob(target_flat) # (B*S,)
-        log_probs_seq = log_probs_flat.reshape(B, S) # (B, S)
+        log_prob_y_flat = dist.log_prob(target_affine_flat) # log p_Y(y|z), shape (B*S,)
+        
+        # Change of variables: log p_X(x|z) = log p_Y(ax+b|z) + log|a|
+        # The log_abs_determinant of the affine transform y = ax+b is log|a|.
+        # self.flow_input_affine.weight is (1,1), so take [0,0]
+        log_abs_det_jacobian = torch.log(self.flow_input_affine.weight.abs().clamp(min=1e-9))[0,0]
+        
+        log_prob_x_flat = log_prob_y_flat + log_abs_det_jacobian # (B*S,)
+        
+        log_probs_x_seq = log_prob_x_flat.reshape(B, S) # (B, S)
 
-        masked_log_probs = log_probs_seq * attention_mask.float() # Apply mask, ensure float for multiplication
+        masked_log_probs = log_probs_x_seq * attention_mask.float() # Apply mask
         return masked_log_probs
     
     def decode(self, z, time_steps_raw):
         """
         Decodes a latent representation z to produce PDF values for photon arrival times
         at the given raw time_steps.
-        The internal flow models log(t+1). This method transforms the PDF back to raw time scale.
+        The internal flow models an affinely transformed version of raw times.
+        This method computes the PDF in the original raw time scale.
 
         Args:
             z (torch.Tensor): Latent representation, shape (B, latent_dim).
@@ -138,40 +155,31 @@ class NT_VAE(pl.LightningModule):
             torch.Tensor: PDF values at the given time_steps_raw, shape (B, NumTimeSteps).
         """
         B = z.shape[0]
-        
-        # Ensure time_steps_raw is on the same device as z
         time_steps_raw = time_steps_raw.to(z.device)
 
         if time_steps_raw.ndim == 1:
             time_steps_raw = time_steps_raw.unsqueeze(0).expand(B, -1) # (B, NumTimeSteps)
         
         NumTimeSteps = time_steps_raw.shape[1]
-
-        # Transform raw time steps to log scale for the flow: log(t_raw + 1)
-        # Ensure input to log is positive. Add a small epsilon if times can be zero.
-        # Given that these are arrival times, they should be > 0. Adding 1 already handles t_raw=0.
-        time_steps_log = torch.log(time_steps_raw.float() + 1.0)
         
-        time_steps_log_flat = time_steps_log.reshape(-1, 1) # (B*NumTimeSteps, 1)
+        time_steps_raw_flat = time_steps_raw.reshape(-1, 1).float() # (B*NumTimeSteps, 1)
+
+        # Apply affine transformation: y = ax + b
+        time_steps_affine_flat = self.flow_input_affine(time_steps_raw_flat) # (B*NumTimeSteps, 1)
 
         context_expanded = z.unsqueeze(1).expand(-1, NumTimeSteps, -1) # (B, NumTimeSteps, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*NumTimeSteps, latent_dim)
 
         dist = self.conditional_flow(context_flat)
         
-        # Log PDF in the log-transformed space
-        log_pdf_log_scale_flat = dist.log_prob(time_steps_log_flat) # (B*NumTimeSteps,)
-        
-        # PDF in the log-transformed space
-        pdf_log_scale_flat = torch.exp(log_pdf_log_scale_flat)
+        # Log PDF in the affinely transformed space: log p_Y(y|z)
+        log_pdf_affine_flat = dist.log_prob(time_steps_affine_flat) # (B*NumTimeSteps,)
+        pdf_affine_flat = torch.exp(log_pdf_affine_flat)
 
-        # Jacobian of the transformation y = log(x+1) is dy/dx = 1/(x+1)
-        # pdf_raw(x) = pdf_log(log(x+1)) * |d(log(x+1))/dx|
-        # pdf_raw(x) = pdf_log(log(x+1)) * (1 / (x + 1))
-        # x corresponds to time_steps_raw
-        jacobian_flat = (1.0 / (time_steps_raw.float().reshape(-1) + 1.0)).clamp(min=1e-9) # (B*NumTimeSteps,)
+        # Change of variables: p_X(x|z) = p_Y(ax+b|z) * |a|
+        abs_det_jacobian = self.flow_input_affine.weight.abs().clamp(min=1e-9)[0,0]
         
-        pdf_raw_flat = pdf_log_scale_flat * jacobian_flat # (B*NumTimeSteps,)
+        pdf_raw_flat = pdf_affine_flat * abs_det_jacobian # (B*NumTimeSteps,)
         
         pdf_values_raw = pdf_raw_flat.reshape(B, NumTimeSteps)
         
@@ -192,11 +200,11 @@ class NT_VAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
             
-        # Reconstruction Loss from NSF (modeling log-transformed times)
-        target_log_times = batch['times_padded'].float() # Use log-transformed times
+        # Reconstruction Loss from NSF (modeling affinely transformed raw times)
+        target_raw_times = batch['raw_times_padded'].float() # Use raw times
         attention_mask = batch['attention_mask'].bool() # ensure boolean
 
-        log_probs_masked = self.decode_log_prob(target_log_times, z, attention_mask)
+        log_probs_masked = self.decode_log_prob(target_raw_times, z, attention_mask)
         
         # Average NLL over valid (non-padded) elements in the batch
         reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
@@ -233,10 +241,10 @@ class NT_VAE(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
 
-        target_log_times = batch['times_padded'].float() # Use log-transformed times
+        target_raw_times = batch['raw_times_padded'].float() # Use raw times
         attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(target_log_times, z, attention_mask)
+        log_probs_masked = self.decode_log_prob(target_raw_times, z, attention_mask)
         reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
         
         kl_loss = self.kl_divergence(mu, logvar)
@@ -250,10 +258,10 @@ class NT_VAE(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
 
-        target_log_times = batch['times_padded'].float() # Use log-transformed times
+        target_raw_times = batch['raw_times_padded'].float() # Use raw times
         attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(target_log_times, z, attention_mask)
+        log_probs_masked = self.decode_log_prob(target_raw_times, z, attention_mask)
         reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
 
         kl_loss = self.kl_divergence(mu, logvar)
