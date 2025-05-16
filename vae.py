@@ -51,14 +51,10 @@ class NT_VAE(pl.LightningModule):
         self.to_latent_mu = nn.Linear(self.hparams.embed_dim, self.hparams.latent_dim)
         self.to_latent_logvar = nn.Linear(self.hparams.embed_dim, self.hparams.latent_dim)
         
-        # Decoder: Conditional Neural Spline Flow (Zuko) with learnable input affine transform
-        self.flow_input_affine = nn.Linear(1, 1)
-        # Initialize affine transform to identity (weight=1, bias=0)
-        torch.nn.init.ones_(self.flow_input_affine.weight)
-        torch.nn.init.zeros_(self.flow_input_affine.bias)
-
+        # Decoder: Conditional Neural Spline Flow (Zuko)
+        # self.flow_input_affine layer is removed. Standardization will be used.
         self.conditional_flow = zuko.flows.NSF(
-            features=1, # Modeling univariate distribution of affinely transformed raw_times
+            features=1, # Modeling univariate distribution of standardized raw_times
             context=self.hparams.latent_dim,
             transforms=self.hparams.flow_transforms,
             bins=self.hparams.flow_bins,
@@ -118,20 +114,23 @@ class NT_VAE(pl.LightningModule):
         B, S = target_raw_times.shape
         target_raw_flat = target_raw_times.reshape(-1, 1).float() # (B*S, 1)
 
-        # Apply learnable affine transformation: y = ax + b
-        target_affine_flat = self.flow_input_affine(target_raw_flat) # (B*S, 1)
+        # Retrieve standardization stats from datamodule (ensure they are on the correct device)
+        data_mean = self.trainer.datamodule.data_mean.to(target_raw_flat.device)
+        data_std = self.trainer.datamodule.data_std.to(target_raw_flat.device).clamp(min=1e-9)
+
+        # Standardize: y = (x - mean) / std
+        target_standardized_flat = (target_raw_flat - data_mean) / data_std # (B*S, 1)
         
         context_expanded = z.unsqueeze(1).expand(-1, S, -1) # (B, S, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*S, latent_dim)
 
-        # Flow models p_Y(y | z)
+        # Flow models p_Y(y | z) for standardized data y
         dist = self.conditional_flow(context_flat)
-        log_prob_y_flat = dist.log_prob(target_affine_flat) # log p_Y(y|z), shape (B*S,)
+        log_prob_y_flat = dist.log_prob(target_standardized_flat) # log p_Y(y|z), shape (B*S,)
         
-        # Change of variables: log p_X(x|z) = log p_Y(ax+b|z) + log|a|
-        # The log_abs_determinant of the affine transform y = ax+b is log|a|.
-        # self.flow_input_affine.weight is (1,1), so take [0,0]
-        log_abs_det_jacobian = torch.log(self.flow_input_affine.weight.abs().clamp(min=1e-9))[0,0]
+        # Change of variables: log p_X(x|z) = log p_Y((x-mean)/std |z) - log|std|
+        # The log_abs_determinant of the standardization y = (x-mean)/std is log|1/std| = -log|std|.
+        log_abs_det_jacobian = -torch.log(data_std) # This is a scalar
         
         log_prob_x_flat = log_prob_y_flat + log_abs_det_jacobian # (B*S,)
         
@@ -144,7 +143,7 @@ class NT_VAE(pl.LightningModule):
         """
         Decodes a latent representation z to produce PDF values for photon arrival times
         at the given raw time_steps.
-        The internal flow models an affinely transformed version of raw times.
+        The internal flow models standardized version of raw times: (t_raw - mean) / std.
         This method computes the PDF in the original raw time scale.
 
         Args:
@@ -164,22 +163,26 @@ class NT_VAE(pl.LightningModule):
         
         time_steps_raw_flat = time_steps_raw.reshape(-1, 1).float() # (B*NumTimeSteps, 1)
 
-        # Apply affine transformation: y = ax + b
-        time_steps_affine_flat = self.flow_input_affine(time_steps_raw_flat) # (B*NumTimeSteps, 1)
+        # Retrieve standardization stats
+        data_mean = self.trainer.datamodule.data_mean.to(time_steps_raw_flat.device)
+        data_std = self.trainer.datamodule.data_std.to(time_steps_raw_flat.device).clamp(min=1e-9)
+
+        # Standardize: y = (x - mean) / std
+        time_steps_standardized_flat = (time_steps_raw_flat - data_mean) / data_std
 
         context_expanded = z.unsqueeze(1).expand(-1, NumTimeSteps, -1) # (B, NumTimeSteps, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*NumTimeSteps, latent_dim)
 
         dist = self.conditional_flow(context_flat)
         
-        # Log PDF in the affinely transformed space: log p_Y(y|z)
-        log_pdf_affine_flat = dist.log_prob(time_steps_affine_flat) # (B*NumTimeSteps,)
-        pdf_affine_flat = torch.exp(log_pdf_affine_flat)
+        # Log PDF in the standardized space: log p_Y(y|z)
+        log_pdf_standardized_flat = dist.log_prob(time_steps_standardized_flat) # (B*NumTimeSteps,)
+        pdf_standardized_flat = torch.exp(log_pdf_standardized_flat)
 
-        # Change of variables: p_X(x|z) = p_Y(ax+b|z) * |a|
-        abs_det_jacobian = self.flow_input_affine.weight.abs().clamp(min=1e-9)[0,0]
+        # Change of variables: p_X(x|z) = p_Y((x-mean)/std |z) * |1/std|
+        abs_det_jacobian = 1.0 / data_std # This is a scalar
         
-        pdf_raw_flat = pdf_affine_flat * abs_det_jacobian # (B*NumTimeSteps,)
+        pdf_raw_flat = pdf_standardized_flat * abs_det_jacobian # (B*NumTimeSteps,)
         
         pdf_values_raw = pdf_raw_flat.reshape(B, NumTimeSteps)
         

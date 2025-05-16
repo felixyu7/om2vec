@@ -18,6 +18,9 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        # Initialize placeholders for standardization stats
+        self.data_mean = None
+        self.data_std = None
         
     def prepare_data(self):
         """Called only once and on 1 GPU."""
@@ -51,6 +54,36 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
             valid_events_per_file_by_folder,
             self.cfg
         )
+
+        # Load standardization parameters (mean and std) for raw_times from a numpy file
+        if stage == 'fit' or stage is None:
+            stats_path = self.cfg['data_options'].get('standardization_stats_path')
+            if stats_path:
+                try:
+                    stats = np.load(stats_path, allow_pickle=True).item()
+                    data_mean_val = torch.tensor(stats['data_mean'], dtype=torch.float32)
+                    data_std_val = torch.tensor(stats['data_std'], dtype=torch.float32).clamp(min=1e-9)
+                    print(f"Loaded standardization stats from {stats_path}: mean={data_mean_val.item()}, std={data_std_val.item()}")
+                except Exception as e:
+                    print(f"Warning: Could not load standardization stats from {stats_path}. Error: {e}. Using default mean=0, std=1.")
+                    data_mean_val = torch.tensor(0.0, dtype=torch.float32)
+                    data_std_val = torch.tensor(1.0, dtype=torch.float32)
+            else:
+                print("Warning: 'standardization_stats_path' not found in config. Using default mean=0, std=1 for raw_times standardization.")
+                data_mean_val = torch.tensor(0.0, dtype=torch.float32)
+                data_std_val = torch.tensor(1.0, dtype=torch.float32)
+
+            # Register as buffers. These will be moved to the correct device by PyTorch Lightning.
+            # Detach them to ensure they are treated as constants if they came from a computation graph (though here they are from numpy).
+            if not hasattr(self, 'data_mean'): # Ensure registration only once
+                 self.register_buffer('data_mean', data_mean_val.clone().detach())
+            else: # If already exists (e.g. from checkpoint), update it
+                 self.data_mean = data_mean_val.clone().detach().to(self.data_mean.device)
+
+            if not hasattr(self, 'data_std'): # Ensure registration only once
+                 self.register_buffer('data_std', data_std_val.clone().detach())
+            else: # If already exists, update it
+                 self.data_std = data_std_val.clone().detach().to(self.data_std.device)
 
     def train_dataloader(self):
         """Returns the training dataloader."""
