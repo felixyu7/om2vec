@@ -5,31 +5,70 @@ import glob
 import os
 import random
 from torch.utils.data import Sampler, Dataset
-from typing import List, Dict
+from typing import List, Dict, Tuple # Added Tuple
+import pyarrow.parquet as pq # Added import
 
-def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> List[str]:
+def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> Tuple[List[List[str]], List[List[int]]]:
     """
-    Get file names from directories within specified ranges.
-    
+    Get file names from directories within specified ranges, grouped by directory.
+    Also returns the number of events (rows) for each file.
+
     Args:
         data_dirs: List of directories to search for files
-        ranges: List of [start, end] ranges for each directory
-        
+        ranges: List of [start, end] ranges for files in each directory
+        shuffle_files: Whether to shuffle files within each directory's list
+
     Returns:
-        List of file paths
+        A tuple containing:
+            - files_by_folder: List of lists of file paths, one inner list per directory.
+            - events_per_file_by_folder: List of lists of event counts, mirroring files_by_folder.
     """
-    filtered_files = []
+    files_by_folder = []
+    events_per_file_by_folder = []
+
     for i, directory in enumerate(data_dirs):
-        all_files = sorted(glob.glob(os.path.join(directory, '*.parquet')))
-        if shuffle_files:
-            random.shuffle(all_files)
+        all_files_in_dir = sorted(glob.glob(os.path.join(directory, '*.parquet')))
+        
+        # Apply range selection
         file_range = ranges[i]
-        filtered_files.extend(
-            all_files[file_range[0]:file_range[1]]
-        )
-    if shuffle_files:
-        random.shuffle(filtered_files)
-    return filtered_files
+        selected_files_in_dir = all_files_in_dir[file_range[0]:file_range[1]]
+
+        if not selected_files_in_dir:
+            files_by_folder.append([])
+            events_per_file_by_folder.append([])
+            continue
+
+        current_folder_files = []
+        current_folder_event_counts = []
+
+        # Prepare list of (file_path, event_count) for shuffling if needed
+        file_event_pairs = []
+        for f_path in selected_files_in_dir:
+            try:
+                pf = pq.ParquetFile(f_path)
+                event_count = pf.metadata.num_rows
+                file_event_pairs.append((f_path, event_count))
+            except Exception as e:
+                # print(f"Warning: Could not read metadata for {f_path}: {e}. Skipping file.")
+                # Optionally, append with 0 events or handle differently
+                # For now, we skip files that error out during metadata read.
+                continue # Skip this file
+        
+        if not file_event_pairs: # All selected files in dir failed to read metadata
+            files_by_folder.append([])
+            events_per_file_by_folder.append([])
+            continue
+
+        if shuffle_files:
+            random.shuffle(file_event_pairs)
+        
+        # Unzip after potential shuffle
+        current_folder_files, current_folder_event_counts = zip(*file_event_pairs)
+        
+        files_by_folder.append(list(current_folder_files))
+        events_per_file_by_folder.append(list(current_folder_event_counts))
+            
+    return files_by_folder, events_per_file_by_folder
 
 class ParquetFileSampler(Sampler):
     """
@@ -103,3 +142,107 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         "attention_mask":   attn_mask,
         "sequence_lengths": seq_lens,
     }
+
+class MultiFolderBatchSampler:
+    """
+    Batch Sampler that draws a configurable number of samples from each folder to form a batch.
+    Ensures mixing of events from different data sources (folders).
+    Yields batches of (folder_idx, event_idx_in_folder) tuples.
+    """
+    def __init__(self,
+                 dataset, # Expects the modified PrometheusTimeSeriesDataset
+                 batch_size: int,
+                 shuffle_intra_batch: bool = True,
+                 shuffle_folders_epoch: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle_intra_batch = shuffle_intra_batch
+        self.shuffle_folders_epoch = shuffle_folders_epoch
+        self.num_folders = self.dataset.num_folders
+
+        if self.num_folders == 0 or self.batch_size == 0:
+            self.samples_per_folder_exact = []
+            self.total_samples_per_batch = 0
+            self.num_batches = 0
+            return
+
+        base_samples_per_folder = self.batch_size // self.num_folders
+        remainder_samples = self.batch_size % self.num_folders
+        
+        self.samples_per_folder_exact = [base_samples_per_folder] * self.num_folders
+        for i in range(remainder_samples):
+            self.samples_per_folder_exact[i % self.num_folders] += 1
+        
+        self.total_samples_per_batch = sum(self.samples_per_folder_exact)
+        
+        if self.total_samples_per_batch == 0: # Handles batch_size = 0 or all folders empty leading to 0 samples
+            self.num_batches = 0
+            return
+
+        num_batches_per_folder = []
+        for f_idx in range(self.num_folders):
+            if self.dataset.folder_total_events[f_idx] == 0:
+                num_batches_per_folder.append(float('inf'))
+                continue
+            if self.samples_per_folder_exact[f_idx] > 0:
+                num_batches_per_folder.append(self.dataset.folder_total_events[f_idx] // self.samples_per_folder_exact[f_idx])
+            else: # This folder contributes 0 samples per batch
+                num_batches_per_folder.append(float('inf'))
+
+        self.num_batches = min(b for b in num_batches_per_folder if b != float('inf')) if any(b != float('inf') for b in num_batches_per_folder) else 0
+        if self.num_batches == float('inf'): # All folders were empty or assigned 0 samples
+             self.num_batches = 0
+
+
+    def __iter__(self):
+        if self.num_folders == 0 or self.num_batches == 0 or self.total_samples_per_batch == 0:
+            return iter([])
+
+        folder_event_indices_lists = []
+        for f_idx in range(self.num_folders):
+            if self.dataset.folder_total_events[f_idx] > 0:
+                indices = list(range(self.dataset.folder_total_events[f_idx]))
+                if self.shuffle_folders_epoch:
+                    random.shuffle(indices)
+                folder_event_indices_lists.append(indices)
+            else:
+                folder_event_indices_lists.append([])
+
+        current_pos_in_folder_indices = [0] * self.num_folders
+
+        for _ in range(self.num_batches):
+            current_batch_tuples = []
+            possible_to_form_batch = True
+            for f_idx in range(self.num_folders):
+                num_samples_to_take = self.samples_per_folder_exact[f_idx]
+                if num_samples_to_take == 0:
+                    continue
+
+                start_ptr = current_pos_in_folder_indices[f_idx]
+                end_ptr = start_ptr + num_samples_to_take
+
+                if end_ptr > len(folder_event_indices_lists[f_idx]):
+                    possible_to_form_batch = False
+                    break
+                
+                for i in range(start_ptr, end_ptr):
+                    event_idx_in_folder = folder_event_indices_lists[f_idx][i]
+                    current_batch_tuples.append((f_idx, event_idx_in_folder))
+                
+                current_pos_in_folder_indices[f_idx] = end_ptr
+
+            if possible_to_form_batch and len(current_batch_tuples) == self.total_samples_per_batch:
+                if self.shuffle_intra_batch:
+                    random.shuffle(current_batch_tuples)
+                yield current_batch_tuples
+            elif not possible_to_form_batch:
+                break
+            elif len(current_batch_tuples) != self.total_samples_per_batch and self.total_samples_per_batch > 0 :
+                # This case implies an issue, e.g. a folder was expected to contribute but couldn't.
+                # Or total_samples_per_batch was miscalculated relative to actual contributions.
+                # For safety, break.
+                break
+
+
+    def __len__(self) -> int:
+        return self.num_batches

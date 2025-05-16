@@ -5,9 +5,10 @@ import numpy as np
 import pytorch_lightning as pl
 import awkward as ak
 import pyarrow.parquet as pq
-from typing import Dict
+from typing import Dict, Tuple, List # Added Tuple, List
+from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, ParquetFileSampler, variable_length_collate_fn # Import new collate_fn
+from .data_utils import get_file_names, MultiFolderBatchSampler, variable_length_collate_fn # Import new collate_fn, MultiFolderBatchSampler
 from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
@@ -29,29 +30,41 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
         Sets up train and validation datasets.
         """
         if self.cfg['training']:
-            train_files = get_file_names(
-                self.cfg['data_options']['train_data_files'], 
+            train_files_by_folder, train_events_per_file_by_folder = get_file_names(
+                self.cfg['data_options']['train_data_files'],
                 self.cfg['data_options']['train_data_file_ranges'],
                 self.cfg['data_options']['shuffle_files']
             )
-            self.train_dataset = PrometheusTimeSeriesDataset(train_files, self.cfg) # Pass cfg, Renamed
+            self.train_dataset = PrometheusTimeSeriesDataset(
+                train_files_by_folder,
+                train_events_per_file_by_folder,
+                self.cfg
+            )
             
-        valid_files = get_file_names(
+        valid_files_by_folder, valid_events_per_file_by_folder = get_file_names(
             self.cfg['data_options']['valid_data_files'],
             self.cfg['data_options']['valid_data_file_ranges'],
-            self.cfg['data_options']['shuffle_files']
+            self.cfg['data_options']['shuffle_files'] # Typically false for validation
         )
-        self.valid_dataset = PrometheusTimeSeriesDataset(valid_files, self.cfg) # Pass cfg, Renamed
+        self.valid_dataset = PrometheusTimeSeriesDataset(
+            valid_files_by_folder,
+            valid_events_per_file_by_folder,
+            self.cfg
+        )
 
     def train_dataloader(self):
         """Returns the training dataloader."""
-        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        batch_sampler = MultiFolderBatchSampler(
+            self.train_dataset,
+            self.cfg['training_options']['batch_size'],
+            shuffle_intra_batch=True,
+            shuffle_folders_epoch=True # Shuffle order of events within folders each epoch
+        )
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
         dataloader = torch.utils.data.DataLoader(self.train_dataset,
-                                            batch_size = self.cfg['training_options']['batch_size'],
-                                            sampler = sampler,
-                                            collate_fn=collate_fn_with_padding, # Use new collate_fn
+                                            batch_sampler=batch_sampler, # Use batch_sampler
+                                            collate_fn=collate_fn_with_padding,
                                             pin_memory=True,
                                             persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
                                             num_workers=self.cfg['training_options']['num_workers'])
@@ -59,77 +72,142 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
 
     def val_dataloader(self):
         """Returns the validation dataloader."""
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        batch_sampler = MultiFolderBatchSampler(
+            self.valid_dataset,
+            self.cfg['training_options']['batch_size'],
+            shuffle_intra_batch=False, # No need to shuffle within validation batches
+            shuffle_folders_epoch=False # Keep validation order consistent
+        )
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
         return torch.utils.data.DataLoader(self.valid_dataset,
-                                           batch_size = self.cfg['training_options']['batch_size'],
-                                           sampler=sampler,
-                                           collate_fn=collate_fn_with_padding, # Use new collate_fn
+                                           batch_sampler=batch_sampler, # Use batch_sampler
+                                           collate_fn=collate_fn_with_padding,
                                            pin_memory=True,
                                            persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
                                            num_workers=self.cfg['training_options']['num_workers'])
 
     def test_dataloader(self):
         """Returns the test dataloader (same as validation for now)."""
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        batch_sampler = MultiFolderBatchSampler(
+            self.valid_dataset, # Using validation dataset for test
+            self.cfg['training_options']['batch_size'],
+            shuffle_intra_batch=False,
+            shuffle_folders_epoch=False
+        )
         collate_fn_with_padding = partial(variable_length_collate_fn)
         
         return torch.utils.data.DataLoader(self.valid_dataset,
-                                           batch_size = self.cfg['training_options']['batch_size'],
-                                           sampler=sampler,
-                                           collate_fn=collate_fn_with_padding, # Use new collate_fn
+                                           batch_sampler=batch_sampler, # Use batch_sampler
+                                           collate_fn=collate_fn_with_padding,
                                            pin_memory=True,
                                            persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
                                            num_workers=self.cfg['training_options']['num_workers'])
 
-class PrometheusTimeSeriesDataset(torch.utils.data.Dataset): # Renamed from PrometheusDataset
+class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     """
-    Dataset class for Prometheus data.
-    
-    Handles loading data from parquet files and preprocessing it for the model.
+    Dataset class for Prometheus data, handling multiple folders.
+    Loads data from parquet files and preprocesses it for the model.
     """
-    def __init__(self, files, cfg): # Added cfg
-        self.files = files
-        self.cfg = cfg # Store cfg
-        # self.max_seq_len is no longer used here, padding handled by collate_fn
-        self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0) # Get from cfg
-        self.max_seq_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None) # Get from cfg
+    def __init__(self,
+                 files_by_folder: List[List[str]],
+                 events_per_file_by_folder: List[List[int]],
+                 cfg: Dict,
+                 cache_size: int = 5): # Added cache_size for Parquet data
+        self.files_by_folder = files_by_folder
+        self.events_per_file_by_folder = events_per_file_by_folder
+        self.cfg = cfg
+        self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0)
+        self.max_seq_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
         
-        # Count number of events in each file
-        num_events = []
-        for file in self.files:
-            data = pq.ParquetFile(file)
-            num_events.append(data.metadata.num_rows)
-        num_events = np.array(num_events)
-        self.cumulative_lengths = np.concatenate(([0], np.cumsum(num_events)))
-        self.dataset_size = self.cumulative_lengths[-1]
-        
-        self.current_file = ''
-        self.current_data = None
-        
+        self.num_folders = len(self.files_by_folder)
+        self.folder_total_events = [sum(counts) for counts in self.events_per_file_by_folder]
+        self.dataset_size = sum(self.folder_total_events)
+
+        # Cumulative lengths for files within each folder
+        self.cumulative_lengths_by_folder_file = []
+        for folder_event_counts in self.events_per_file_by_folder:
+            if folder_event_counts: # Check if the list is not empty
+                self.cumulative_lengths_by_folder_file.append(
+                    np.concatenate(([0], np.cumsum(np.array(folder_event_counts, dtype=np.int64))))
+                )
+            else: # Handle empty folder (no files or files with 0 events)
+                self.cumulative_lengths_by_folder_file.append(np.array([0], dtype=np.int64))
+
+
+        # Simple FIFO cache for loaded Parquet data (ak.RecordBatch)
+        self.cache_size = cache_size
+        self.data_cache = OrderedDict() # Stores {file_path: ak_data}
+        self.current_file_path_per_folder_file_tuple = {} # {(folder_idx, file_idx_in_folder): path}
+                                                          # This helps avoid re-reading if __getitem__ is called
+                                                          # for the same file but different event_idx
+
     def __len__(self):
-        return self.dataset_size
+        return self.dataset_size # Total events across all folders
     
-    def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
+    def _get_file_path_and_event_index_in_file(self, folder_idx: int, event_idx_in_folder: int) -> Tuple[str, int]:
         """
-        Returns one training example with *both* fixed-window grouping and
-        adaptive length-capping already applied.
+        Given a folder index and an event index within that folder,
+        determines the specific file and the event's index within that file.
         """
+        if folder_idx < 0 or folder_idx >= self.num_folders:
+            raise IndexError(f"Folder index {folder_idx} out of range for {self.num_folders} folders.")
+        
+        if not self.files_by_folder[folder_idx]: # Empty folder
+             raise IndexError(f"Folder {folder_idx} has no files.")
 
-        # -------------------------------------------------- index bookkeeping
-        if i < 0 or i >= self.dataset_size:
-            raise IndexError("Index out of range")
+        cumulative_lengths_for_folder = self.cumulative_lengths_by_folder_file[folder_idx]
+        
+        if event_idx_in_folder < 0 or event_idx_in_folder >= cumulative_lengths_for_folder[-1]:
+            raise IndexError(f"Event index {event_idx_in_folder} out of range for folder {folder_idx} (size {cumulative_lengths_for_folder[-1]}).")
 
-        file_idx = int(np.searchsorted(self.cumulative_lengths, i + 1) - 1)
-        true_idx = int(i - self.cumulative_lengths[file_idx])
+        file_idx_in_folder = int(np.searchsorted(cumulative_lengths_for_folder, event_idx_in_folder + 1) - 1)
+        event_idx_in_file = int(event_idx_in_folder - cumulative_lengths_for_folder[file_idx_in_folder])
+        
+        file_path = self.files_by_folder[folder_idx][file_idx_in_folder]
+        return file_path, event_idx_in_file
 
-        # ------------------------------------------------ parquet row (lazy)
-        if self.current_file != self.files[file_idx]:
-            self.current_file = self.files[file_idx]
-            self.current_data = ak.from_parquet(self.current_file)
+    def _load_data_from_file(self, file_path: str):
+        """Loads data from a parquet file, using a cache."""
+        if file_path in self.data_cache:
+            # Move to end to mark as recently used
+            self.data_cache.move_to_end(file_path)
+            return self.data_cache[file_path]
+        
+        # Load data
+        try:
+            data = ak.from_parquet(file_path)
+        except Exception as e:
+            # print(f"Error loading parquet file {file_path}: {e}")
+            # Return a structure that __getitem__ can handle gracefully, e.g., an empty-like structure
+            # This depends on how __getitem__ handles missing or malformed data.
+            # For now, re-raise to signal a problem.
+            raise RuntimeError(f"Failed to load data from {file_path}") from e
 
-        row = self.current_data[true_idx]
+        # Add to cache
+        if len(self.data_cache) >= self.cache_size:
+            self.data_cache.popitem(last=False) # Remove oldest item
+        self.data_cache[file_path] = data
+        return data
+
+    def __getitem__(self, item_tuple: Tuple[int, int]) -> Dict[str, torch.Tensor]:
+        """
+        Returns one training example.
+        item_tuple: (folder_idx, event_idx_in_folder)
+        """
+        folder_idx, event_idx_in_folder = item_tuple
+
+        file_path, true_idx = self._get_file_path_and_event_index_in_file(folder_idx, event_idx_in_folder)
+        
+        # Load data using cache
+        ak_data_for_file = self._load_data_from_file(file_path)
+        
+        if true_idx >= len(ak_data_for_file):
+            # This should ideally not happen if cumulative lengths are correct
+            # and event_idx_in_file is calculated correctly.
+            raise IndexError(f"Calculated true_idx {true_idx} is out of bounds for file {file_path} with {len(ak_data_for_file)} events.")
+
+        row = ak_data_for_file[true_idx]
 
         # ------------------------------------------------ raw hit times
         raw_t = np.asarray(row['hits_t'], dtype=np.float32)
