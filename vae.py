@@ -105,13 +105,13 @@ class NT_VAE(pl.LightningModule):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode_log_prob(self, target_raw_times, z, attention_mask):
-        # target_raw_times: (B, S), e.g., batch['raw_times_padded']
+    def decode_log_prob(self, target_log_times, z, attention_mask):
+        # target_log_times: (B, S), e.g., batch['times_padded'] (log-transformed)
         # z: (B, latent_dim)
         # attention_mask: (B, S), boolean, True for valid tokens
 
-        B, S = target_raw_times.shape
-        target_flat = target_raw_times.reshape(-1, 1).float() # (B*S, 1)
+        B, S = target_log_times.shape
+        target_flat = target_log_times.reshape(-1, 1).float() # (B*S, 1)
 
         context_expanded = z.unsqueeze(1).expand(-1, S, -1) # (B, S, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*S, latent_dim)
@@ -124,46 +124,58 @@ class NT_VAE(pl.LightningModule):
         masked_log_probs = log_probs_seq * attention_mask.float() # Apply mask, ensure float for multiplication
         return masked_log_probs
     
-    def decode(self, z, time_steps):
+    def decode(self, z, time_steps_raw):
         """
         Decodes a latent representation z to produce PDF values for photon arrival times
-        at the given time_steps.
+        at the given raw time_steps.
+        The internal flow models log(t+1). This method transforms the PDF back to raw time scale.
 
         Args:
             z (torch.Tensor): Latent representation, shape (B, latent_dim).
-            time_steps (torch.Tensor): Time steps at which to evaluate the PDF.
-                                      Can be shape (B, NumTimeSteps) or (NumTimeSteps).
-                                      These should be in the raw time scale.
-
+            time_steps_raw (torch.Tensor): Time steps at which to evaluate the PDF, in raw scale.
+                                           Can be shape (B, NumTimeSteps) or (NumTimeSteps).
         Returns:
-            torch.Tensor: PDF values at the given time_steps, shape (B, NumTimeSteps).
+            torch.Tensor: PDF values at the given time_steps_raw, shape (B, NumTimeSteps).
         """
         B = z.shape[0]
         
-        if time_steps.ndim == 1:
-            # If time_steps is 1D, expand it for each item in the batch
-            time_steps = time_steps.unsqueeze(0).expand(B, -1) # (B, NumTimeSteps)
-        
-        NumTimeSteps = time_steps.shape[1]
+        # Ensure time_steps_raw is on the same device as z
+        time_steps_raw = time_steps_raw.to(z.device)
 
-        time_steps_flat = time_steps.reshape(-1, 1).float() # (B*NumTimeSteps, 1)
+        if time_steps_raw.ndim == 1:
+            time_steps_raw = time_steps_raw.unsqueeze(0).expand(B, -1) # (B, NumTimeSteps)
+        
+        NumTimeSteps = time_steps_raw.shape[1]
+
+        # Transform raw time steps to log scale for the flow: log(t_raw + 1)
+        # Ensure input to log is positive. Add a small epsilon if times can be zero.
+        # Given that these are arrival times, they should be > 0. Adding 1 already handles t_raw=0.
+        time_steps_log = torch.log(time_steps_raw.float() + 1.0)
+        
+        time_steps_log_flat = time_steps_log.reshape(-1, 1) # (B*NumTimeSteps, 1)
 
         context_expanded = z.unsqueeze(1).expand(-1, NumTimeSteps, -1) # (B, NumTimeSteps, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*NumTimeSteps, latent_dim)
 
-        # Get the conditional distribution from the flow
         dist = self.conditional_flow(context_flat)
         
-        # Calculate log probability density
-        log_pdf_flat = dist.log_prob(time_steps_flat) # (B*NumTimeSteps,)
+        # Log PDF in the log-transformed space
+        log_pdf_log_scale_flat = dist.log_prob(time_steps_log_flat) # (B*NumTimeSteps,)
         
-        # Convert log_pdf to pdf
-        pdf_flat = torch.exp(log_pdf_flat) # (B*NumTimeSteps,)
+        # PDF in the log-transformed space
+        pdf_log_scale_flat = torch.exp(log_pdf_log_scale_flat)
+
+        # Jacobian of the transformation y = log(x+1) is dy/dx = 1/(x+1)
+        # pdf_raw(x) = pdf_log(log(x+1)) * |d(log(x+1))/dx|
+        # pdf_raw(x) = pdf_log(log(x+1)) * (1 / (x + 1))
+        # x corresponds to time_steps_raw
+        jacobian_flat = (1.0 / (time_steps_raw.float().reshape(-1) + 1.0)).clamp(min=1e-9) # (B*NumTimeSteps,)
         
-        # Reshape back to (B, NumTimeSteps)
-        pdf_values = pdf_flat.reshape(B, NumTimeSteps)
+        pdf_raw_flat = pdf_log_scale_flat * jacobian_flat # (B*NumTimeSteps,)
         
-        return pdf_values
+        pdf_values_raw = pdf_raw_flat.reshape(B, NumTimeSteps)
+        
+        return pdf_values_raw
     
     def forward(self, batch):
         times_padded = batch['times_padded'].float()
@@ -180,11 +192,11 @@ class NT_VAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
             
-        # Reconstruction Loss from NSF
-        raw_times_padded = batch['raw_times_padded'].float()
+        # Reconstruction Loss from NSF (modeling log-transformed times)
+        target_log_times = batch['times_padded'].float() # Use log-transformed times
         attention_mask = batch['attention_mask'].bool() # ensure boolean
 
-        log_probs_masked = self.decode_log_prob(raw_times_padded, z, attention_mask)
+        log_probs_masked = self.decode_log_prob(target_log_times, z, attention_mask)
         
         # Average NLL over valid (non-padded) elements in the batch
         reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
@@ -221,10 +233,10 @@ class NT_VAE(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
 
-        raw_times_padded = batch['raw_times_padded'].float()
+        target_log_times = batch['times_padded'].float() # Use log-transformed times
         attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(raw_times_padded, z, attention_mask)
+        log_probs_masked = self.decode_log_prob(target_log_times, z, attention_mask)
         reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
         
         kl_loss = self.kl_divergence(mu, logvar)
@@ -238,10 +250,10 @@ class NT_VAE(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
 
-        raw_times_padded = batch['raw_times_padded'].float()
+        target_log_times = batch['times_padded'].float() # Use log-transformed times
         attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(raw_times_padded, z, attention_mask)
+        log_probs_masked = self.decode_log_prob(target_log_times, z, attention_mask)
         reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
 
         kl_loss = self.kl_divergence(mu, logvar)
