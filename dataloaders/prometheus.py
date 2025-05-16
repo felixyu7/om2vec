@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn # Import new collate_fn, InterleavedFileBatchSampler
+from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn
 from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
@@ -134,13 +134,10 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             else: # Handle empty folder (no files or files with 0 events)
                 self.cumulative_lengths_by_folder_file.append(np.array([0], dtype=np.int64))
 
-
         # Simple FIFO cache for loaded Parquet data (ak.RecordBatch)
         self.cache_size = cache_size
         self.data_cache = OrderedDict() # Stores {file_path: ak_data}
-        self.current_file_path_per_folder_file_tuple = {} # {(folder_idx, file_idx_in_folder): path}
-                                                          # This helps avoid re-reading if __getitem__ is called
-                                                          # for the same file but different event_idx
+        self.current_file_path_per_folder_file_tuple = {}
 
     def __len__(self):
         return self.dataset_size # Total events across all folders
@@ -150,16 +147,8 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         Given a folder index and an event index within that folder,
         determines the specific file and the event's index within that file.
         """
-        if folder_idx < 0 or folder_idx >= self.num_folders:
-            raise IndexError(f"Folder index {folder_idx} out of range for {self.num_folders} folders.")
-        
-        if not self.files_by_folder[folder_idx]: # Empty folder
-             raise IndexError(f"Folder {folder_idx} has no files.")
 
         cumulative_lengths_for_folder = self.cumulative_lengths_by_folder_file[folder_idx]
-        
-        if event_idx_in_folder < 0 or event_idx_in_folder >= cumulative_lengths_for_folder[-1]:
-            raise IndexError(f"Event index {event_idx_in_folder} out of range for folder {folder_idx} (size {cumulative_lengths_for_folder[-1]}).")
 
         file_idx_in_folder = int(np.searchsorted(cumulative_lengths_for_folder, event_idx_in_folder + 1) - 1)
         event_idx_in_file = int(event_idx_in_folder - cumulative_lengths_for_folder[file_idx_in_folder])
@@ -173,17 +162,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             # Move to end to mark as recently used
             self.data_cache.move_to_end(file_path)
             return self.data_cache[file_path]
-        
-        # Load data
-        try:
-            data = ak.from_parquet(file_path)
-        except Exception as e:
-            # print(f"Error loading parquet file {file_path}: {e}")
-            # Return a structure that __getitem__ can handle gracefully, e.g., an empty-like structure
-            # This depends on how __getitem__ handles missing or malformed data.
-            # For now, re-raise to signal a problem.
-            raise RuntimeError(f"Failed to load data from {file_path}") from e
-
+        data = ak.from_parquet(file_path)
         # Add to cache
         if len(self.data_cache) >= self.cache_size:
             self.data_cache.popitem(last=False) # Remove oldest item
@@ -201,11 +180,6 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         
         # Load data using cache
         ak_data_for_file = self._load_data_from_file(file_path)
-        
-        if true_idx >= len(ak_data_for_file):
-            # This should ideally not happen if cumulative lengths are correct
-            # and event_idx_in_file is calculated correctly.
-            raise IndexError(f"Calculated true_idx {true_idx} is out of bounds for file {file_path} with {len(ak_data_for_file)} events.")
 
         row = ak_data_for_file[true_idx]
 
