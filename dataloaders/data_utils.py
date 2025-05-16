@@ -143,106 +143,223 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         "sequence_lengths": seq_lens,
     }
 
-class MultiFolderBatchSampler:
+class InterleavedFileBatchSampler:
     """
-    Batch Sampler that draws a configurable number of samples from each folder to form a batch.
-    Ensures mixing of events from different data sources (folders).
+    Batch Sampler that interleaves data from multiple folders by processing one file
+    from each folder at a time. A set of "active files" (one per folder) is used
+    to generate batches until one of these files is exhausted. Then, the sampler
+    advances to the next file in the folder(s) whose file(s) were exhausted.
+
     Yields batches of (folder_idx, event_idx_in_folder) tuples.
     """
     def __init__(self,
-                 dataset, # Expects the modified PrometheusTimeSeriesDataset
+                 dataset,  # Expects PrometheusTimeSeriesDataset
                  batch_size: int,
                  shuffle_intra_batch: bool = True,
-                 shuffle_folders_epoch: bool = True):
+                 shuffle_files_within_folder: bool = True): # Added to control if files within a folder are shuffled
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle_intra_batch = shuffle_intra_batch
-        self.shuffle_folders_epoch = shuffle_folders_epoch
         self.num_folders = self.dataset.num_folders
 
         if self.num_folders == 0 or self.batch_size == 0:
-            self.samples_per_folder_exact = []
-            self.total_samples_per_batch = 0
-            self.num_batches = 0
+            self._num_batches = 0
             return
 
+        # Determine how many samples to draw from each folder per batch
         base_samples_per_folder = self.batch_size // self.num_folders
         remainder_samples = self.batch_size % self.num_folders
-        
-        self.samples_per_folder_exact = [base_samples_per_folder] * self.num_folders
+        self.samples_per_folder_in_batch = [base_samples_per_folder] * self.num_folders
         for i in range(remainder_samples):
-            self.samples_per_folder_exact[i % self.num_folders] += 1
+            self.samples_per_folder_in_batch[i % self.num_folders] += 1
         
-        self.total_samples_per_batch = sum(self.samples_per_folder_exact)
-        
-        if self.total_samples_per_batch == 0: # Handles batch_size = 0 or all folders empty leading to 0 samples
-            self.num_batches = 0
-            return
+        self.actual_batch_size = sum(self.samples_per_folder_in_batch)
 
-        num_batches_per_folder = []
+        # Store file paths and their event counts, potentially shuffled per folder
+        self.files_by_folder = []
+        self.events_in_files_by_folder = []
+
         for f_idx in range(self.num_folders):
-            if self.dataset.folder_total_events[f_idx] == 0:
-                num_batches_per_folder.append(float('inf'))
+            folder_files = list(self.dataset.files_by_folder[f_idx]) # Make a copy
+            folder_event_counts = list(self.dataset.events_per_file_by_folder[f_idx]) # Make a copy
+            
+            if shuffle_files_within_folder and folder_files:
+                paired = list(zip(folder_files, folder_event_counts))
+                random.shuffle(paired)
+                shuffled_f, shuffled_e = zip(*paired)
+                self.files_by_folder.append(list(shuffled_f))
+                self.events_in_files_by_folder.append(list(shuffled_e))
+            else:
+                self.files_by_folder.append(folder_files)
+                self.events_in_files_by_folder.append(folder_event_counts)
+        
+        self._num_batches = self._calculate_total_batches()
+
+    def _calculate_total_batches(self) -> int:
+        if self.num_folders == 0 or self.actual_batch_size == 0:
+            return 0
+
+        total_batches = 0
+        current_file_indices = [0] * self.num_folders # Index of the current file being processed in each folder
+        
+        # Create a copy of event counts for simulation
+        sim_events_in_files = [[count for count in folder_counts] for folder_counts in self.events_in_files_by_folder]
+
+        while True:
+            active_files_exist = False
+            min_batches_from_current_set = float('inf')
+            
+            # Check if there's an active file for each folder that contributes to a batch
+            # and determine how many batches this set can produce
+            possible_to_form_set = True
+            for f_idx in range(self.num_folders):
+                if self.samples_per_folder_in_batch[f_idx] == 0: # This folder doesn't contribute
+                    continue
+
+                if current_file_indices[f_idx] >= len(sim_events_in_files[f_idx]):
+                    possible_to_form_set = False # This folder is out of files
+                    break
+                
+                active_files_exist = True
+                num_events_in_active_file = sim_events_in_files[f_idx][current_file_indices[f_idx]]
+                batches_from_this_file = num_events_in_active_file // self.samples_per_folder_in_batch[f_idx]
+                min_batches_from_current_set = min(min_batches_from_current_set, batches_from_this_file)
+
+            if not possible_to_form_set or not active_files_exist or min_batches_from_current_set == float('inf'):
+                break # No more complete sets of active files or a folder is exhausted
+
+            if min_batches_from_current_set == 0 and active_files_exist : # A file is too small for even one contribution
+                 # Advance the file index for all folders that contributed to this problematic set
+                 # to avoid infinite loop if a file is smaller than its per-batch contribution.
+                advanced_once = False
+                for f_idx in range(self.num_folders):
+                    if self.samples_per_folder_in_batch[f_idx] > 0 and \
+                       current_file_indices[f_idx] < len(sim_events_in_files[f_idx]) and \
+                       sim_events_in_files[f_idx][current_file_indices[f_idx]] < self.samples_per_folder_in_batch[f_idx]:
+                        current_file_indices[f_idx] += 1
+                        advanced_once = True
+                if not advanced_once: # Should not happen if min_batches_from_current_set was 0
+                    break
                 continue
-            if self.samples_per_folder_exact[f_idx] > 0:
-                num_batches_per_folder.append(self.dataset.folder_total_events[f_idx] // self.samples_per_folder_exact[f_idx])
-            else: # This folder contributes 0 samples per batch
-                num_batches_per_folder.append(float('inf'))
 
-        self.num_batches = min(b for b in num_batches_per_folder if b != float('inf')) if any(b != float('inf') for b in num_batches_per_folder) else 0
-        if self.num_batches == float('inf'): # All folders were empty or assigned 0 samples
-             self.num_batches = 0
 
+            total_batches += min_batches_from_current_set
+            
+            # Consume events and advance file indices for exhausted files
+            for f_idx in range(self.num_folders):
+                if self.samples_per_folder_in_batch[f_idx] == 0:
+                    continue
+                if current_file_indices[f_idx] < len(sim_events_in_files[f_idx]):
+                    events_to_consume = min_batches_from_current_set * self.samples_per_folder_in_batch[f_idx]
+                    # This subtraction is just for simulation, original counts are preserved in self.events_in_files_by_folder
+                    # The actual check for exhaustion in __iter__ will be based on offsets.
+                    # For calculation, we just need to know when to advance the file pointer.
+                    sim_events_in_files[f_idx][current_file_indices[f_idx]] -= events_to_consume
+                    if sim_events_in_files[f_idx][current_file_indices[f_idx]] < self.samples_per_folder_in_batch[f_idx] : # or effectively zero
+                        current_file_indices[f_idx] += 1
+        return total_batches
 
     def __iter__(self):
-        if self.num_folders == 0 or self.num_batches == 0 or self.total_samples_per_batch == 0:
+        if self.num_folders == 0 or self._num_batches == 0 or self.actual_batch_size == 0:
             return iter([])
 
-        folder_event_indices_lists = []
+        # Pointers to the current file index within each folder's list of files
+        current_file_indices_in_folder = [0] * self.num_folders
+        # Pointers to the current event offset *within the currently active file* of each folder
+        current_event_offsets_in_active_files = [0] * self.num_folders
+        
+        # Cumulative event counts for files *within each folder* (from dataset, but using potentially shuffled file order)
+        # This helps map a local event_idx_in_folder (across concatenated files of that folder) to a specific file and offset.
+        # We need to reconstruct this based on self.events_in_files_by_folder
+        cumulative_lengths_by_folder_shuffled_files = []
         for f_idx in range(self.num_folders):
-            if self.dataset.folder_total_events[f_idx] > 0:
-                indices = list(range(self.dataset.folder_total_events[f_idx]))
-                if self.shuffle_folders_epoch:
-                    random.shuffle(indices)
-                folder_event_indices_lists.append(indices)
+            if self.events_in_files_by_folder[f_idx]:
+                cumulative_lengths_by_folder_shuffled_files.append(
+                    np.concatenate(([0], np.cumsum(np.array(self.events_in_files_by_folder[f_idx], dtype=np.int64))))
+                )
             else:
-                folder_event_indices_lists.append([])
+                cumulative_lengths_by_folder_shuffled_files.append(np.array([0], dtype=np.int64))
 
-        current_pos_in_folder_indices = [0] * self.num_folders
 
-        for _ in range(self.num_batches):
-            current_batch_tuples = []
-            possible_to_form_batch = True
+        for _ in range(self._num_batches): # Iterate for the pre-calculated number of batches
+            batch_event_tuples = []
+            
+            # Determine the number of batches that can be formed from the current set of active files
+            # This logic is implicitly handled by _calculate_total_batches ensuring we don't over-iterate.
+            # Here, we just need to pick events for *one* batch.
+
+            possible_to_form_this_batch = True
             for f_idx in range(self.num_folders):
-                num_samples_to_take = self.samples_per_folder_exact[f_idx]
+                if self.samples_per_folder_in_batch[f_idx] == 0:
+                    continue
+
+                # Check if current folder has enough files left
+                if current_file_indices_in_folder[f_idx] >= len(self.files_by_folder[f_idx]):
+                    possible_to_form_this_batch = False
+                    break
+                
+                active_file_total_events = self.events_in_files_by_folder[f_idx][current_file_indices_in_folder[f_idx]]
+                
+                # Check if current active file has enough remaining events for this batch
+                if current_event_offsets_in_active_files[f_idx] + self.samples_per_folder_in_batch[f_idx] > active_file_total_events:
+                    possible_to_form_this_batch = False # This specific file is exhausted for this batch round
+                    # This situation should ideally be caught by _calculate_total_batches logic,
+                    # leading to file advancement before this point. If hit, it implies a mismatch or edge case.
+                    break
+
+            if not possible_to_form_this_batch:
+                # This signifies an issue with batch calculation or state,
+                # or that we need to advance files. The outer loop of _calculate_total_batches
+                # should prevent needing to advance files *mid-batch construction* here.
+                # For safety, if we can't form a full batch as expected by _num_batches, we stop.
+                # print("Warning: Could not form a full batch as expected. Ending iteration.")
+                break
+
+            for f_idx in range(self.num_folders):
+                num_samples_to_take = self.samples_per_folder_in_batch[f_idx]
                 if num_samples_to_take == 0:
                     continue
 
-                start_ptr = current_pos_in_folder_indices[f_idx]
-                end_ptr = start_ptr + num_samples_to_take
-
-                if end_ptr > len(folder_event_indices_lists[f_idx]):
-                    possible_to_form_batch = False
-                    break
+                # Base event index in this folder, considering all previous files in this folder
+                base_event_idx_in_folder = cumulative_lengths_by_folder_shuffled_files[f_idx][current_file_indices_in_folder[f_idx]]
                 
-                for i in range(start_ptr, end_ptr):
-                    event_idx_in_folder = folder_event_indices_lists[f_idx][i]
-                    current_batch_tuples.append((f_idx, event_idx_in_folder))
+                for i in range(num_samples_to_take):
+                    # event_idx_in_current_file = current_event_offsets_in_active_files[f_idx] + i
+                    # The dataset's __getitem__ expects an overall event index within the folder
+                    event_idx_in_folder_for_dataset = base_event_idx_in_folder + current_event_offsets_in_active_files[f_idx] + i
+                    batch_event_tuples.append((f_idx, event_idx_in_folder_for_dataset))
                 
-                current_pos_in_folder_indices[f_idx] = end_ptr
+                current_event_offsets_in_active_files[f_idx] += num_samples_to_take
 
-            if possible_to_form_batch and len(current_batch_tuples) == self.total_samples_per_batch:
-                if self.shuffle_intra_batch:
-                    random.shuffle(current_batch_tuples)
-                yield current_batch_tuples
-            elif not possible_to_form_batch:
-                break
-            elif len(current_batch_tuples) != self.total_samples_per_batch and self.total_samples_per_batch > 0 :
-                # This case implies an issue, e.g. a folder was expected to contribute but couldn't.
-                # Or total_samples_per_batch was miscalculated relative to actual contributions.
-                # For safety, break.
-                break
+            if self.shuffle_intra_batch:
+                random.shuffle(batch_event_tuples)
+            
+            if len(batch_event_tuples) == self.actual_batch_size:
+                 yield batch_event_tuples
+            else:
+                # print(f"Warning: Batch size mismatch. Expected {self.actual_batch_size}, got {len(batch_event_tuples)}. Ending.")
+                break # Safety break
 
+            # After yielding a batch, check if any active file is now exhausted
+            # and advance to the next file for those folders.
+            needs_file_advancement = False
+            for f_idx in range(self.num_folders):
+                if self.samples_per_folder_in_batch[f_idx] == 0:
+                    continue
+                if current_file_indices_in_folder[f_idx] >= len(self.files_by_folder[f_idx]): # Already out of files
+                    continue
+
+                active_file_total_events = self.events_in_files_by_folder[f_idx][current_file_indices_in_folder[f_idx]]
+                # If the offset + next sample requirement exceeds current file, it's exhausted for next round
+                if current_event_offsets_in_active_files[f_idx] + self.samples_per_folder_in_batch[f_idx] > active_file_total_events \
+                   or current_event_offsets_in_active_files[f_idx] >= active_file_total_events : # Fully exhausted
+                    current_file_indices_in_folder[f_idx] += 1
+                    current_event_offsets_in_active_files[f_idx] = 0
+                    needs_file_advancement = True # Signal that at least one file was advanced
+
+            # If no files were advanced, it means all active files still have data for the next batch.
+            # If files *were* advanced, the next iteration of the loop will use the new set of active files.
+            # The overall loop is controlled by `_num_batches`, which should account for these advancements.
 
     def __len__(self) -> int:
-        return self.num_batches
+        return self._num_batches

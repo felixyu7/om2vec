@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, MultiFolderBatchSampler, variable_length_collate_fn # Import new collate_fn, MultiFolderBatchSampler
+from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn # Import new collate_fn, InterleavedFileBatchSampler
 from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
@@ -54,11 +54,11 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
 
     def train_dataloader(self):
         """Returns the training dataloader."""
-        batch_sampler = MultiFolderBatchSampler(
-            self.train_dataset,
-            self.cfg['training_options']['batch_size'],
+        batch_sampler = InterleavedFileBatchSampler(
+            dataset=self.train_dataset,
+            batch_size=self.cfg['training_options']['batch_size'],
             shuffle_intra_batch=True,
-            shuffle_folders_epoch=True # Shuffle order of events within folders each epoch
+            shuffle_files_within_folder=self.cfg['data_options'].get('shuffle_files', True) # Align with global file shuffle option
         )
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
@@ -72,11 +72,11 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
 
     def val_dataloader(self):
         """Returns the validation dataloader."""
-        batch_sampler = MultiFolderBatchSampler(
-            self.valid_dataset,
-            self.cfg['training_options']['batch_size'],
+        batch_sampler = InterleavedFileBatchSampler(
+            dataset=self.valid_dataset,
+            batch_size=self.cfg['training_options']['batch_size'],
             shuffle_intra_batch=False, # No need to shuffle within validation batches
-            shuffle_folders_epoch=False # Keep validation order consistent
+            shuffle_files_within_folder=False # Keep validation file order consistent
         )
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
@@ -89,11 +89,11 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
 
     def test_dataloader(self):
         """Returns the test dataloader (same as validation for now)."""
-        batch_sampler = MultiFolderBatchSampler(
-            self.valid_dataset, # Using validation dataset for test
-            self.cfg['training_options']['batch_size'],
+        batch_sampler = InterleavedFileBatchSampler(
+            dataset=self.valid_dataset, # Using validation dataset for test
+            batch_size=self.cfg['training_options']['batch_size'],
             shuffle_intra_batch=False,
-            shuffle_folders_epoch=False
+            shuffle_files_within_folder=False
         )
         collate_fn_with_padding = partial(variable_length_collate_fn)
         
