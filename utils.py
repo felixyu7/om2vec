@@ -5,28 +5,30 @@ import math
 
 # Positional Encoding
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
         self.dropout = nn.Dropout(p=dropout)
 
+        position = torch.arange(max_len).unsqueeze(1) # (max_len, 1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)) # (d_model/2)
+        
         pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1) # Shape: (max_len, 1, d_model)
-        self.register_buffer('pe', pe)
+        # pe is now (max_len, d_model)
+        # We want it to be (1, max_len, d_model) to easily add to (B, S, E)
+        # Or, if Transformer is not batch_first, then (max_len, 1, d_model)
+        # Since our Transformer is batch_first=True, input x to forward will be (B, S, E)
+        self.register_buffer('pe', pe.unsqueeze(0)) # Shape: (1, max_len, d_model)
 
-    def forward(self, x):
-        # x shape: (seq_len, batch_size, d_model) or (batch_size, seq_len, d_model) if batch_first
-        # If batch_first, permute to (seq_len, batch_size, d_model)
-        is_batch_first = x.size(1) == self.pe.size(1) and x.size(0) != self.pe.size(0)
-        if is_batch_first: # Assuming x is (B, S, E)
-            x = x.permute(1, 0, 2) # (S, B, E)
-        
-        x = x + self.pe[:x.size(0), :]
-        x = self.dropout(x)
-        
-        if is_batch_first: # Permute back if originally batch_first
-            x = x.permute(1, 0, 2) # (B, S, E)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, embedding_dim] (if batch_first=True)
+        """
+        # x is (B, S, E). self.pe is (1, max_len, E)
+        # We need to add self.pe[:, :S, :] to x
+        # self.pe is (1, max_len, d_model). We need (1, seq_len, d_model)
+        # x is (batch_size, seq_len, d_model)
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)

@@ -101,11 +101,11 @@ if __name__=="__main__":
                                               save_on_train_epoch_end=True)
         trainer = pl.Trainer(accelerator=cfg['accelerator'], 
                              devices=cfg['num_devices'],
-                             precision="bf16-mixed",
+                             precision=cfg['training_options']['precision'],
                              max_epochs=cfg['training_options']['epochs'], 
                              log_every_n_steps=1, 
                             #  overfit_batches=10,
-                             gradient_clip_val=0.1,
+                             gradient_clip_val=cfg['training_options']['gradient_clip_val'],
                              logger=wandb_logger, 
                              callbacks=[checkpoint_callback, lr_monitor],
                              num_sanity_val_steps=0)
@@ -118,7 +118,7 @@ if __name__=="__main__":
         logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'])
         logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
         trainer = pl.Trainer(accelerator=cfg['accelerator'], 
-                             precision="bf16-mixed",
+                             precision=cfg['training_options']['test_precision'],
                              profiler='simple', 
                              logger=logger,
                              num_sanity_val_steps=0)
