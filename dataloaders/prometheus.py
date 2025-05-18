@@ -8,9 +8,8 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn
+from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn, calculate_summary_statistics
 from functools import partial # For passing max_seq_len_padding to collate_fn
-from ..utils import calculate_summary_statistics
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
     """
@@ -223,7 +222,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         sensor_pos_x = float(row['sensor_pos_x']) if 'sensor_pos_x' in row.fields else 0.0
         sensor_pos_y = float(row['sensor_pos_y']) if 'sensor_pos_y' in row.fields else 0.0
         sensor_pos_z = float(row['sensor_pos_z']) if 'sensor_pos_z' in row.fields else 0.0
-        sensor_pos = torch.tensor([sensor_pos_x, sensor_pos_y, sensor_pos_z], dtype=torch.float32)
+        sensor_pos = torch.tensor([sensor_pos_x, sensor_pos_y, sensor_pos_z], dtype=torch.float32) / 1000. # convert to km
 
         grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
 

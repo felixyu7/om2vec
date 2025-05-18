@@ -47,8 +47,10 @@ class NT_VAE(pl.LightningModule):
             d_model=self.hparams.embed_dim,
             nhead=self.hparams.transformer_encoder_heads,
             dim_feedforward=self.hparams.transformer_encoder_ff_dim,
+            activation='gelu',
             dropout=self.hparams.transformer_encoder_dropout,
-            batch_first=True # Important: input will be (B, S, E)
+            batch_first=True, # Important: input will be (B, S, E)
+            norm_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
