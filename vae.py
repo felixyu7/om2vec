@@ -173,7 +173,7 @@ class NT_VAE(pl.LightningModule):
 
         # Standardize charge: q_std = f(q_raw)
         # q_std = ((log(q_raw + 1) / approx_max_log_charge) - 0.5) * sqrt_12
-        log_q_raw_plus_1 = torch.log(target_raw_counts_flat + 1e-9) # Add epsilon for stability if counts can be 0
+        log_q_raw_plus_1 = torch.log(target_raw_counts_flat + 1.0) # Corrected to + 1.0 to match dataloader
         
         # Ensure constants are on the correct device
         _approx_max_log_charge = self.approx_max_log_charge.to(log_q_raw_plus_1.device)
@@ -195,6 +195,7 @@ class NT_VAE(pl.LightningModule):
         # Jacobian for charge normalization: log |d(q_std)/d(q_raw)|
         # d(q_std)/d(q_raw) = (sqrt_12 / approx_max_log_charge) * (1 / (q_raw + 1))
         # log_abs_det_jacobian_charge = log(sqrt_12) - log(approx_max_log_charge) - log(q_raw + 1)
+        # The derivative of log(x+1) is 1/(x+1). So log_q_raw_plus_1 is correct here.
         log_abs_det_jacobian_charge = torch.log(_sqrt_12) - torch.log(_approx_max_log_charge) - log_q_raw_plus_1.squeeze(-1) # (B*S,)
         
         log_prob_q_raw_flat = log_prob_q_std_flat + log_abs_det_jacobian_charge # (B*S,)
