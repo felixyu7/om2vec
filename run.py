@@ -82,6 +82,8 @@ if __name__=="__main__":
         }
 
         net = NT_VAE(**vae_init_args)
+        net.data_mean = dm.data_mean
+        net.data_std = dm.data_std
     
     if cfg['training']:
         if cfg['logger'] == 'wandb':

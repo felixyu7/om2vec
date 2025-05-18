@@ -70,6 +70,10 @@ class NT_VAE(pl.LightningModule):
         self.beta = 0.
         self.current_train_iter = 0 # Renamed from self.iter for clarity
         
+        # store data_mean and data_std for standardization (set in run.py)
+        self.data_mean = None
+        self.data_std = None
+        
         self.test_step_results = {'num_hits': [], 'js_divs': []}
 
     def encode(self, times_data, counts_data, attention_mask):
@@ -116,7 +120,7 @@ class NT_VAE(pl.LightningModule):
 
         # Retrieve standardization stats from datamodule (ensure they are on the correct device)
         data_mean = self.trainer.datamodule.data_mean.to(target_raw_flat.device)
-        data_std = self.trainer.datamodule.data_std.to(target_raw_flat.device).clamp(min=1e-9)
+        data_std = self.trainer.datamodule.data_std.to(target_raw_flat.device).clamp(min=1e-6)
 
         # Standardize: y = (x - mean) / std
         target_standardized_flat = (target_raw_flat - data_mean) / data_std # (B*S, 1)
@@ -163,12 +167,8 @@ class NT_VAE(pl.LightningModule):
         
         time_steps_raw_flat = time_steps_raw.reshape(-1, 1).float() # (B*NumTimeSteps, 1)
 
-        # Retrieve standardization stats
-        data_mean = self.trainer.datamodule.data_mean.to(time_steps_raw_flat.device)
-        data_std = self.trainer.datamodule.data_std.to(time_steps_raw_flat.device).clamp(min=1e-9)
-
         # Standardize: y = (x - mean) / std
-        time_steps_standardized_flat = (time_steps_raw_flat - data_mean) / data_std
+        time_steps_standardized_flat = (time_steps_raw_flat - self.data_mean) / self.data_std
 
         context_expanded = z.unsqueeze(1).expand(-1, NumTimeSteps, -1) # (B, NumTimeSteps, latent_dim)
         context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*NumTimeSteps, latent_dim)
@@ -180,7 +180,7 @@ class NT_VAE(pl.LightningModule):
         pdf_standardized_flat = torch.exp(log_pdf_standardized_flat)
 
         # Change of variables: p_X(x|z) = p_Y((x-mean)/std |z) * |1/std|
-        abs_det_jacobian = 1.0 / data_std # This is a scalar
+        abs_det_jacobian = 1.0 / self.data_std # This is a scalar
         
         pdf_raw_flat = pdf_standardized_flat * abs_det_jacobian # (B*NumTimeSteps,)
         

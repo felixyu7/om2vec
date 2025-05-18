@@ -32,29 +32,6 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
         
         Sets up train and validation datasets.
         """
-        if self.cfg['training']:
-            train_files_by_folder, train_events_per_file_by_folder = get_file_names(
-                self.cfg['data_options']['train_data_files'],
-                self.cfg['data_options']['train_data_file_ranges'],
-                self.cfg['data_options']['shuffle_files']
-            )
-            self.train_dataset = PrometheusTimeSeriesDataset(
-                train_files_by_folder,
-                train_events_per_file_by_folder,
-                self.cfg
-            )
-            
-        valid_files_by_folder, valid_events_per_file_by_folder = get_file_names(
-            self.cfg['data_options']['valid_data_files'],
-            self.cfg['data_options']['valid_data_file_ranges'],
-            self.cfg['data_options']['shuffle_files'] # Typically false for validation
-        )
-        self.valid_dataset = PrometheusTimeSeriesDataset(
-            valid_files_by_folder,
-            valid_events_per_file_by_folder,
-            self.cfg
-        )
-
         # Load standardization parameters (mean and std) for raw_times from a numpy file
         if stage == 'fit' or stage is None:
             stats_path = self.cfg['data_options'].get('standardization_stats_path')
@@ -73,17 +50,35 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
                 data_mean_val = torch.tensor(0.0, dtype=torch.float32)
                 data_std_val = torch.tensor(1.0, dtype=torch.float32)
 
-            # Register as buffers. These will be moved to the correct device by PyTorch Lightning.
-            # Detach them to ensure they are treated as constants if they came from a computation graph (though here they are from numpy).
-            if not hasattr(self, 'data_mean'): # Ensure registration only once
-                 self.register_buffer('data_mean', data_mean_val.clone().detach())
-            else: # If already exists (e.g. from checkpoint), update it
-                 self.data_mean = data_mean_val.clone().detach().to(self.data_mean.device)
-
-            if not hasattr(self, 'data_std'): # Ensure registration only once
-                 self.register_buffer('data_std', data_std_val.clone().detach())
-            else: # If already exists, update it
-                 self.data_std = data_std_val.clone().detach().to(self.data_std.device)
+            self.data_mean = data_mean_val.clone().detach()
+            self.data_std = data_std_val.clone().detach()
+            
+        if self.cfg['training']:
+            train_files_by_folder, train_events_per_file_by_folder = get_file_names(
+                self.cfg['data_options']['train_data_files'],
+                self.cfg['data_options']['train_data_file_ranges'],
+                self.cfg['data_options']['shuffle_files']
+            )
+            self.train_dataset = PrometheusTimeSeriesDataset(
+                train_files_by_folder,
+                train_events_per_file_by_folder,
+                self.data_mean,
+                self.data_std,
+                self.cfg
+            )
+            
+        valid_files_by_folder, valid_events_per_file_by_folder = get_file_names(
+            self.cfg['data_options']['valid_data_files'],
+            self.cfg['data_options']['valid_data_file_ranges'],
+            self.cfg['data_options']['shuffle_files'] # Typically false for validation
+        )
+        self.valid_dataset = PrometheusTimeSeriesDataset(
+            valid_files_by_folder,
+            valid_events_per_file_by_folder,
+            self.data_mean,
+            self.data_std,
+            self.cfg
+        )
 
     def train_dataloader(self):
         """Returns the training dataloader."""
@@ -145,6 +140,8 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     def __init__(self,
                  files_by_folder: List[List[str]],
                  events_per_file_by_folder: List[List[int]],
+                 data_mean,
+                 data_std,
                  cfg: Dict,
                  cache_size: int = 5): # Added cache_size for Parquet data
         self.files_by_folder = files_by_folder
@@ -152,6 +149,8 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0)
         self.max_seq_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
+        self.data_mean = data_mean
+        self.data_std = data_std
         
         self.num_folders = len(self.files_by_folder)
         self.folder_total_events = [sum(counts) for counts in self.events_per_file_by_folder]
@@ -218,50 +217,33 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
         # ------------------------------------------------ raw hit times
         raw_t = np.asarray(row['hits_t'], dtype=np.float32)
-
-        # ------------------------------------------------ 1) fixed window grouping
-        if raw_t.size == 0:                                  # empty fast-path
-            grp_t_np = np.empty(0, np.float32)
-            grp_c_np = np.empty(0, np.float32)
-        else:
-            t_sorted     = np.sort(raw_t)
-            gaps         = np.diff(t_sorted) >= self.grouping_window_ns
-            split_pts    = np.nonzero(gaps)[0] + 1
-            chunks       = np.split(t_sorted, split_pts)
-
-            grp_t_np = np.fromiter((c[0]   for c in chunks),
-                                count=len(chunks), dtype=np.float32)
-            grp_c_np = np.fromiter((c.size for c in chunks),
-                                count=len(chunks), dtype=np.float32)
-
-        # ------------------------------------------------ 2) adaptive merge-down
-        if (self.max_seq_len_padding is not None and
-            grp_t_np.size > self.max_seq_len_padding):
-
-            # keep everything on torch to avoid host/device swaps
-            rt = torch.from_numpy(grp_t_np)
-            rc = torch.from_numpy(grp_c_np)
-
-            while rt.size(0) > self.max_seq_len_padding:
-                idx = torch.argmin(torch.diff(rt))           # nearest pair
-                rc[idx] += rc[idx + 1]                       # merge counts
-                rt = torch.cat((rt[:idx + 1], rt[idx + 2:]))
-                rc = torch.cat((rc[:idx + 1], rc[idx + 2:]))
-
-            grp_t_np = rt.numpy(force=True)                  # still float32
-            grp_c_np = rc.numpy(force=True)
-
+        
+        grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
+        
         # ------------------------------------------------ tensors + log space
         rt = torch.from_numpy(grp_t_np)
         rc = torch.from_numpy(grp_c_np)
-
+        
         if rt.numel():                                       # non-empty
-            nt = torch.log(rt + 1)
+            # nt = torch.log(rt + 1)
+            nt = (rt - self.data_mean) / self.data_std
             nq = torch.log(rc + 1)
         else:
             nt = torch.empty(0, dtype=torch.float32)
             nq = torch.empty(0, dtype=torch.float32)
-
+        
+        # if max_seq_len_padding is exceeded, randomly sample, count-weighted
+        if self.max_seq_len_padding is not None and rt.numel() > self.max_seq_len_padding:
+            # Count-weighted random sampling
+            probs = rc.float() / rc.sum()
+            idx = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
+            # Sort indices to preserve time order
+            idx, _ = torch.sort(idx)
+            nt = nt[idx]
+            nq = nq[idx]
+            rt = rt[idx]
+            rc = rc[idx]
+        
         return {
             "times":           nt,
             "counts":          nq,
@@ -269,3 +251,16 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             "raw_counts":      rc,
             "sequence_length": torch.tensor(rt.numel(), dtype=torch.long),
         }
+        
+def reduce_by_window(arr, window_size):
+    sorted_arr = np.sort(arr)
+    n = sorted_arr.size
+    reps, counts = [], []
+    i = 0
+    while i < n:
+        rep = sorted_arr[i]
+        j = np.searchsorted(sorted_arr, rep + window_size, side='right')
+        reps.append(rep)
+        counts.append(j - i)
+        i = j
+    return np.array(reps), np.array(counts)
