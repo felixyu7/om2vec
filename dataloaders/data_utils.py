@@ -122,6 +122,24 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     raw_t_pad   = torch.zeros_like(times_pad)
     raw_c_pad   = torch.zeros_like(times_pad)
     attn_mask   = torch.zeros(bsz, max_len, dtype=torch.bool, device=device)
+    
+    # Handle summary_stats (fixed size per item, so just stack)
+    # Assuming summary_stats is a 1D tensor of 9 elements
+    summary_stats_list = [item["summary_stats"] for item in batch if "summary_stats" in item]
+    if summary_stats_list:
+        summary_stats_batched = torch.stack(summary_stats_list, dim=0)
+    else:
+        # Fallback if no summary_stats found, though this shouldn't happen if dataset provides it
+        summary_stats_batched = torch.empty(bsz, 9, dtype=dtype, device=device)
+
+    # Handle sensor_pos (fixed size per item, so just stack)
+    # Assuming sensor_pos is a 1D tensor of 3 elements
+    sensor_pos_list = [item["sensor_pos"] for item in batch if "sensor_pos" in item]
+    if sensor_pos_list:
+        sensor_pos_batched = torch.stack(sensor_pos_list, dim=0)
+    else:
+        # Fallback if no sensor_pos found
+        sensor_pos_batched = torch.empty(bsz, 3, dtype=dtype, device=device)
 
     # ---------- write each sequence ----------
     for row, item in enumerate(batch):
@@ -141,6 +159,8 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         "raw_counts_padded": raw_c_pad,
         "attention_mask":   attn_mask,
         "sequence_lengths": seq_lens,
+        "summary_stats_batched": summary_stats_batched,
+        "sensor_pos_batched": sensor_pos_batched,
     }
 
 class InterleavedFileBatchSampler:

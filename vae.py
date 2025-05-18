@@ -30,7 +30,13 @@ class NT_VAE(pl.LightningModule):
                  ):
         super().__init__()
         self.save_hyperparameters()
-        
+
+        self.num_summary_stats = 9 # Fixed number of summary statistics
+        # The VAE learns the remaining latent dimensions
+        self.learned_latent_dim = self.hparams.latent_dim - self.num_summary_stats
+        if self.learned_latent_dim <= 0:
+            raise ValueError(f"latent_dim ({self.hparams.latent_dim}) must be greater than num_summary_stats ({self.num_summary_stats})")
+
         # Encoder: PyTorch Transformer based
         self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim) # Input: (time, count)
         self.pos_encoder = PositionalEncoding(self.hparams.embed_dim, 
@@ -48,10 +54,13 @@ class NT_VAE(pl.LightningModule):
             encoder_layer,
             num_layers=self.hparams.transformer_encoder_layers
         )
-        self.to_latent_mu = nn.Linear(self.hparams.embed_dim, self.hparams.latent_dim)
-        self.to_latent_logvar = nn.Linear(self.hparams.embed_dim, self.hparams.latent_dim)
+        # Input to these layers will be pooled_output (embed_dim) + sensor_pos (3)
+        self.encoder_to_latent_input_dim = self.hparams.embed_dim + 3
+        self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.learned_latent_dim)
+        self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.learned_latent_dim)
         
         # Decoder: Conditional Neural Spline Flow (Zuko)
+        # The context for the flow is the full latent_dim (summary_stats + learned_latents)
         # self.flow_input_affine layer is removed. Standardization will be used.
         self.conditional_flow = zuko.flows.NSF(
             features=1, # Modeling univariate distribution of standardized raw_times
@@ -60,13 +69,7 @@ class NT_VAE(pl.LightningModule):
             bins=self.hparams.flow_bins,
             hidden_features=[self.hparams.flow_hidden_dim] * self.hparams.flow_hidden_layers,
         )
-        
-        if self.hparams.sensor_positional_encoding:
-            # self.sensor_positional_encoding = nn.Linear(3, self.hparams.in_features) # Defunct, in_features removed
-            # Sensor positional encoding is currently ignored in the forward pass.
-            # If re-enabled, its initialization and application need to be revisited.
-            pass
-        
+
         self.beta = 0.
         self.current_train_iter = 0 # Renamed from self.iter for clarity
         
@@ -76,9 +79,10 @@ class NT_VAE(pl.LightningModule):
         
         self.test_step_results = {'num_hits': [], 'js_divs': []}
 
-    def encode(self, times_data, counts_data, attention_mask):
+    def encode(self, times_data, counts_data, attention_mask, sensor_pos_batched):
         # times_data, counts_data: (B, S)
         # attention_mask: (B, S), boolean, True for valid tokens (False for padding)
+        # sensor_pos_batched: (B, 3)
         
         concatenated_input = torch.stack((times_data, counts_data), dim=-1).float() # (B, S, 2)
         embedded_input = self.encoder_input_embedding(concatenated_input) # (B, S, embed_dim)
@@ -100,10 +104,14 @@ class NT_VAE(pl.LightningModule):
         num_valid_tokens = attention_mask.sum(dim=1, keepdim=True).float().clamp(min=1) # (B, 1), avoid division by zero
         
         pooled_output = summed_pool / num_valid_tokens # (B, embed_dim)
+
+        # Concatenate pooled_output with sensor_pos_batched
+        encoder_latent_input = torch.cat((pooled_output, sensor_pos_batched), dim=1) # (B, embed_dim + 3)
         
-        mu = self.to_latent_mu(pooled_output)
-        logvar = self.to_latent_logvar(pooled_output)
-        return mu, logvar
+        mu_learned = self.to_latent_mu(encoder_latent_input)
+        logvar_learned = self.to_latent_logvar(encoder_latent_input)
+
+        return mu_learned, logvar_learned
     
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -130,7 +138,9 @@ class NT_VAE(pl.LightningModule):
 
         # Flow models p_Y(y | z) for standardized data y
         dist = self.conditional_flow(context_flat)
-        log_prob_y_flat = dist.log_prob(target_standardized_flat) # log p_Y(y|z), shape (B*S,)
+        # Clamp standardized targets to prevent extreme values from destabilizing flow log_prob (zuko NSF limits)
+        target_standardized_flat_clamped = torch.clamp(target_standardized_flat, min=-5, max=5)
+        log_prob_y_flat = dist.log_prob(target_standardized_flat_clamped) # log p_Y(y|z), shape (B*S,)
         
         # Change of variables: log p_X(x|z) = log p_Y((x-mean)/std |z) - log|std|
         # The log_abs_determinant of the standardization y = (x-mean)/std is log|1/std| = -log|std|.
@@ -192,10 +202,17 @@ class NT_VAE(pl.LightningModule):
         times_padded = batch['times_padded'].float()
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
-        mu, logvar = self.encode(times_padded, counts_padded, attention_mask)
-        z = self.reparameterize(mu, logvar)
-        # The old decode and softmax are removed. Log prob calculation is in training_step.
-        return mu, logvar, z
+        summary_stats = batch['summary_stats_batched'].float() # (B, num_summary_stats)
+        sensor_pos_batched = batch['sensor_pos_batched'].float() # (B, 3)
+
+        mu_learned, logvar_learned = self.encode(times_padded, counts_padded, attention_mask, sensor_pos_batched)
+        z_learned = self.reparameterize(mu_learned, logvar_learned) # (B, learned_latent_dim)
+        
+        # Concatenate summary statistics with learned latents
+        z_full = torch.cat((summary_stats, z_learned), dim=1) # (B, latent_dim)
+        
+        # mu and logvar for KL loss are from the learned part only
+        return mu_learned, logvar_learned, z_full
 
     def kl_divergence(self, mu, logvar):
         return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())

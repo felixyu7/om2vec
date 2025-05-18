@@ -10,6 +10,7 @@ from collections import OrderedDict # For FIFO cache
 
 from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn
 from functools import partial # For passing max_seq_len_padding to collate_fn
+from ..utils import calculate_summary_statistics
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
     """
@@ -39,7 +40,7 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
                 try:
                     stats = np.load(stats_path, allow_pickle=True).item()
                     data_mean_val = torch.tensor(stats['data_mean'], dtype=torch.float32)
-                    data_std_val = torch.tensor(stats['data_std'], dtype=torch.float32).clamp(min=1e-9)
+                    data_std_val = torch.tensor(stats['data_std'], dtype=torch.float32).clamp(min=1e-6) # Changed clamp from 1e-9 to 1e-6
                     print(f"Loaded standardization stats from {stats_path}: mean={data_mean_val.item()}, std={data_std_val.item()}")
                 except Exception as e:
                     print(f"Warning: Could not load standardization stats from {stats_path}. Error: {e}. Using default mean=0, std=1.")
@@ -218,7 +219,18 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         # ------------------------------------------------ raw hit times
         raw_t = np.asarray(row['hits_t'], dtype=np.float32)
         
+        # Extract sensor position
+        sensor_pos_x = float(row['sensor_pos_x']) if 'sensor_pos_x' in row.fields else 0.0
+        sensor_pos_y = float(row['sensor_pos_y']) if 'sensor_pos_y' in row.fields else 0.0
+        sensor_pos_z = float(row['sensor_pos_z']) if 'sensor_pos_z' in row.fields else 0.0
+        sensor_pos = torch.tensor([sensor_pos_x, sensor_pos_y, sensor_pos_z], dtype=torch.float32)
+
         grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
+
+        # Calculate summary statistics before potential sampling
+        summary_stats_np = calculate_summary_statistics(grp_t_np, grp_c_np)
+        summary_stats_np = np.log(summary_stats_np + 1) # Log-transform summary statistics
+        summary_stats = torch.from_numpy(summary_stats_np)
         
         # ------------------------------------------------ tensors + log space
         rt = torch.from_numpy(grp_t_np)
@@ -250,6 +262,8 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             "raw_times":       rt,
             "raw_counts":      rc,
             "sequence_length": torch.tensor(rt.numel(), dtype=torch.long),
+            "summary_stats":   summary_stats,
+            "sensor_pos":      sensor_pos,
         }
         
 def reduce_by_window(arr, window_size):
