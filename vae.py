@@ -21,9 +21,13 @@ class NT_VAE(pl.LightningModule):
                  transformer_encoder_dropout=0.1,
                  flow_transforms=5,
                  flow_bins=8,
-                 flow_hidden_dim=128, # Example, ensure it's a list if Zuko expects list e.g. [128, 128]
-                 flow_hidden_layers=2, # Used to construct hidden_features list for Zuko
-                 batch_size=32, # Added batch_size to hparams for logging
+                 flow_hidden_dim=128,
+                 flow_hidden_layers=2,
+                 charge_flow_transforms=3, # New: Hyperparameters for charge flow
+                 charge_flow_bins=8,       # New
+                 charge_flow_hidden_dim=64,# New
+                 charge_flow_hidden_layers=2,# New
+                 batch_size=32,
                  lr=1e-3,
                  lr_schedule=[2, 20],
                  weight_decay=1e-5,
@@ -71,6 +75,20 @@ class NT_VAE(pl.LightningModule):
             bins=self.hparams.flow_bins,
             hidden_features=[self.hparams.flow_hidden_dim] * self.hparams.flow_hidden_layers,
         )
+        
+        # Decoder: Conditional Neural Spline Flow for Charge (Zuko)
+        # Context: latent_dim (from z_full) + 1 (from standardized time)
+        self.conditional_charge_flow = zuko.flows.NSF(
+            features=1, # Modeling univariate distribution of standardized charge
+            context=self.hparams.latent_dim + 1, # z_full + standardized time
+            transforms=self.hparams.charge_flow_transforms,
+            bins=self.hparams.charge_flow_bins,
+            hidden_features=[self.hparams.charge_flow_hidden_dim] * self.hparams.charge_flow_hidden_layers,
+        )
+
+        # Constants for charge normalization/unnormalization
+        self.approx_max_log_charge = torch.tensor(np.log(1e6), dtype=torch.float32)
+        self.sqrt_12 = torch.tensor(np.sqrt(12.0), dtype=torch.float32)
 
         self.beta = 0.
         self.current_train_iter = 0 # Renamed from self.iter for clarity
@@ -120,54 +138,86 @@ class NT_VAE(pl.LightningModule):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode_log_prob(self, target_raw_times, z, attention_mask):
+    def decode_log_prob(self, target_raw_times, target_raw_counts, z, attention_mask):
         # target_raw_times: (B, S), e.g., batch['raw_times_padded'] (original raw scale)
+        # target_raw_counts: (B, S), e.g., batch['raw_counts_padded'] (original raw scale)
         # z: (B, latent_dim)
         # attention_mask: (B, S), boolean, True for valid tokens
 
         B, S = target_raw_times.shape
         target_raw_flat = target_raw_times.reshape(-1, 1).float() # (B*S, 1)
 
-        # Retrieve standardization stats from datamodule (ensure they are on the correct device)
-        data_mean = self.trainer.datamodule.data_mean.to(target_raw_flat.device)
-        data_std = self.trainer.datamodule.data_std.to(target_raw_flat.device).clamp(min=1e-6)
+        # Retrieve standardization stats for time from datamodule (ensure they are on the correct device)
+        data_mean_time = self.trainer.datamodule.data_mean.to(target_raw_flat.device) # Assuming this is time_mean
+        data_std_time = self.trainer.datamodule.data_std.to(target_raw_flat.device).clamp(min=1e-6) # Assuming this is time_std
 
-        # Standardize: y = (x - mean) / std
-        target_standardized_flat = (target_raw_flat - data_mean) / data_std # (B*S, 1)
+        # Standardize time: y_t = (x_t - mean_t) / std_t
+        target_time_standardized_flat = (target_raw_flat - data_mean_time) / data_std_time # (B*S, 1)
         
-        context_expanded = z.unsqueeze(1).expand(-1, S, -1) # (B, S, latent_dim)
-        context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*S, latent_dim)
+        # Prepare context for time flow
+        time_flow_context_expanded = z.unsqueeze(1).expand(-1, S, -1) # (B, S, latent_dim)
+        time_flow_context_flat = time_flow_context_expanded.reshape(-1, self.hparams.latent_dim) # (B*S, latent_dim)
 
-        # Flow models p_Y(y | z) for standardized data y
-        dist = self.conditional_flow(context_flat)
-        # Clamp standardized targets to prevent extreme values from destabilizing flow log_prob (zuko NSF limits)
-        target_standardized_flat_clamped = torch.clamp(target_standardized_flat, min=-5, max=5)
-        log_prob_y_flat = dist.log_prob(target_standardized_flat_clamped) # log p_Y(y|z), shape (B*S,)
+        # Time Flow: log p_T_raw(t_raw | z)
+        dist_time = self.conditional_flow(time_flow_context_flat)
+        target_time_standardized_flat_clamped = torch.clamp(target_time_standardized_flat, min=-5, max=5) # Clamp for stability
+        log_prob_t_std_flat = dist_time.log_prob(target_time_standardized_flat_clamped) # log p_T_std(t_std|z)
         
-        # Change of variables: log p_X(x|z) = log p_Y((x-mean)/std |z) - log|std|
-        # The log_abs_determinant of the standardization y = (x-mean)/std is log|1/std| = -log|std|.
-        log_abs_det_jacobian = -torch.log(data_std) # This is a scalar
-        
-        log_prob_x_flat = log_prob_y_flat + log_abs_det_jacobian # (B*S,)
-        
-        log_probs_x_seq = log_prob_x_flat.reshape(B, S) # (B, S)
+        log_abs_det_jacobian_time = -torch.log(data_std_time) # log|1/std_t|
+        log_prob_t_raw_flat = log_prob_t_std_flat + log_abs_det_jacobian_time # (B*S,)
+        log_probs_t_raw_seq = log_prob_t_raw_flat.reshape(B, S) # (B, S)
+        masked_log_probs_time = log_probs_t_raw_seq * attention_mask.float()
 
-        masked_log_probs = log_probs_x_seq * attention_mask.float() # Apply mask
-        return masked_log_probs
+        # --- Charge Flow ---
+        target_raw_counts_flat = target_raw_counts.reshape(-1, 1).float() # (B*S, 1)
+
+        # Standardize charge: q_std = f(q_raw)
+        # q_std = ((log(q_raw + 1) / approx_max_log_charge) - 0.5) * sqrt_12
+        log_q_raw_plus_1 = torch.log(target_raw_counts_flat + 1e-9) # Add epsilon for stability if counts can be 0
+        
+        # Ensure constants are on the correct device
+        _approx_max_log_charge = self.approx_max_log_charge.to(log_q_raw_plus_1.device)
+        _sqrt_12 = self.sqrt_12.to(log_q_raw_plus_1.device)
+
+        q_scaled = log_q_raw_plus_1 / _approx_max_log_charge
+        target_charge_standardized_flat = (q_scaled - 0.5) * _sqrt_12 # (B*S, 1)
+        
+        # Prepare context for charge flow: z_full and standardized time
+        # time_flow_context_flat is (B*S, latent_dim) from z
+        # target_time_standardized_flat_clamped is (B*S, 1)
+        charge_flow_context_flat = torch.cat((time_flow_context_flat, target_time_standardized_flat_clamped), dim=1) # (B*S, latent_dim + 1)
+
+        # Charge Flow: log p_Q_raw(q_raw | z, t_std)
+        dist_charge = self.conditional_charge_flow(charge_flow_context_flat)
+        target_charge_standardized_flat_clamped = torch.clamp(target_charge_standardized_flat, min=-5, max=5) # Clamp for stability
+        log_prob_q_std_flat = dist_charge.log_prob(target_charge_standardized_flat_clamped) # log p_Q_std(q_std | z, t_std)
+
+        # Jacobian for charge normalization: log |d(q_std)/d(q_raw)|
+        # d(q_std)/d(q_raw) = (sqrt_12 / approx_max_log_charge) * (1 / (q_raw + 1))
+        # log_abs_det_jacobian_charge = log(sqrt_12) - log(approx_max_log_charge) - log(q_raw + 1)
+        log_abs_det_jacobian_charge = torch.log(_sqrt_12) - torch.log(_approx_max_log_charge) - log_q_raw_plus_1.squeeze(-1) # (B*S,)
+        
+        log_prob_q_raw_flat = log_prob_q_std_flat + log_abs_det_jacobian_charge # (B*S,)
+        log_probs_q_raw_seq = log_prob_q_raw_flat.reshape(B, S) # (B, S)
+        masked_log_probs_charge = log_probs_q_raw_seq * attention_mask.float()
+        
+        return masked_log_probs_time, masked_log_probs_charge
     
-    def decode(self, z, time_steps_raw):
+    def decode(self, z, time_steps_raw, num_charge_samples=1):
         """
-        Decodes a latent representation z to produce PDF values for photon arrival times
-        at the given raw time_steps.
-        The internal flow models standardized version of raw times: (t_raw - mean) / std.
-        This method computes the PDF in the original raw time scale.
+        Decodes a latent representation z to produce:
+        1. PDF values for photon arrival times at the given raw time_steps.
+        2. Sampled raw charge values associated with each time_step.
 
         Args:
             z (torch.Tensor): Latent representation, shape (B, latent_dim).
-            time_steps_raw (torch.Tensor): Time steps at which to evaluate the PDF, in raw scale.
-                                           Can be shape (B, NumTimeSteps) or (NumTimeSteps).
+            time_steps_raw (torch.Tensor): Time steps at which to evaluate the PDF and generate charge,
+                                           in raw scale. Can be shape (B, NumTimeSteps) or (NumTimeSteps).
+            num_charge_samples (int): Number of charge samples to generate per time step.
         Returns:
-            torch.Tensor: PDF values at the given time_steps_raw, shape (B, NumTimeSteps).
+            Tuple[torch.Tensor, torch.Tensor]:
+                - pdf_values_time_raw (torch.Tensor): PDF values for time, shape (B, NumTimeSteps).
+                - generated_charges_raw (torch.Tensor): Sampled raw charges, shape (B, NumTimeSteps, num_charge_samples).
         """
         B = z.shape[0]
         time_steps_raw = time_steps_raw.to(z.device)
@@ -179,26 +229,56 @@ class NT_VAE(pl.LightningModule):
         
         time_steps_raw_flat = time_steps_raw.reshape(-1, 1).float() # (B*NumTimeSteps, 1)
 
-        # Standardize: y = (x - mean) / std
-        time_steps_standardized_flat = (time_steps_raw_flat - self.data_mean) / self.data_std
+        # Standardize time: y_t = (x_t - mean_t) / std_t
+        # Ensure data_mean and data_std are on the correct device (should be handled if they are buffers/params or set in forward)
+        _data_mean_time = self.data_mean.to(z.device)
+        _data_std_time = self.data_std.to(z.device)
+        time_steps_standardized_flat = (time_steps_raw_flat - _data_mean_time) / _data_std_time # (B*NumTimeSteps, 1)
 
-        context_expanded = z.unsqueeze(1).expand(-1, NumTimeSteps, -1) # (B, NumTimeSteps, latent_dim)
-        context_flat = context_expanded.reshape(-1, self.hparams.latent_dim) # (B*NumTimeSteps, latent_dim)
+        # --- Time PDF Calculation ---
+        time_flow_context_expanded = z.unsqueeze(1).expand(-1, NumTimeSteps, -1) # (B, NumTimeSteps, latent_dim)
+        time_flow_context_flat = time_flow_context_expanded.reshape(-1, self.hparams.latent_dim) # (B*NumTimeSteps, latent_dim)
 
-        dist = self.conditional_flow(context_flat)
+        dist_time = self.conditional_flow(time_flow_context_flat)
+        log_pdf_time_standardized_flat = dist_time.log_prob(time_steps_standardized_flat) # (B*NumTimeSteps,)
+        pdf_time_standardized_flat = torch.exp(log_pdf_time_standardized_flat)
         
-        # Log PDF in the standardized space: log p_Y(y|z)
-        log_pdf_standardized_flat = dist.log_prob(time_steps_standardized_flat) # (B*NumTimeSteps,)
-        pdf_standardized_flat = torch.exp(log_pdf_standardized_flat)
+        abs_det_jacobian_time = 1.0 / _data_std_time
+        pdf_time_raw_flat = pdf_time_standardized_flat * abs_det_jacobian_time
+        pdf_values_time_raw = pdf_time_raw_flat.reshape(B, NumTimeSteps)
 
-        # Change of variables: p_X(x|z) = p_Y((x-mean)/std |z) * |1/std|
-        abs_det_jacobian = 1.0 / self.data_std # This is a scalar
+        # --- Charge Sampling and Un-normalization ---
+        # Context for charge flow: z (expanded) and standardized time
+        # time_flow_context_flat is (B*NumTimeSteps, latent_dim)
+        # time_steps_standardized_flat is (B*NumTimeSteps, 1)
+        charge_flow_context_flat = torch.cat((time_flow_context_flat, time_steps_standardized_flat), dim=1) # (B*NumTimeSteps, latent_dim + 1)
         
-        pdf_raw_flat = pdf_standardized_flat * abs_det_jacobian # (B*NumTimeSteps,)
+        dist_charge = self.conditional_charge_flow(charge_flow_context_flat)
         
-        pdf_values_raw = pdf_raw_flat.reshape(B, NumTimeSteps)
+        # Sample standardized charges: (B*NumTimeSteps, num_charge_samples)
+        # charge_flow_context_flat is (B*NumTimeSteps, latent_dim + 1)
         
-        return pdf_values_raw
+        num_elements = B * NumTimeSteps
+        expanded_charge_context = charge_flow_context_flat.repeat_interleave(num_charge_samples, dim=0) # (B*NumTimeSteps*num_samples, latent_dim + 1)
+        
+        dist_charge_expanded = self.conditional_charge_flow(expanded_charge_context)
+        sampled_charge_standardized_expanded_flat = dist_charge_expanded.sample() # (B*NumTimeSteps*num_samples, 1)
+        
+        # Reshape to (B*NumTimeSteps, num_charge_samples) for unnormalization
+        sampled_charge_standardized = sampled_charge_standardized_expanded_flat.reshape(num_elements, num_charge_samples)
+
+        # Un-normalize charge: q_raw = exp(((q_std / sqrt_12) + 0.5) * approx_max_log_charge) - 1
+        _approx_max_log_charge_dev = self.approx_max_log_charge.to(z.device)
+        _sqrt_12_dev = self.sqrt_12.to(z.device)
+
+        q_scaled_inv = (sampled_charge_standardized / _sqrt_12_dev) + 0.5
+        log_q_raw_plus_1_inv = q_scaled_inv * _approx_max_log_charge_dev
+        generated_charges_raw_flat = torch.exp(log_q_raw_plus_1_inv) - 1.0
+        
+        # Reshape to (B, NumTimeSteps, num_charge_samples)
+        generated_charges_raw = generated_charges_raw_flat.reshape(B, NumTimeSteps, num_charge_samples)
+        
+        return pdf_values_time_raw, generated_charges_raw
     
     def forward(self, batch):
         times_padded = batch['times_padded'].float()
@@ -222,14 +302,20 @@ class NT_VAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
             
-        # Reconstruction Loss from NSF (modeling affinely transformed raw times)
-        target_raw_times = batch['raw_times_padded'].float() # Use raw times
-        attention_mask = batch['attention_mask'].bool() # ensure boolean
+        target_raw_times = batch['raw_times_padded'].float()
+        target_raw_counts = batch['raw_counts_padded'].float() # Get raw counts
+        attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(target_raw_times, z, attention_mask)
+        masked_log_probs_time, masked_log_probs_charge = self.decode_log_prob(
+            target_raw_times, target_raw_counts, z, attention_mask
+        )
         
-        # Average NLL over valid (non-padded) elements in the batch
-        reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
+        # Average NLL for time
+        reconstruction_loss_time = -masked_log_probs_time.sum() / attention_mask.sum().float().clamp(min=1)
+        # Average NLL for charge
+        reconstruction_loss_charge = -masked_log_probs_charge.sum() / attention_mask.sum().float().clamp(min=1)
+        
+        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge # Combine losses
 
         kl_loss = self.kl_divergence(mu, logvar)
         
@@ -254,44 +340,62 @@ class NT_VAE(pl.LightningModule):
         
         self.current_train_iter += 1
         
-        self.log("train_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("train_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
         self.log("kl_loss", kl_loss, batch_size=self.hparams.batch_size, sync_dist=True)
-        self.log("reco_loss", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("reco_loss_total", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
+        self.log("reco_loss_time", reconstruction_loss_time, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("reco_loss_charge", reconstruction_loss_charge, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("beta", self.beta, batch_size=self.hparams.batch_size, sync_dist=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
 
-        target_raw_times = batch['raw_times_padded'].float() # Use raw times
+        target_raw_times = batch['raw_times_padded'].float()
+        target_raw_counts = batch['raw_counts_padded'].float() # Get raw counts
         attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(target_raw_times, z, attention_mask)
-        reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
+        masked_log_probs_time, masked_log_probs_charge = self.decode_log_prob(
+            target_raw_times, target_raw_counts, z, attention_mask
+        )
+        
+        reconstruction_loss_time = -masked_log_probs_time.sum() / attention_mask.sum().float().clamp(min=1)
+        reconstruction_loss_charge = -masked_log_probs_charge.sum() / attention_mask.sum().float().clamp(min=1)
+        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
         
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss) # Consider if beta should be fixed for val/test
         
-        self.log("val_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True) # Renamed val_train_loss to val_loss
+        self.log("val_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
         self.log("val_kl_loss", kl_loss, batch_size=self.hparams.batch_size, sync_dist=True)
-        self.log("val_reco_loss", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("val_reco_loss_total", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
+        self.log("val_reco_loss_time", reconstruction_loss_time, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("val_reco_loss_charge", reconstruction_loss_charge, batch_size=self.hparams.batch_size, sync_dist=True)
         return loss
     
     def test_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
 
-        target_raw_times = batch['raw_times_padded'].float() # Use raw times
+        target_raw_times = batch['raw_times_padded'].float()
+        target_raw_counts = batch['raw_counts_padded'].float() # Get raw counts
         attention_mask = batch['attention_mask'].bool()
 
-        log_probs_masked = self.decode_log_prob(target_raw_times, z, attention_mask)
-        reconstruction_loss = -log_probs_masked.sum() / attention_mask.sum().float().clamp(min=1)
+        masked_log_probs_time, masked_log_probs_charge = self.decode_log_prob(
+            target_raw_times, target_raw_counts, z, attention_mask
+        )
+
+        reconstruction_loss_time = -masked_log_probs_time.sum() / attention_mask.sum().float().clamp(min=1)
+        reconstruction_loss_charge = -masked_log_probs_charge.sum() / attention_mask.sum().float().clamp(min=1)
+        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
 
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss) # Consider if beta should be fixed for val/test
         
         self.log("test_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("test_kl_loss", kl_loss, batch_size=self.hparams.batch_size, sync_dist=True)
-        self.log("test_reco_loss", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("test_reco_loss_total", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("test_reco_loss_time", reconstruction_loss_time, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("test_reco_loss_charge", reconstruction_loss_charge, batch_size=self.hparams.batch_size, sync_dist=True)
         return loss
     
     def configure_optimizers(self):

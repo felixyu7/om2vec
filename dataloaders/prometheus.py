@@ -2,6 +2,7 @@ import os
 import glob
 import torch
 import numpy as np
+import math
 import pytorch_lightning as pl
 import awkward as ak
 import pyarrow.parquet as pq
@@ -239,6 +240,10 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             # nt = torch.log(rt + 1)
             nt = (rt - self.data_mean) / self.data_std
             nq = torch.log(rc + 1)
+            # approximate standarization for counts
+            approx_max = math.log(1e6)
+            nq = nq / approx_max
+            nq = (nq - 0.5) * math.sqrt(12)
         else:
             nt = torch.empty(0, dtype=torch.float32)
             nq = torch.empty(0, dtype=torch.float32)

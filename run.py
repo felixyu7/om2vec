@@ -75,6 +75,10 @@ if __name__=="__main__":
             "flow_bins": cfg['model_options']['flow_bins'],
             "flow_hidden_dim": cfg['model_options']['flow_hidden_dim'],
             "flow_hidden_layers": cfg['model_options']['flow_hidden_layers'],
+            "charge_flow_transforms": cfg['model_options']['charge_flow_transforms'], # New
+            "charge_flow_bins": cfg['model_options']['charge_flow_bins'],             # New
+            "charge_flow_hidden_dim": cfg['model_options']['charge_flow_hidden_dim'], # New
+            "charge_flow_hidden_layers": cfg['model_options']['charge_flow_hidden_layers'],# New
             "batch_size": cfg['training_options']['batch_size'], # Add batch_size for VAE hparams
             "lr": cfg['training_options']['lr'],
             "lr_schedule": cfg['training_options']['lr_schedule'],
