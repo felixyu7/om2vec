@@ -229,21 +229,17 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
         # Calculate summary statistics before potential sampling
         summary_stats_np = calculate_summary_statistics(grp_t_np, grp_c_np)
-        summary_stats_np = np.log(summary_stats_np + 1) # Log-transform summary statistics
+        epsilon = 1e-6
+        summary_stats_np = np.log(summary_stats_np + epsilon) # Log-normalize summary statistics
         summary_stats = torch.from_numpy(summary_stats_np)
         
-        # ------------------------------------------------ tensors + log space
+        # ------------------------------------------------ tensors + log-normalization
         rt = torch.from_numpy(grp_t_np)
         rc = torch.from_numpy(grp_c_np)
         
-        if rt.numel():                                       # non-empty
-            # nt = torch.log(rt + 1)
-            nt = (rt - self.data_mean) / self.data_std
-            nq = torch.log(rc + 1)
-            # approximate standarization for counts
-            approx_max = math.log(1e6)
-            nq = nq / approx_max
-            nq = (nq - 0.5) * math.sqrt(12)
+        if rt.numel():  # non-empty
+            nt = torch.log(rt + epsilon)
+            nq = torch.log(rc + epsilon)
         else:
             nt = torch.empty(0, dtype=torch.float32)
             nq = torch.empty(0, dtype=torch.float32)

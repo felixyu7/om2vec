@@ -65,29 +65,22 @@ if __name__=="__main__":
             "embed_dim": cfg['model_options']['embed_dim'],
             "beta_factor": cfg['model_options']['beta_factor'],
             "beta_peak_epoch": cfg['model_options']['beta_peak_epoch'],
-            "sensor_positional_encoding": cfg['model_options']['sensor_positional_encoding'],
             "max_seq_len_padding": cfg['data_options']['max_seq_len_padding'],
             "transformer_encoder_layers": cfg['model_options']['transformer_encoder_layers'],
             "transformer_encoder_heads": cfg['model_options']['transformer_encoder_heads'],
             "transformer_encoder_ff_dim": cfg['model_options']['transformer_encoder_ff_dim'],
             "transformer_encoder_dropout": cfg['model_options']['transformer_encoder_dropout'],
-            "flow_transforms": cfg['model_options']['flow_transforms'],
-            "flow_bins": cfg['model_options']['flow_bins'],
-            "flow_hidden_dim": cfg['model_options']['flow_hidden_dim'],
-            "flow_hidden_layers": cfg['model_options']['flow_hidden_layers'],
-            "charge_flow_transforms": cfg['model_options']['charge_flow_transforms'], # New
-            "charge_flow_bins": cfg['model_options']['charge_flow_bins'],             # New
-            "charge_flow_hidden_dim": cfg['model_options']['charge_flow_hidden_dim'], # New
-            "charge_flow_hidden_layers": cfg['model_options']['charge_flow_hidden_layers'],# New
-            "batch_size": cfg['training_options']['batch_size'], # Add batch_size for VAE hparams
+            "transformer_decoder_layers": cfg['model_options']['transformer_decoder_layers'],
+            "transformer_decoder_heads": cfg['model_options']['transformer_decoder_heads'],
+            "transformer_decoder_ff_dim": cfg['model_options']['transformer_decoder_ff_dim'],
+            "transformer_decoder_dropout": cfg['model_options']['transformer_decoder_dropout'],
+            "batch_size": cfg['training_options']['batch_size'],
             "lr": cfg['training_options']['lr'],
             "lr_schedule": cfg['training_options']['lr_schedule'],
             "weight_decay": cfg['training_options']['weight_decay'],
         }
 
         net = NT_VAE(**vae_init_args)
-        net.data_mean = dm.data_mean
-        net.data_std = dm.data_std
     
     if cfg['training']:
         if cfg['logger'] == 'wandb':

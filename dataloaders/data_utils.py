@@ -10,28 +10,32 @@ import pyarrow.parquet as pq # Added import
 
 def calculate_summary_statistics(raw_times_np: np.ndarray, raw_counts_np: np.ndarray) -> np.ndarray:
     """
-    Calculates 9 summary statistics for a given photon distribution.
+    Calculates 10 summary statistics for a given photon distribution.
+    The first statistic is the real (unpadded) sequence length.
 
     Args:
         raw_times_np (np.ndarray): Array of pulse arrival times.
         raw_counts_np (np.ndarray): Array of pulse charges (counts).
 
     Returns:
-        np.ndarray: A 1D array of 9 summary statistics.
+        np.ndarray: A 1D array of 10 summary statistics.
                     Returns zeros if input is empty.
     """
     if raw_times_np.size == 0 or raw_counts_np.size == 0:
-        return np.zeros(9, dtype=np.float32)
+        return np.zeros(10, dtype=np.float32)
 
     # Ensure sorted by time for cumulative calculations and first/last pulse
     sort_indices = np.argsort(raw_times_np)
     times = raw_times_np[sort_indices]
     counts = raw_counts_np[sort_indices]
 
+    # Real (unpadded) sequence length
+    seq_length = float(len(times))
+
     # 1. Total charge
     total_charge = np.sum(counts)
     if total_charge == 0: # Avoid division by zero if all counts are zero
-        return np.zeros(9, dtype=np.float32)
+        return np.zeros(10, dtype=np.float32)
 
     # 4. Time of first pulse
     time_first_pulse = times[0]
@@ -60,7 +64,7 @@ def calculate_summary_statistics(raw_times_np: np.ndarray, raw_counts_np: np.nda
     if idx_20_percent < len(times):
         time_charge_20_percent = times[idx_20_percent]
     else: # Should not happen if total_charge > 0 and cumulative_charge reaches total_charge
-        time_charge_20_percent = time_last_pulse 
+        time_charge_20_percent = time_last_pulse
 
     # 6. Time at which 50% of the charge is collected
     target_charge_50 = 0.50 * total_charge
@@ -71,6 +75,7 @@ def calculate_summary_statistics(raw_times_np: np.ndarray, raw_counts_np: np.nda
         time_charge_50_percent = time_last_pulse
 
     return np.array([
+        seq_length,
         total_charge,
         charge_within_100ns,
         charge_within_500ns,
@@ -198,13 +203,13 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     attn_mask   = torch.zeros(bsz, max_len, dtype=torch.bool, device=device)
     
     # Handle summary_stats (fixed size per item, so just stack)
-    # Assuming summary_stats is a 1D tensor of 9 elements
+    # Now summary_stats is a 1D tensor of 10 elements
     summary_stats_list = [item["summary_stats"] for item in batch if "summary_stats" in item]
     if summary_stats_list:
         summary_stats_batched = torch.stack(summary_stats_list, dim=0)
     else:
         # Fallback if no summary_stats found, though this shouldn't happen if dataset provides it
-        summary_stats_batched = torch.empty(bsz, 9, dtype=dtype, device=device)
+        summary_stats_batched = torch.empty(bsz, 10, dtype=dtype, device=device)
 
     # Handle sensor_pos (fixed size per item, so just stack)
     # Assuming sensor_pos is a 1D tensor of 3 elements
