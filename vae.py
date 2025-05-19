@@ -232,8 +232,8 @@ class NT_VAE(pl.LightningModule):
 
         # Standardize time: y_t = (x_t - mean_t) / std_t
         # Ensure data_mean and data_std are on the correct device (should be handled if they are buffers/params or set in forward)
-        _data_mean_time = self.data_mean.to(z.device)
-        _data_std_time = self.data_std.to(z.device)
+        _data_mean_time = self.data_mean
+        _data_std_time = self.data_std
         time_steps_standardized_flat = (time_steps_raw_flat - _data_mean_time) / _data_std_time # (B*NumTimeSteps, 1)
 
         # --- Time PDF Calculation ---
@@ -293,6 +293,9 @@ class NT_VAE(pl.LightningModule):
         
         # Concatenate summary statistics with learned latents
         z_full = torch.cat((summary_stats, z_learned), dim=1) # (B, latent_dim)
+        
+        # clamp logvar for stability
+        logvar_learned = torch.clamp(logvar_learned, min=-10, max=10)
         
         # mu and logvar for KL loss are from the learned part only
         return mu_learned, logvar_learned, z_full
