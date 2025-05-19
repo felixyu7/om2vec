@@ -22,10 +22,11 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
+                 mdn_num_components=5,
                  batch_size=32,
                  lr=1e-3,
                  lr_schedule=[2, 20],
-                 weight_decay=1e-5,
+                 weight_decay=1e-5
                  ):
         super().__init__()
         self.save_hyperparameters()
@@ -67,7 +68,8 @@ class NT_VAE(pl.LightningModule):
             num_layers=self.hparams.transformer_decoder_layers,
             num_heads=self.hparams.transformer_decoder_heads,
             ff_dim=self.hparams.transformer_decoder_ff_dim,
-            dropout=self.hparams.transformer_decoder_dropout
+            dropout=self.hparams.transformer_decoder_dropout,
+            num_mixture_components=self.hparams.mdn_num_components
         )
 
         self.beta = 0.
@@ -113,30 +115,6 @@ class NT_VAE(pl.LightningModule):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-
-    def reconstruction_loss(self, target_log_t, target_log_q, z, attention_mask):
-        """
-        Args:
-            target_log_t: (B, S) log-normalized arrival times
-            target_log_q: (B, S) log-normalized charges
-            z: (B, latent_dim)
-            attention_mask: (B, S) boolean, True for valid tokens
-        Returns:
-            mse_t: (B,) MSE for t (masked)
-            mse_q: (B,) MSE for q (masked)
-        """
-        # Teacher forcing: input is previous (t, q), output is next (t, q)
-        # Shift input right, prepend SOS token (zeros)
-        B, S = target_log_t.shape
-        device = target_log_t.device
-        sos = torch.zeros((B, 1, 2), device=device)
-        decoder_inputs = torch.cat([sos, torch.stack([target_log_t, target_log_q], dim=-1)[:, :-1, :]], dim=1)  # (B, S, 2)
-        # Forward through transformer decoder
-        pred_means = self.decoder(decoder_inputs, z, padding_mask=attention_mask)  # (B, S, 2)
-        # Compute MSE loss (masked)
-        mse_t = F.mse_loss(pred_means[..., 0][attention_mask], target_log_t[attention_mask], reduction='mean')
-        mse_q = F.mse_loss(pred_means[..., 1][attention_mask], target_log_q[attention_mask], reduction='mean')
-        return mse_t, mse_q
     
     def decode(self, z, max_len=None):
         """
@@ -158,8 +136,32 @@ class NT_VAE(pl.LightningModule):
         generated = []
         prev = torch.zeros((B, 1, 2), device=device)
         for _ in range(L):
-            out = self.decoder(prev, z, padding_mask=None)  # (B, step+1, 2)
-            next_token = out[:, -1:, :]  # (B, 1, 2)
+            # Decoder returns GMM params: (pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q)
+            pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q = self.decoder(prev, z, padding_mask=None)
+            # Get the last predicted token's GMM params (B, 1, K)
+            pis_t_last = pis_t[:, -1, :]  # (B, K)
+            mus_t_last = mus_t[:, -1, :]  # (B, K)
+            sigmas_t_last = sigmas_t[:, -1, :]  # (B, K)
+            pis_q_last = pis_q[:, -1, :]  # (B, K)
+            mus_q_last = mus_q[:, -1, :]  # (B, K)
+            sigmas_q_last = sigmas_q[:, -1, :]  # (B, K)
+
+            # Sample mixture component for each batch item
+            k_t = torch.multinomial(pis_t_last, 1).squeeze(-1)  # (B,)
+            k_q = torch.multinomial(pis_q_last, 1).squeeze(-1)  # (B,)
+
+            # Gather means and stds for selected components
+            mu_t = mus_t_last.gather(1, k_t.unsqueeze(1)).squeeze(1)      # (B,)
+            sigma_t = sigmas_t_last.gather(1, k_t.unsqueeze(1)).squeeze(1)  # (B,)
+            mu_q = mus_q_last.gather(1, k_q.unsqueeze(1)).squeeze(1)      # (B,)
+            sigma_q = sigmas_q_last.gather(1, k_q.unsqueeze(1)).squeeze(1)  # (B,)
+
+            # Sample from Normal for log(t) and log(q)
+            log_t_sampled = torch.distributions.Normal(mu_t, sigma_t).sample().unsqueeze(1)  # (B,1)
+            log_q_sampled = torch.distributions.Normal(mu_q, sigma_q).sample().unsqueeze(1)  # (B,1)
+
+            # Stack to get next_token (B, 1, 2)
+            next_token = torch.cat([log_t_sampled, log_q_sampled], dim=-1).unsqueeze(1)  # (B, 1, 2)
             generated.append(next_token)
             prev = torch.cat([prev, next_token], dim=1)
         generated = torch.cat(generated, dim=1)  # (B, L, 2)
@@ -168,6 +170,58 @@ class NT_VAE(pl.LightningModule):
             if l < L:
                 generated[i, l:] = 0
         return generated
+    
+    def mdn_negative_log_likelihood(self, target, pis, mus, sigmas, attention_mask):
+        """
+        Computes the negative log-likelihood for a Mixture Density Network (MDN) output.
+        Args:
+            target: (B, S)
+            pis: (B, S, K) - mixing coefficients (softmaxed)
+            mus: (B, S, K) - means
+            sigmas: (B, S, K) - stddevs (positive)
+            attention_mask: (B, S) - boolean, True for valid tokens
+        Returns:
+            Scalar negative log-likelihood averaged over valid tokens.
+        """
+        # Expand target to (B, S, K)
+        target_exp = target.unsqueeze(-1).expand_as(mus)
+        # Compute log-probabilities under each Gaussian component
+        normal = torch.distributions.Normal(mus, sigmas)
+        log_probs = normal.log_prob(target_exp)  # (B, S, K)
+        # Combine with log mixing coefficients
+        log_pis = torch.log(pis + 1e-8)  # (B, S, K), add epsilon for stability
+        log_weighted = log_pis + log_probs  # (B, S, K)
+        # Log-sum-exp over mixture components
+        log_sum = torch.logsumexp(log_weighted, dim=-1)  # (B, S)
+        # Mask out invalid tokens
+        valid_log_sum = log_sum[attention_mask]
+        # Negative log-likelihood, mean over valid tokens
+        nll = -valid_log_sum.mean()
+        return nll
+
+    def reconstruction_loss(self, target_log_t, target_log_q, z, attention_mask):
+        """
+        Args:
+            target_log_t: (B, S) log-normalized arrival times
+            target_log_q: (B, S) log-normalized charges
+            z: (B, latent_dim)
+            attention_mask: (B, S) boolean, True for valid tokens
+        Returns:
+            nll_t: scalar NLL for t
+            nll_q: scalar NLL for q
+        """
+        B, S = target_log_t.shape
+        device = target_log_t.device
+        sos = torch.zeros((B, 1, 2), device=device)
+        decoder_inputs = torch.cat([sos, torch.stack([target_log_t, target_log_q], dim=-1)[:, :-1, :]], dim=1)  # (B, S, 2)
+        # Decoder returns GMM parameters
+        pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q = self.decoder(decoder_inputs, z, padding_mask=attention_mask)
+        nll_t = self.mdn_negative_log_likelihood(target_log_t, pis_t, mus_t, sigmas_t, attention_mask)
+        nll_q = self.mdn_negative_log_likelihood(target_log_q, pis_q, mus_q, sigmas_q, attention_mask)
+        return nll_t, nll_q
+    
+    def kl_divergence(self, mu, logvar):
+        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     
     def forward(self, batch):
         times_padded = batch['times_padded'].float()
@@ -188,9 +242,6 @@ class NT_VAE(pl.LightningModule):
         # mu and logvar for KL loss are from the learned part only
         return mu_learned, logvar_learned, z_full
 
-    def kl_divergence(self, mu, logvar):
-        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-
     def training_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
             
@@ -198,12 +249,12 @@ class NT_VAE(pl.LightningModule):
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
 
-        mse_t, mse_q = self.reconstruction_loss(
+        nll_t, nll_q = self.reconstruction_loss(
             times_padded, counts_padded, z, attention_mask
         )
 
-        reconstruction_loss_time = mse_t
-        reconstruction_loss_charge = mse_q
+        reconstruction_loss_time = nll_t
+        reconstruction_loss_charge = nll_q
         reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
 
         kl_loss = self.kl_divergence(mu, logvar)
@@ -243,12 +294,12 @@ class NT_VAE(pl.LightningModule):
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
 
-        mse_t, mse_q = self.reconstruction_loss(
+        nll_t, nll_q = self.reconstruction_loss(
             times_padded, counts_padded, z, attention_mask
         )
 
-        reconstruction_loss_time = mse_t
-        reconstruction_loss_charge = mse_q
+        reconstruction_loss_time = nll_t
+        reconstruction_loss_charge = nll_q
         reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
 
         kl_loss = self.kl_divergence(mu, logvar)
@@ -268,12 +319,12 @@ class NT_VAE(pl.LightningModule):
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
 
-        mse_t, mse_q = self.reconstruction_loss(
+        nll_t, nll_q = self.reconstruction_loss(
             times_padded, counts_padded, z, attention_mask
         )
 
-        reconstruction_loss_time = mse_t
-        reconstruction_loss_charge = mse_q
+        reconstruction_loss_time = nll_t
+        reconstruction_loss_charge = nll_q
         reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
 
         kl_loss = self.kl_divergence(mu, logvar)
@@ -293,7 +344,7 @@ class NT_VAE(pl.LightningModule):
     
 # --- Om2VecDecoder module ---
 class Om2VecDecoder(nn.Module):
-    def __init__(self, latent_dim, embed_dim, num_layers=4, num_heads=8, ff_dim=256, dropout=0.1):
+    def __init__(self, latent_dim, embed_dim, num_layers=4, num_heads=8, ff_dim=256, dropout=0.1, num_mixture_components=5):
         super().__init__()
         self.input_proj = nn.Linear(2, embed_dim)
         self.pos_encoder = PositionalEncoding(embed_dim, dropout)
@@ -308,7 +359,9 @@ class Om2VecDecoder(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.z_proj = nn.Linear(latent_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, 2)  # Predict mean log(t), log(q)
+        self.num_mixture_components = num_mixture_components
+        # Output: for each of log(t) and log(q): num_mixture_components * (pi, mu, sigma)
+        self.out_proj = nn.Linear(embed_dim, num_mixture_components * 3 * 2)
 
     def forward(self, tgt, z, padding_mask=None):
         # tgt: (B, S_tgt, 2) - current target sequence
@@ -325,23 +378,18 @@ class Om2VecDecoder(nn.Module):
         # 2. Prepare memory (context from z)
         # memory shape: (B, S_mem, embed_dim). Here S_mem = 1.
         memory = self.z_proj(z).unsqueeze(1) # (B, 1, embed_dim)
-        # No need to expand memory to S_tgt, TransformerDecoder handles broadcasting or uses it as (B, S_mem, E)
 
         # 3. Create Causal Mask for target self-attention (for nn.TransformerDecoder's tgt_mask)
         # Shape: (S_tgt, S_tgt)
         causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device)
 
         # 4. Create Target Padding Mask (for nn.TransformerDecoder's tgt_key_padding_mask)
-        # True for PADDED tokens in the target sequence.
         # Shape: (B, S_tgt)
         tgt_key_padding_mask = None
         if padding_mask is not None:
-            # nn.TransformerDecoder expects True for PADDED tokens.
-            # Input padding_mask is True for VALID tokens.
             tgt_key_padding_mask = ~padding_mask
 
         # 5. Create Memory Padding Mask (for nn.TransformerDecoder's memory_key_padding_mask)
-        # Since memory (z_ctx) has S_mem=1 and z is not inherently padded, this is all False.
         # Shape: (B, S_mem) -> (B, 1)
         memory_key_padding_mask = torch.zeros((B, 1), dtype=torch.bool, device=device)
         
@@ -353,4 +401,25 @@ class Om2VecDecoder(nn.Module):
             tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask
         )
-        return self.out_proj(out)
+        # out: (B, S_tgt, embed_dim)
+        raw_out = self.out_proj(out)  # (B, S_tgt, num_mixture_components * 3 * 2)
+        B, S_tgt, _ = raw_out.shape
+        n = self.num_mixture_components
+
+        # Reshape to (B, S_tgt, 2, n, 3): 2 features, n components, 3 params (pi, mu, sigma)
+        raw_out = raw_out.view(B, S_tgt, 2, n, 3)
+
+        # Split for log(t) and log(q)
+        raw_t = raw_out[:, :, 0, :, :]  # (B, S_tgt, n, 3)
+        raw_q = raw_out[:, :, 1, :, :]  # (B, S_tgt, n, 3)
+
+        # For each: [:, :, :, 0]=pi, [:, :, :, 1]=mu, [:, :, :, 2]=sigma
+        pis_t = torch.softmax(raw_t[..., 0], dim=-1)  # (B, S_tgt, n)
+        mus_t = raw_t[..., 1]                        # (B, S_tgt, n)
+        sigmas_t = torch.nn.functional.softplus(raw_t[..., 2]) + 1e-6  # (B, S_tgt, n)
+
+        pis_q = torch.softmax(raw_q[..., 0], dim=-1)  # (B, S_tgt, n)
+        mus_q = raw_q[..., 1]                         # (B, S_tgt, n)
+        sigmas_q = torch.nn.functional.softplus(raw_q[..., 2]) + 1e-6  # (B, S_tgt, n)
+
+        return pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q
