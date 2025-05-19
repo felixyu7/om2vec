@@ -19,9 +19,6 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        # Initialize placeholders for standardization stats
-        self.data_mean = None
-        self.data_std = None
         
     def prepare_data(self):
         """Called only once and on 1 GPU."""
@@ -32,28 +29,7 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
         Called on each GPU separately - shards data to all GPUs.
         
         Sets up train and validation datasets.
-        """
-        # Load standardization parameters (mean and std) for raw_times from a numpy file
-        if stage == 'fit' or stage is None:
-            stats_path = self.cfg['data_options'].get('standardization_stats_path')
-            if stats_path:
-                try:
-                    stats = np.load(stats_path, allow_pickle=True).item()
-                    data_mean_val = torch.tensor(stats['data_mean'], dtype=torch.float32)
-                    data_std_val = torch.tensor(stats['data_std'], dtype=torch.float32).clamp(min=1e-6) # Changed clamp from 1e-9 to 1e-6
-                    print(f"Loaded standardization stats from {stats_path}: mean={data_mean_val.item()}, std={data_std_val.item()}")
-                except Exception as e:
-                    print(f"Warning: Could not load standardization stats from {stats_path}. Error: {e}. Using default mean=0, std=1.")
-                    data_mean_val = torch.tensor(0.0, dtype=torch.float32)
-                    data_std_val = torch.tensor(1.0, dtype=torch.float32)
-            else:
-                print("Warning: 'standardization_stats_path' not found in config. Using default mean=0, std=1 for raw_times standardization.")
-                data_mean_val = torch.tensor(0.0, dtype=torch.float32)
-                data_std_val = torch.tensor(1.0, dtype=torch.float32)
-
-            self.data_mean = data_mean_val.clone().detach()
-            self.data_std = data_std_val.clone().detach()
-            
+        """ 
         if self.cfg['training']:
             train_files_by_folder, train_events_per_file_by_folder = get_file_names(
                 self.cfg['data_options']['train_data_files'],
@@ -63,8 +39,6 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
             self.train_dataset = PrometheusTimeSeriesDataset(
                 train_files_by_folder,
                 train_events_per_file_by_folder,
-                self.data_mean,
-                self.data_std,
                 self.cfg
             )
             
@@ -76,8 +50,6 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
         self.valid_dataset = PrometheusTimeSeriesDataset(
             valid_files_by_folder,
             valid_events_per_file_by_folder,
-            self.data_mean,
-            self.data_std,
             self.cfg
         )
 
@@ -141,8 +113,6 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     def __init__(self,
                  files_by_folder: List[List[str]],
                  events_per_file_by_folder: List[List[int]],
-                 data_mean,
-                 data_std,
                  cfg: Dict,
                  cache_size: int = 5): # Added cache_size for Parquet data
         self.files_by_folder = files_by_folder
@@ -150,8 +120,6 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0)
         self.max_seq_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
-        self.data_mean = data_mean
-        self.data_std = data_std
         
         self.num_folders = len(self.files_by_folder)
         self.folder_total_events = [sum(counts) for counts in self.events_per_file_by_folder]

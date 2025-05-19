@@ -30,7 +30,7 @@ class NT_VAE(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.num_summary_stats = 9 # Fixed number of summary statistics
+        self.num_summary_stats = 10 # Fixed number of summary statistics
         # The VAE learns the remaining latent dimensions
         self.learned_latent_dim = self.hparams.latent_dim - self.num_summary_stats
         if self.learned_latent_dim <= 0:
@@ -132,7 +132,7 @@ class NT_VAE(pl.LightningModule):
         sos = torch.zeros((B, 1, 2), device=device)
         decoder_inputs = torch.cat([sos, torch.stack([target_log_t, target_log_q], dim=-1)[:, :-1, :]], dim=1)  # (B, S, 2)
         # Forward through transformer decoder
-        pred_means = self.decoder(decoder_inputs, z, attention_mask)  # (B, S, 2)
+        pred_means = self.decoder(decoder_inputs, z, padding_mask=attention_mask)  # (B, S, 2)
         # Compute MSE loss (masked)
         mse_t = F.mse_loss(pred_means[..., 0][attention_mask], target_log_t[attention_mask], reduction='mean')
         mse_q = F.mse_loss(pred_means[..., 1][attention_mask], target_log_q[attention_mask], reduction='mean')
@@ -158,7 +158,7 @@ class NT_VAE(pl.LightningModule):
         generated = []
         prev = torch.zeros((B, 1, 2), device=device)
         for _ in range(L):
-            out = self.decoder(prev, z, None)  # (B, step+1, 2)
+            out = self.decoder(prev, z, padding_mask=None)  # (B, step+1, 2)
             next_token = out[:, -1:, :]  # (B, 1, 2)
             generated.append(next_token)
             prev = torch.cat([prev, next_token], dim=1)
@@ -302,20 +302,55 @@ class Om2VecDecoder(nn.Module):
             nhead=num_heads,
             dim_feedforward=ff_dim,
             dropout=dropout,
-            batch_first=True
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.z_proj = nn.Linear(latent_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, 2)  # Predict mean log(t), log(q)
 
-    def forward(self, tgt, z, tgt_mask=None):
-        # tgt: (B, S, 2), z: (B, latent_dim)
-        B, S, _ = tgt.shape
-        tgt_emb = self.input_proj(tgt)
+    def forward(self, tgt, z, padding_mask=None):
+        # tgt: (B, S_tgt, 2) - current target sequence
+        # z: (B, latent_dim) - latent vector
+        # padding_mask: (B, S_tgt) - Optional, True for VALID tokens, False for PADDED tokens
+        
+        B, S_tgt, _ = tgt.shape
+        device = tgt.device
+
+        # 1. Prepare target embeddings
+        tgt_emb = self.input_proj(tgt)  # (B, S_tgt, embed_dim)
         tgt_emb = self.pos_encoder(tgt_emb)
-        # Cross-attention: expand z to (B, 1, latent_dim) and project
-        z_ctx = self.z_proj(z).unsqueeze(1)  # (B, 1, E)
-        z_ctx = z_ctx.expand(-1, S, -1)     # (B, S, E)
-        # Use z_ctx as memory for cross-attention
-        out = self.transformer_decoder(tgt_emb, z_ctx, tgt_mask=tgt_mask)
+
+        # 2. Prepare memory (context from z)
+        # memory shape: (B, S_mem, embed_dim). Here S_mem = 1.
+        memory = self.z_proj(z).unsqueeze(1) # (B, 1, embed_dim)
+        # No need to expand memory to S_tgt, TransformerDecoder handles broadcasting or uses it as (B, S_mem, E)
+
+        # 3. Create Causal Mask for target self-attention (for nn.TransformerDecoder's tgt_mask)
+        # Shape: (S_tgt, S_tgt)
+        causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device)
+
+        # 4. Create Target Padding Mask (for nn.TransformerDecoder's tgt_key_padding_mask)
+        # True for PADDED tokens in the target sequence.
+        # Shape: (B, S_tgt)
+        tgt_key_padding_mask = None
+        if padding_mask is not None:
+            # nn.TransformerDecoder expects True for PADDED tokens.
+            # Input padding_mask is True for VALID tokens.
+            tgt_key_padding_mask = ~padding_mask
+
+        # 5. Create Memory Padding Mask (for nn.TransformerDecoder's memory_key_padding_mask)
+        # Since memory (z_ctx) has S_mem=1 and z is not inherently padded, this is all False.
+        # Shape: (B, S_mem) -> (B, 1)
+        memory_key_padding_mask = torch.zeros((B, 1), dtype=torch.bool, device=device)
+        
+        # 6. Pass to the actual nn.TransformerDecoder
+        out = self.transformer_decoder(
+            tgt=tgt_emb,
+            memory=memory,
+            tgt_mask=causal_tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask
+        )
         return self.out_proj(out)
