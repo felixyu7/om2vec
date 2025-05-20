@@ -74,12 +74,14 @@ if __name__=="__main__":
             "transformer_decoder_heads": cfg['model_options']['transformer_decoder_heads'],
             "transformer_decoder_ff_dim": cfg['model_options']['transformer_decoder_ff_dim'],
             "transformer_decoder_dropout": cfg['model_options']['transformer_decoder_dropout'],
+            "decoder_type": cfg['model_options'].get('decoder_type', 'mdn'),
             "mdn_num_components": cfg['model_options']['mdn_num_components'],
             "batch_size": cfg['training_options']['batch_size'],
             "lr": cfg['training_options']['lr'],
             "lr_schedule": cfg['training_options']['lr_schedule'],
             "weight_decay": cfg['training_options']['weight_decay'],
         }
+        vae_init_args["decoder_type"] = cfg['model_options']['decoder_type']
 
         net = NT_VAE(**vae_init_args)
     

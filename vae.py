@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from utils import PositionalEncoding
+from utils import mdn_negative_log_likelihood, point_estimate_mse_loss
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -22,11 +23,12 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
+                 decoder_type='mdn',
                  mdn_num_components=5,
                  batch_size=32,
                  lr=1e-3,
                  lr_schedule=[20, 1e-6],
-                 weight_decay=1e-5
+                 weight_decay=1e-5,
                  ):
         super().__init__()
         self.save_hyperparameters()
@@ -69,7 +71,8 @@ class NT_VAE(pl.LightningModule):
             num_heads=self.hparams.transformer_decoder_heads,
             ff_dim=self.hparams.transformer_decoder_ff_dim,
             dropout=self.hparams.transformer_decoder_dropout,
-            num_mixture_components=self.hparams.mdn_num_components
+            num_mixture_components=self.hparams.mdn_num_components,
+            decoder_type=self.hparams.decoder_type # Pass decoder_type to Om2VecDecoder
         )
 
         self.beta = 0.
@@ -139,34 +142,46 @@ class NT_VAE(pl.LightningModule):
         generated = []
         prev = torch.zeros((B, 1, 2), device=device)
         for _ in range(L):
-            # Decoder returns GMM params: (pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q)
-            pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q = self.decoder(prev, z, padding_mask=None)
-            # Get the last predicted token's GMM params (B, 1, K)
-            pis_t_last = pis_t[:, -1, :]  # (B, K)
-            mus_t_last = mus_t[:, -1, :]  # (B, K)
-            sigmas_t_last = sigmas_t[:, -1, :]  # (B, K)
-            pis_q_last = pis_q[:, -1, :]  # (B, K)
-            mus_q_last = mus_q[:, -1, :]  # (B, K)
-            sigmas_q_last = sigmas_q[:, -1, :]  # (B, K)
+            decoder_output = self.decoder(prev, z, padding_mask=None)
 
-            # Sample mixture component for each batch item
-            k_t = torch.multinomial(pis_t_last, 1).squeeze(-1)  # (B,)
-            k_q = torch.multinomial(pis_q_last, 1).squeeze(-1)  # (B,)
+            if self.hparams.decoder_type == 'mdn':
+                # Decoder returns GMM params: (pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q)
+                pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q = decoder_output
+                # Get the last predicted token's GMM params (B, 1, K)
+                pis_t_last = pis_t[:, -1, :]  # (B, K)
+                mus_t_last = mus_t[:, -1, :]  # (B, K)
+                sigmas_t_last = sigmas_t[:, -1, :]  # (B, K)
+                pis_q_last = pis_q[:, -1, :]  # (B, K)
+                mus_q_last = mus_q[:, -1, :]  # (B, K)
+                sigmas_q_last = sigmas_q[:, -1, :]  # (B, K)
 
-            # Gather means and stds for selected components
-            mu_t = mus_t_last.gather(1, k_t.unsqueeze(1)).squeeze(1)      # (B,)
-            sigma_t = sigmas_t_last.gather(1, k_t.unsqueeze(1)).squeeze(1)  # (B,)
-            mu_q = mus_q_last.gather(1, k_q.unsqueeze(1)).squeeze(1)      # (B,)
-            sigma_q = sigmas_q_last.gather(1, k_q.unsqueeze(1)).squeeze(1)  # (B,)
+                # Sample mixture component for each batch item
+                k_t = torch.multinomial(pis_t_last, 1).squeeze(-1)  # (B,)
+                k_q = torch.multinomial(pis_q_last, 1).squeeze(-1)  # (B,)
 
-            # Sample from Normal for log(t) and log(q)
-            log_t_sampled = torch.distributions.Normal(mu_t, sigma_t).sample().unsqueeze(1)  # (B,1)
-            log_q_sampled = torch.distributions.Normal(mu_q, sigma_q).sample().unsqueeze(1)  # (B,1)
+                # Gather means and stds for selected components
+                mu_t = mus_t_last.gather(1, k_t.unsqueeze(1)).squeeze(1)      # (B,)
+                sigma_t = sigmas_t_last.gather(1, k_t.unsqueeze(1)).squeeze(1)  # (B,)
+                mu_q = mus_q_last.gather(1, k_q.unsqueeze(1)).squeeze(1)      # (B,)
+                sigma_q = sigmas_q_last.gather(1, k_q.unsqueeze(1)).squeeze(1)  # (B,)
 
-            # Stack to get next_token (B, 1, 2)
-            next_token = torch.cat([log_t_sampled, log_q_sampled], dim=-1).unsqueeze(1)  # (B, 1, 2)
+                # Sample from Normal for log(t) and log(q)
+                log_t_val = torch.distributions.Normal(mu_t, sigma_t).sample()  # (B,)
+                log_q_val = torch.distributions.Normal(mu_q, sigma_q).sample()  # (B,)
+
+            elif self.hparams.decoder_type == 'point_estimate':
+                # Decoder returns point estimates: (pred_log_t, pred_log_q)
+                pred_log_t_steps, pred_log_q_steps = decoder_output
+                log_t_val = pred_log_t_steps[:, -1] # (B,)
+                log_q_val = pred_log_q_steps[:, -1] # (B,)
+            else:
+                raise ValueError(f"Unknown decoder_type for sampling: {self.hparams.decoder_type}")
+
+            # Stack to get next_token (B, 2), then unsqueeze to (B, 1, 2)
+            next_token = torch.stack((log_t_val, log_q_val), dim=-1).unsqueeze(1)  # (B, 1, 2)
             generated.append(next_token)
             prev = torch.cat([prev, next_token], dim=1)
+
         generated = torch.cat(generated, dim=1)  # (B, L, 2)
         # Optionally mask to true lengths
         for i, l in enumerate(lengths):
@@ -174,34 +189,6 @@ class NT_VAE(pl.LightningModule):
                 generated[i, l:] = 0
         return generated
     
-    def mdn_negative_log_likelihood(self, target, pis, mus, sigmas, attention_mask):
-        """
-        Computes the negative log-likelihood for a Mixture Density Network (MDN) output.
-        Args:
-            target: (B, S)
-            pis: (B, S, K) - mixing coefficients (softmaxed)
-            mus: (B, S, K) - means
-            sigmas: (B, S, K) - stddevs (positive)
-            attention_mask: (B, S) - boolean, True for valid tokens
-        Returns:
-            Scalar negative log-likelihood averaged over valid tokens.
-        """
-        # Expand target to (B, S, K)
-        target_exp = target.unsqueeze(-1).expand_as(mus)
-        # Compute log-probabilities under each Gaussian component
-        normal = torch.distributions.Normal(mus, sigmas)
-        log_probs = normal.log_prob(target_exp)  # (B, S, K)
-        # Combine with log mixing coefficients
-        log_pis = torch.log(pis + 1e-8)  # (B, S, K), add epsilon for stability
-        log_weighted = log_pis + log_probs  # (B, S, K)
-        # Log-sum-exp over mixture components
-        log_sum = torch.logsumexp(log_weighted, dim=-1)  # (B, S)
-        # Mask out invalid tokens
-        valid_log_sum = log_sum[attention_mask]
-        # Negative log-likelihood, mean over valid tokens
-        nll = -valid_log_sum.mean()
-        return nll
-
     def reconstruction_loss(self, target_log_t, target_log_q, z, attention_mask):
         """
         Args:
@@ -217,11 +204,22 @@ class NT_VAE(pl.LightningModule):
         device = target_log_t.device
         sos = torch.zeros((B, 1, 2), device=device)
         decoder_inputs = torch.cat([sos, torch.stack([target_log_t, target_log_q], dim=-1)[:, :-1, :]], dim=1)  # (B, S, 2)
-        # Decoder returns GMM parameters
-        pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q = self.decoder(decoder_inputs, z, padding_mask=attention_mask)
-        nll_t = self.mdn_negative_log_likelihood(target_log_t, pis_t, mus_t, sigmas_t, attention_mask)
-        nll_q = self.mdn_negative_log_likelihood(target_log_q, pis_q, mus_q, sigmas_q, attention_mask)
-        return nll_t, nll_q
+        decoder_output = self.decoder(decoder_inputs, z, padding_mask=attention_mask)
+
+        if self.hparams.decoder_type == 'mdn':
+            # Decoder returns GMM parameters
+            pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q = decoder_output
+            loss_t = mdn_negative_log_likelihood(target_log_t, pis_t, mus_t, sigmas_t, attention_mask)
+            loss_q = mdn_negative_log_likelihood(target_log_q, pis_q, mus_q, sigmas_q, attention_mask)
+        elif self.hparams.decoder_type == 'point_estimate':
+            # Decoder returns point estimates
+            pred_log_t, pred_log_q = decoder_output
+            loss_t = point_estimate_mse_loss(target_log_t, pred_log_t, attention_mask)
+            loss_q = point_estimate_mse_loss(target_log_q, pred_log_q, attention_mask)
+        else:
+            raise ValueError(f"Unknown decoder_type for reconstruction_loss: {self.hparams.decoder_type}")
+
+        return loss_t, loss_q
     
     def kl_divergence(self, mu, logvar):
         return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -344,7 +342,7 @@ class NT_VAE(pl.LightningModule):
     
 # --- Om2VecDecoder module ---
 class Om2VecDecoder(nn.Module):
-    def __init__(self, latent_dim, embed_dim, num_layers=4, num_heads=8, ff_dim=256, dropout=0.1, num_mixture_components=5):
+    def __init__(self, latent_dim, embed_dim, num_layers=4, num_heads=8, ff_dim=256, dropout=0.1, decoder_type='mdn', num_mixture_components=5):
         super().__init__()
         self.input_proj = nn.Linear(2, embed_dim)
         self.pos_encoder = PositionalEncoding(embed_dim, dropout)
@@ -360,8 +358,14 @@ class Om2VecDecoder(nn.Module):
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.z_proj = nn.Linear(latent_dim, embed_dim)
         self.num_mixture_components = num_mixture_components
-        # Output: for each of log(t) and log(q): num_mixture_components * (pi, mu, sigma)
-        self.out_proj = nn.Linear(embed_dim, num_mixture_components * 3 * 2)
+        self.decoder_type = decoder_type
+        if self.decoder_type == 'mdn':
+            # Output: for each of log(t) and log(q): num_mixture_components * (pi, mu, sigma)
+            self.out_proj = nn.Linear(embed_dim, num_mixture_components * 3 * 2)
+        elif self.decoder_type == 'point_estimate':
+            self.out_proj = nn.Linear(embed_dim, 2)
+        else:
+            raise ValueError(f"Unknown decoder_type: {self.decoder_type}")
 
     def forward(self, tgt, z, padding_mask=None):
         # tgt: (B, S_tgt, 2) - current target sequence
@@ -402,24 +406,32 @@ class Om2VecDecoder(nn.Module):
             memory_key_padding_mask=memory_key_padding_mask
         )
         # out: (B, S_tgt, embed_dim)
-        raw_out = self.out_proj(out)  # (B, S_tgt, num_mixture_components * 3 * 2)
-        B, S_tgt, _ = raw_out.shape
-        n = self.num_mixture_components
+        raw_out = self.out_proj(out)
+        if self.decoder_type == 'mdn':
+            n = self.num_mixture_components
+            # Reshape to (B, S_tgt, 2, n, 3): 2 features, n components, 3 params (pi, mu, sigma)
+            raw_out = raw_out.view(B, S_tgt, 2, n, 3)
 
-        # Reshape to (B, S_tgt, 2, n, 3): 2 features, n components, 3 params (pi, mu, sigma)
-        raw_out = raw_out.view(B, S_tgt, 2, n, 3)
+            # Split for log(t) and log(q)
+            raw_t = raw_out[:, :, 0, :, :]  # (B, S_tgt, n, 3)
+            raw_q = raw_out[:, :, 1, :, :]  # (B, S_tgt, n, 3)
 
-        # Split for log(t) and log(q)
-        raw_t = raw_out[:, :, 0, :, :]  # (B, S_tgt, n, 3)
-        raw_q = raw_out[:, :, 1, :, :]  # (B, S_tgt, n, 3)
+            # For each: [:, :, :, 0]=pi, [:, :, :, 1]=mu, [:, :, :, 2]=sigma
+            pis_t = torch.softmax(raw_t[..., 0], dim=-1)  # (B, S_tgt, n)
+            mus_t = raw_t[..., 1]                        # (B, S_tgt, n)
+            sigmas_t = torch.nn.functional.softplus(raw_t[..., 2]) + 1e-4  # (B, S_tgt, n)
 
-        # For each: [:, :, :, 0]=pi, [:, :, :, 1]=mu, [:, :, :, 2]=sigma
-        pis_t = torch.softmax(raw_t[..., 0], dim=-1)  # (B, S_tgt, n)
-        mus_t = raw_t[..., 1]                        # (B, S_tgt, n)
-        sigmas_t = torch.nn.functional.softplus(raw_t[..., 2]) + 1e-4  # (B, S_tgt, n)
+            pis_q = torch.softmax(raw_q[..., 0], dim=-1)  # (B, S_tgt, n)
+            mus_q = raw_q[..., 1]                         # (B, S_tgt, n)
+            sigmas_q = torch.nn.functional.softplus(raw_q[..., 2]) + 1e-4  # (B, S_tgt, n)
 
-        pis_q = torch.softmax(raw_q[..., 0], dim=-1)  # (B, S_tgt, n)
-        mus_q = raw_q[..., 1]                         # (B, S_tgt, n)
-        sigmas_q = torch.nn.functional.softplus(raw_q[..., 2]) + 1e-4  # (B, S_tgt, n)
+            return pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q
 
-        return pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q
+        elif self.decoder_type == 'point_estimate':
+            # Output shape: (B, S_tgt, 2)
+            pred_log_t = raw_out[..., 0]  # (B, S_tgt)
+            pred_log_q = raw_out[..., 1]  # (B, S_tgt)
+            return pred_log_t, pred_log_q
+
+        else:
+            raise ValueError(f"Unknown decoder_type: {self.decoder_type}")
