@@ -188,8 +188,13 @@ class NT_VAE(pl.LightningModule):
         # mu and logvar for KL loss are from the learned part only
         return mu_learned, logvar_learned, z_full
 
-    def kl_divergence(self, mu, logvar):
-        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    def kl_divergence(self, mu, logvar, free_bits_lambda=0.1):
+        # Per-dimension KL: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+        kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar)
+        # Apply free-bits threshold
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits_lambda)
+        # Sum over latent dims, mean over batch
+        return kl_per_dim.sum(dim=1).mean()
 
     def training_step(self, batch, batch_idx):
         mu, logvar, z = self(batch)
@@ -287,7 +292,7 @@ class NT_VAE(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[0], eta_min=self.hparams.lr_schedule[1])
         return [optimizer], [scheduler]
     
