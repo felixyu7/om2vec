@@ -25,7 +25,7 @@ class NT_VAE(pl.LightningModule):
                  mdn_num_components=5,
                  batch_size=32,
                  lr=1e-3,
-                 lr_schedule=[2, 20],
+                 lr_schedule=[20, 1e-6],
                  weight_decay=1e-5
                  ):
         super().__init__()
@@ -108,6 +108,9 @@ class NT_VAE(pl.LightningModule):
         
         mu_learned = self.to_latent_mu(encoder_latent_input)
         logvar_learned = self.to_latent_logvar(encoder_latent_input)
+
+        # clamp logvar_learned for stability
+        logvar_learned = torch.clamp(logvar_learned, min=-10, max=10)
 
         return mu_learned, logvar_learned
     
@@ -236,9 +239,6 @@ class NT_VAE(pl.LightningModule):
         # Concatenate summary statistics with learned latents
         z_full = torch.cat((summary_stats, z_learned), dim=1) # (B, latent_dim)
         
-        # clamp logvar for stability
-        logvar_learned = torch.clamp(logvar_learned, min=-10, max=10)
-        
         # mu and logvar for KL loss are from the learned part only
         return mu_learned, logvar_learned, z_full
 
@@ -338,7 +338,7 @@ class NT_VAE(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[0], eta_min=self.hparams.lr_schedule[1])
         return [optimizer], [scheduler]
     
@@ -416,10 +416,10 @@ class Om2VecDecoder(nn.Module):
         # For each: [:, :, :, 0]=pi, [:, :, :, 1]=mu, [:, :, :, 2]=sigma
         pis_t = torch.softmax(raw_t[..., 0], dim=-1)  # (B, S_tgt, n)
         mus_t = raw_t[..., 1]                        # (B, S_tgt, n)
-        sigmas_t = torch.nn.functional.softplus(raw_t[..., 2]) + 1e-6  # (B, S_tgt, n)
+        sigmas_t = torch.nn.functional.softplus(raw_t[..., 2]) + 1e-4  # (B, S_tgt, n)
 
         pis_q = torch.softmax(raw_q[..., 0], dim=-1)  # (B, S_tgt, n)
         mus_q = raw_q[..., 1]                         # (B, S_tgt, n)
-        sigmas_q = torch.nn.functional.softplus(raw_q[..., 2]) + 1e-6  # (B, S_tgt, n)
+        sigmas_q = torch.nn.functional.softplus(raw_q[..., 2]) + 1e-4  # (B, S_tgt, n)
 
         return pis_t, mus_t, sigmas_t, pis_q, mus_q, sigmas_q
