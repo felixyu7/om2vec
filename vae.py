@@ -134,8 +134,12 @@ class NT_VAE(pl.LightningModule):
         device = target_log_t.device
         sos = torch.zeros((B, 1, 2), device=device)
         decoder_inputs = torch.cat([sos, torch.stack([target_log_t, target_log_q], dim=-1)[:, :-1, :]], dim=1)  # (B, S, 2)
+        # Shift attention mask to align with decoder_inputs (teacher forcing)
+        sos_mask_segment = torch.full_like(attention_mask[:, :1], True, dtype=torch.bool, device=attention_mask.device)
+        main_mask_segment = attention_mask[:, :-1]
+        shifted_attention_mask = torch.cat([sos_mask_segment, main_mask_segment], dim=1)
         # Forward through transformer decoder
-        pred_means = self.decoder(decoder_inputs, z, padding_mask=attention_mask)  # (B, S, 2)
+        pred_means = self.decoder(decoder_inputs, z, padding_mask=shifted_attention_mask)  # (B, S, 2)
         # Compute MSE loss (masked)
         mse_t = F.mse_loss(pred_means[..., 0][attention_mask], target_log_t[attention_mask], reduction='mean')
         mse_q = F.mse_loss(pred_means[..., 1][attention_mask], target_log_q[attention_mask], reduction='mean')
@@ -192,7 +196,7 @@ class NT_VAE(pl.LightningModule):
         # Per-dimension KL: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
         kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar)
         # Apply free-bits threshold
-        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits_lambda)
+        kl_per_dim = F.relu(kl_per_dim - free_bits_lambda)
         # Sum over latent dims, mean over batch
         return kl_per_dim.sum(dim=1).mean()
 
@@ -331,26 +335,17 @@ class Om2VecDecoder(nn.Module):
         # memory shape: (B, S_mem, embed_dim). Here S_mem = 1.
         memory = self.z_proj(z).unsqueeze(1) # (B, 1, embed_dim)
 
-        # 3. Create Causal Mask for target self-attention (for nn.TransformerDecoder's tgt_mask)
-        # Shape: (S_tgt, S_tgt)
-        causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device)
-
-        # 4. Create Target Padding Mask (for nn.TransformerDecoder's tgt_key_padding_mask)
+        # 3. Create Target Padding Mask (for nn.TransformerDecoder's tgt_key_padding_mask)
         # Shape: (B, S_tgt)
         tgt_key_padding_mask = None
         if padding_mask is not None:
             tgt_key_padding_mask = ~padding_mask
 
-        # 5. Create Memory Padding Mask (for nn.TransformerDecoder's memory_key_padding_mask)
-        # Shape: (B, S_mem) -> (B, 1)
-        memory_key_padding_mask = torch.zeros((B, 1), dtype=torch.bool, device=device)
-        
-        # 6. Pass to the actual nn.TransformerDecoder
+        # 4. Pass to the actual nn.TransformerDecoder
         out = self.transformer_decoder(
             tgt=tgt_emb,
             memory=memory,
-            tgt_mask=causal_tgt_mask,
             tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
+            tgt_is_causal=True
         )
         return self.out_proj(out)
