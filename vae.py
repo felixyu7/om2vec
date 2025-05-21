@@ -34,7 +34,7 @@ class NT_VAE(pl.LightningModule):
         self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim) # Input: (time, count)
         self.pos_encoder = PositionalEncoding(self.hparams.embed_dim,
                                               self.hparams.transformer_encoder_dropout,
-                                              max_len=self.hparams.max_seq_len_padding)
+                                              max_len=self.hparams.max_seq_len_padding + 1) # +1 for EOS token
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hparams.embed_dim,
@@ -172,8 +172,11 @@ class NT_VAE(pl.LightningModule):
         prev = torch.zeros((B, 1, 2), device=device)
         active_sequences = torch.ones(B, dtype=torch.bool, device=device)
         generated_lists = [[] for _ in range(B)]
-        for _ in range(max_steps):
-            out = self.decoder(prev, z, padding_mask=None)  # (B, step+1, 3)
+        eos_step = torch.full((B,), max_steps, dtype=torch.long, device=device)  # Track EOS step for each sequence
+        for step in range(max_steps):
+            # Build padding mask: True for positions < eos_step, False for >= eos_step
+            padding_mask = torch.arange(prev.shape[1], device=device).unsqueeze(0) < eos_step.unsqueeze(1)  # (B, S)
+            out = self.decoder(prev, z, padding_mask=padding_mask)  # (B, step+1, 3)
             next_pred_all = out[:, -1:, :]  # (B, 1, 3)
             next_token_tq_vals = next_pred_all[..., :2]  # (B, 1, 2)
             next_eos_logit = next_pred_all[..., 2].squeeze(-1)  # (B,)
@@ -184,16 +187,12 @@ class NT_VAE(pl.LightningModule):
                     generated_lists[i].append(next_token_tq_vals[i, 0].detach().clone())
                     if next_eos_prob[i] > 0.5:
                         active_sequences[i] = False
+                        eos_step[i] = prev.shape[1]  # Mark EOS at this step (current length)
 
             if not active_sequences.any():
                 break
 
-            # Prepare next input: only update for active sequences
-            next_input = prev.clone()
-            for i in range(B):
-                if active_sequences[i]:
-                    next_input[i] = torch.cat([prev[i], next_token_tq_vals[i]], dim=0)
-            prev = next_input
+            prev = torch.cat((prev, next_token_tq_vals), dim=1)
 
         # Pad generated sequences to max length in batch
         max_len = max(len(seq) for seq in generated_lists)
@@ -372,7 +371,7 @@ class Om2VecDecoder(nn.Module):
         if padding_mask is not None:
             tgt_key_padding_mask = ~padding_mask
 
-        causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device)
+        causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device).bool()
 
         # 4. Pass to the actual nn.TransformerDecoder
         out = self.transformer_decoder(
