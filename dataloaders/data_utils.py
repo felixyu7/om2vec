@@ -146,8 +146,14 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
             continue
         times_pad[row,  :L] = item["times"]
         counts_pad[row, :L] = item["counts"]
-        raw_t_pad[row,  :L] = item["raw_times"]
-        raw_c_pad[row,  :L] = item["raw_counts"]
+        # For raw_times and raw_counts, use their actual length as they don't include EOS
+        L_raw_times = item["raw_times"].numel()
+        if L_raw_times > 0:
+            raw_t_pad[row,  :L_raw_times] = item["raw_times"]
+        
+        L_raw_counts = item["raw_counts"].numel() # Should be same as L_raw_times
+        if L_raw_counts > 0:
+            raw_c_pad[row,  :L_raw_counts] = item["raw_counts"]
         attn_mask[row,  :L] = True
 
     return {
