@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn, calculate_summary_statistics
+from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn
 from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
@@ -195,42 +195,43 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
         grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
 
-        # Calculate summary statistics before potential sampling
-        summary_stats_np = calculate_summary_statistics(grp_t_np, grp_c_np)
-        epsilon = 1e-6
-        summary_stats_np = np.log(summary_stats_np + epsilon) # Log-normalize summary statistics
-        summary_stats = torch.from_numpy(summary_stats_np)
-        
         # ------------------------------------------------ tensors + log-normalization
-        rt = torch.from_numpy(grp_t_np)
-        rc = torch.from_numpy(grp_c_np)
-        
-        if rt.numel():  # non-empty
-            nt = torch.log(rt + epsilon)
-            nq = torch.log(rc + epsilon)
+        rt_original = torch.from_numpy(grp_t_np)
+        rc_original = torch.from_numpy(grp_c_np)
+
+        if rt_original.numel():  # non-empty
+            nt_original = torch.log1p(rt_original)
+            nq_original = torch.log1p(rc_original)
         else:
-            nt = torch.empty(0, dtype=torch.float32)
-            nq = torch.empty(0, dtype=torch.float32)
-        
+            nt_original = torch.empty(0, dtype=torch.float32)
+            nq_original = torch.empty(0, dtype=torch.float32)
+
         # if max_seq_len_padding is exceeded, randomly sample, count-weighted
-        if self.max_seq_len_padding is not None and rt.numel() > self.max_seq_len_padding:
+        if self.max_seq_len_padding is not None and rt_original.numel() > self.max_seq_len_padding:
             # Count-weighted random sampling
-            probs = rc.float() / rc.sum()
+            probs = rc_original.float() / rc_original.sum()
             idx = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
             # Sort indices to preserve time order
             idx, _ = torch.sort(idx)
-            nt = nt[idx]
-            nq = nq[idx]
-            rt = rt[idx]
-            rc = rc[idx]
-        
+            nt_original = nt_original[idx]
+            nq_original = nq_original[idx]
+            rt_original = rt_original[idx]
+            rc_original = rc_original[idx]
+
+        current_sequence_length = rt_original.numel()
+        # EOS token integration
+        times_for_model = torch.cat([nt_original, torch.tensor([0.0], dtype=torch.float32)])
+        counts_for_model = torch.cat([nq_original, torch.tensor([0.0], dtype=torch.float32)])
+        eos_target = torch.zeros(current_sequence_length + 1, dtype=torch.float32)
+        eos_target[current_sequence_length] = 1.0
+
         return {
-            "times":           nt,
-            "counts":          nq,
-            "raw_times":       rt,
-            "raw_counts":      rc,
-            "sequence_length": torch.tensor(rt.numel(), dtype=torch.long),
-            "summary_stats":   summary_stats,
+            "times":           times_for_model,
+            "counts":          counts_for_model,
+            "raw_times":       rt_original,
+            "raw_counts":      rc_original,
+            "sequence_length": torch.tensor(current_sequence_length + 1, dtype=torch.long),
+            "eos_target":      eos_target,
             "sensor_pos":      sensor_pos,
         }
         

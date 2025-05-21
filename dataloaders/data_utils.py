@@ -8,85 +8,6 @@ from torch.utils.data import Sampler, Dataset
 from typing import List, Dict, Tuple # Added Tuple
 import pyarrow.parquet as pq # Added import
 
-def calculate_summary_statistics(raw_times_np: np.ndarray, raw_counts_np: np.ndarray) -> np.ndarray:
-    """
-    Calculates 10 summary statistics for a given photon distribution.
-    The first statistic is the real (unpadded) sequence length.
-
-    Args:
-        raw_times_np (np.ndarray): Array of pulse arrival times.
-        raw_counts_np (np.ndarray): Array of pulse charges (counts).
-
-    Returns:
-        np.ndarray: A 1D array of 10 summary statistics.
-                    Returns zeros if input is empty.
-    """
-    if raw_times_np.size == 0 or raw_counts_np.size == 0:
-        return np.zeros(10, dtype=np.float32)
-
-    # Ensure sorted by time for cumulative calculations and first/last pulse
-    sort_indices = np.argsort(raw_times_np)
-    times = raw_times_np[sort_indices]
-    counts = raw_counts_np[sort_indices]
-
-    # Real (unpadded) sequence length
-    seq_length = float(len(times))
-
-    # 1. Total charge
-    total_charge = np.sum(counts)
-    if total_charge == 0: # Avoid division by zero if all counts are zero
-        return np.zeros(10, dtype=np.float32)
-
-    # 4. Time of first pulse
-    time_first_pulse = times[0]
-
-    # 7. Time of last pulse
-    time_last_pulse = times[-1]
-
-    # 2. Charge within 100 ns of the first pulse
-    charge_within_100ns = np.sum(counts[times <= time_first_pulse + 100.0])
-
-    # 3. Charge within 500 ns of the first pulse
-    charge_within_500ns = np.sum(counts[times <= time_first_pulse + 500.0])
-
-    # 8. Charge-weighted mean of pulse arrival times
-    charge_weighted_mean_time = np.sum(times * counts) / total_charge
-
-    # 9. Charge-weighted standard deviation of pulse arrival times
-    charge_weighted_std_time = np.sqrt(np.sum(((times - charge_weighted_mean_time)**2) * counts) / total_charge)
-
-    # Cumulative charge calculation for 20% and 50% times
-    cumulative_charge = np.cumsum(counts)
-    
-    # 5. Time at which 20% of the charge is collected
-    target_charge_20 = 0.20 * total_charge
-    idx_20_percent = np.searchsorted(cumulative_charge, target_charge_20, side='left')
-    if idx_20_percent < len(times):
-        time_charge_20_percent = times[idx_20_percent]
-    else: # Should not happen if total_charge > 0 and cumulative_charge reaches total_charge
-        time_charge_20_percent = time_last_pulse
-
-    # 6. Time at which 50% of the charge is collected
-    target_charge_50 = 0.50 * total_charge
-    idx_50_percent = np.searchsorted(cumulative_charge, target_charge_50, side='left')
-    if idx_50_percent < len(times):
-        time_charge_50_percent = times[idx_50_percent]
-    else:
-        time_charge_50_percent = time_last_pulse
-
-    return np.array([
-        seq_length,
-        total_charge,
-        charge_within_100ns,
-        charge_within_500ns,
-        time_first_pulse,
-        time_charge_20_percent,
-        time_charge_50_percent,
-        time_last_pulse,
-        charge_weighted_mean_time,
-        charge_weighted_std_time
-    ], dtype=np.float32)
-
 def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> Tuple[List[List[str]], List[List[int]]]:
     """
     Get file names from directories within specified ranges, grouped by directory.
@@ -202,14 +123,12 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     raw_c_pad   = torch.zeros_like(times_pad)
     attn_mask   = torch.zeros(bsz, max_len, dtype=torch.bool, device=device)
     
-    # Handle summary_stats (fixed size per item, so just stack)
-    # Now summary_stats is a 1D tensor of 10 elements
-    summary_stats_list = [item["summary_stats"] for item in batch if "summary_stats" in item]
-    if summary_stats_list:
-        summary_stats_batched = torch.stack(summary_stats_list, dim=0)
-    else:
-        # Fallback if no summary_stats found, though this shouldn't happen if dataset provides it
-        summary_stats_batched = torch.empty(bsz, 10, dtype=dtype, device=device)
+    # Handle eos_target (pad to max_len)
+    eos_targets = [item["eos_target"] for item in batch]
+    eos_target_padded = torch.zeros(bsz, max_len, dtype=torch.float32, device=device)
+    for row, eos in enumerate(eos_targets):
+        L = eos.shape[0]
+        eos_target_padded[row, :L] = eos
 
     # Handle sensor_pos (fixed size per item, so just stack)
     # Assuming sensor_pos is a 1D tensor of 3 elements
@@ -238,7 +157,7 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         "raw_counts_padded": raw_c_pad,
         "attention_mask":   attn_mask,
         "sequence_lengths": seq_lens,
-        "summary_stats_batched": summary_stats_batched,
+        "eos_target_padded": eos_target_padded,
         "sensor_pos_batched": sensor_pos_batched,
     }
 

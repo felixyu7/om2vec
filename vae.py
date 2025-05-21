@@ -30,16 +30,10 @@ class NT_VAE(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.num_summary_stats = 10 # Fixed number of summary statistics
-        # The VAE learns the remaining latent dimensions
-        self.learned_latent_dim = self.hparams.latent_dim - self.num_summary_stats
-        if self.learned_latent_dim <= 0:
-            raise ValueError(f"latent_dim ({self.hparams.latent_dim}) must be greater than num_summary_stats ({self.num_summary_stats})")
-
         # Encoder: PyTorch Transformer based
         self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim) # Input: (time, count)
-        self.pos_encoder = PositionalEncoding(self.hparams.embed_dim, 
-                                              self.hparams.transformer_encoder_dropout, 
+        self.pos_encoder = PositionalEncoding(self.hparams.embed_dim,
+                                              self.hparams.transformer_encoder_dropout,
                                               max_len=self.hparams.max_seq_len_padding)
         
         encoder_layer = nn.TransformerEncoderLayer(
@@ -57,12 +51,12 @@ class NT_VAE(pl.LightningModule):
         )
         # Input to these layers will be pooled_output (embed_dim) + sensor_pos (3)
         self.encoder_to_latent_input_dim = self.hparams.embed_dim + 3
-        self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.learned_latent_dim)
-        self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.learned_latent_dim)
+        self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
+        self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
         
-        # Decoder: Auto-regressive Transformer Decoder for photon hits (log-normalized t, q)
+        # Decoder: Auto-regressive Transformer Decoder for photon hits (log-normalized t, q, eos)
         self.decoder = Om2VecDecoder(
-            latent_dim=self.hparams.latent_dim, # This is the full latent_dim (summary_stats + learned)
+            latent_dim=self.hparams.latent_dim, # Now the full learned latent_dim
             embed_dim=self.hparams.embed_dim, # This is d_model for the decoder's internal workings
             num_layers=self.hparams.transformer_decoder_layers,
             num_heads=self.hparams.transformer_decoder_heads,
@@ -72,7 +66,10 @@ class NT_VAE(pl.LightningModule):
 
         self.beta = 0.
         self.current_train_iter = 0 # Renamed from self.iter for clarity
-        
+
+        # EOS loss weight hyperparameter
+        self.hparams.eos_loss_weight = getattr(self.hparams, "eos_loss_weight", 1.0)
+
         self.test_step_results = {'num_hits': [], 'js_divs': []}
 
     def encode(self, times_data, counts_data, attention_mask, sensor_pos_batched):
@@ -104,32 +101,33 @@ class NT_VAE(pl.LightningModule):
         # Concatenate pooled_output with sensor_pos_batched
         encoder_latent_input = torch.cat((pooled_output, sensor_pos_batched), dim=1) # (B, embed_dim + 3)
         
-        mu_learned = self.to_latent_mu(encoder_latent_input)
-        logvar_learned = self.to_latent_logvar(encoder_latent_input)
+        mu = self.to_latent_mu(encoder_latent_input)
+        logvar = self.to_latent_logvar(encoder_latent_input)
 
         # clamp logvar for stability
-        logvar_learned = torch.clamp(logvar_learned, min=-10, max=10)
+        logvar = torch.clamp(logvar, min=-10, max=10)
 
-        return mu_learned, logvar_learned
+        return mu, logvar
     
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def reconstruction_loss(self, target_log_t, target_log_q, z, attention_mask):
+    def reconstruction_loss(self, target_log_t, target_log_q, z, attention_mask, target_eos, sequence_lengths):
         """
         Args:
             target_log_t: (B, S) log-normalized arrival times
             target_log_q: (B, S) log-normalized charges
             z: (B, latent_dim)
             attention_mask: (B, S) boolean, True for valid tokens
+            target_eos: (B, S) float, EOS targets (0 or 1)
+            sequence_lengths: (B,) int, true sequence lengths (including EOS)
         Returns:
-            mse_t: (B,) MSE for t (masked)
-            mse_q: (B,) MSE for q (masked)
+            mse_t: MSE for t (masked, excluding EOS and padding)
+            mse_q: MSE for q (masked, excluding EOS and padding)
+            eos_loss: BCE loss for EOS prediction (masked, includes EOS)
         """
-        # Teacher forcing: input is previous (t, q), output is next (t, q)
-        # Shift input right, prepend SOS token (zeros)
         B, S = target_log_t.shape
         device = target_log_t.device
         sos = torch.zeros((B, 1, 2), device=device)
@@ -139,58 +137,82 @@ class NT_VAE(pl.LightningModule):
         main_mask_segment = attention_mask[:, :-1]
         shifted_attention_mask = torch.cat([sos_mask_segment, main_mask_segment], dim=1)
         # Forward through transformer decoder
-        pred_means = self.decoder(decoder_inputs, z, padding_mask=shifted_attention_mask)  # (B, S, 2)
-        # Compute MSE loss (masked)
-        mse_t = F.mse_loss(pred_means[..., 0][attention_mask], target_log_t[attention_mask], reduction='mean')
-        mse_q = F.mse_loss(pred_means[..., 1][attention_mask], target_log_q[attention_mask], reduction='mean')
-        return mse_t, mse_q
+        pred_outputs = self.decoder(decoder_inputs, z, padding_mask=shifted_attention_mask)  # (B, S, 3)
+        pred_log_t = pred_outputs[..., 0]
+        pred_log_q = pred_outputs[..., 1]
+        pred_eos_logits = pred_outputs[..., 2]
+
+        # Data step attention mask: True for indices 0 to sequence_lengths[i]-2 (excludes EOS and padding)
+        data_step_attention_mask = torch.zeros_like(attention_mask)
+        for i in range(B):
+            seq_len = sequence_lengths[i].item()
+            if seq_len > 1:
+                data_step_attention_mask[i, :seq_len-1] = True
+
+        mse_t = F.mse_loss(pred_log_t[data_step_attention_mask], target_log_t[data_step_attention_mask], reduction='mean')
+        mse_q = F.mse_loss(pred_log_q[data_step_attention_mask], target_log_q[data_step_attention_mask], reduction='mean')
+
+        # EOS loss: use original attention_mask (covers all valid steps including EOS)
+        eos_loss = F.binary_cross_entropy_with_logits(
+            pred_eos_logits[attention_mask], target_eos[attention_mask], reduction='mean'
+        )
+        return mse_t, mse_q, eos_loss
     
-    def decode(self, z, max_len=None):
+    def decode(self, z):
         """
-        Auto-regressively generate a sequence of (log t, log q) given latent z.
+        Auto-regressively generate a sequence of (log t, log q) given latent z, stopping at EOS.
         Args:
             z: (B, latent_dim)
-            max_len: Optional[int], if None, use exp(z[0]) as sequence length (rounded)
         Returns:
-            generated: (B, L, 2) log-normalized (t, q) sequence
+            generated: (B, L_i, 2) log-normalized (t, q) sequence, padded to max generated length
         """
         B = z.shape[0]
         device = z.device
-        if max_len is None:
-            # z[:, 0] is log-normalized real sequence length
-            lengths = torch.exp(z[:, 0]).round().long().clamp(min=1, max=self.hparams.max_seq_len_padding)
-        else:
-            lengths = torch.full((B,), max_len, dtype=torch.long, device=device)
-        L = lengths.max().item()
-        generated = []
+        max_steps = self.hparams.max_seq_len_padding
         prev = torch.zeros((B, 1, 2), device=device)
-        for _ in range(L):
-            out = self.decoder(prev, z, padding_mask=None)  # (B, step+1, 2)
-            next_token = out[:, -1:, :]  # (B, 1, 2)
-            generated.append(next_token)
-            prev = torch.cat([prev, next_token], dim=1)
-        generated = torch.cat(generated, dim=1)  # (B, L, 2)
-        # Optionally mask to true lengths
-        for i, l in enumerate(lengths):
-            if l < L:
-                generated[i, l:] = 0
+        active_sequences = torch.ones(B, dtype=torch.bool, device=device)
+        generated_lists = [[] for _ in range(B)]
+        for _ in range(max_steps):
+            out = self.decoder(prev, z, padding_mask=None)  # (B, step+1, 3)
+            next_pred_all = out[:, -1:, :]  # (B, 1, 3)
+            next_token_tq_vals = next_pred_all[..., :2]  # (B, 1, 2)
+            next_eos_logit = next_pred_all[..., 2].squeeze(-1)  # (B,)
+            next_eos_prob = torch.sigmoid(next_eos_logit)  # (B,)
+
+            for i in range(B):
+                if active_sequences[i]:
+                    generated_lists[i].append(next_token_tq_vals[i, 0].detach().clone())
+                    if next_eos_prob[i] > 0.5:
+                        active_sequences[i] = False
+
+            if not active_sequences.any():
+                break
+
+            # Prepare next input: only update for active sequences
+            next_input = prev.clone()
+            for i in range(B):
+                if active_sequences[i]:
+                    next_input[i] = torch.cat([prev[i], next_token_tq_vals[i]], dim=0)
+            prev = next_input
+
+        # Pad generated sequences to max length in batch
+        max_len = max(len(seq) for seq in generated_lists)
+        generated = torch.zeros((B, max_len, 2), device=device)
+        for i, seq in enumerate(generated_lists):
+            if len(seq) > 0:
+                generated[i, :len(seq), :] = torch.stack(seq, dim=0)
         return generated
     
     def forward(self, batch):
         times_padded = batch['times_padded'].float()
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
-        summary_stats = batch['summary_stats_batched'].float() # (B, num_summary_stats)
         sensor_pos_batched = batch['sensor_pos_batched'].float() # (B, 3)
 
-        mu_learned, logvar_learned = self.encode(times_padded, counts_padded, attention_mask, sensor_pos_batched)
-        z_learned = self.reparameterize(mu_learned, logvar_learned) # (B, learned_latent_dim)
-        
-        # Concatenate summary statistics with learned latents
-        z_full = torch.cat((summary_stats, z_learned), dim=1) # (B, latent_dim)
-        
-        # mu and logvar for KL loss are from the learned part only
-        return mu_learned, logvar_learned, z_full
+        mu, logvar = self.encode(times_padded, counts_padded, attention_mask, sensor_pos_batched)
+        z = self.reparameterize(mu, logvar) # (B, latent_dim)
+
+        return mu, logvar, z
 
     def kl_divergence(self, mu, logvar, free_bits_lambda=0.1):
         # Per-dimension KL: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
@@ -206,14 +228,16 @@ class NT_VAE(pl.LightningModule):
         times_padded = batch['times_padded'].float()
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
+        target_eos = batch['eos_target_padded'].float()
+        sequence_lengths = batch['sequence_lengths']
 
-        mse_t, mse_q = self.reconstruction_loss(
-            times_padded, counts_padded, z, attention_mask
+        mse_t, mse_q, eos_loss = self.reconstruction_loss(
+            times_padded, counts_padded, z, attention_mask, target_eos, sequence_lengths
         )
 
         reconstruction_loss_time = mse_t
         reconstruction_loss_charge = mse_q
-        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
+        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge + self.hparams.eos_loss_weight * eos_loss
 
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss)
@@ -242,6 +266,7 @@ class NT_VAE(pl.LightningModule):
         self.log("reco_loss_total", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
         self.log("reco_loss_time", reconstruction_loss_time, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("reco_loss_charge", reconstruction_loss_charge, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("train_eos_loss", eos_loss, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("beta", self.beta, batch_size=self.hparams.batch_size, sync_dist=True)
         return loss
     
@@ -251,14 +276,16 @@ class NT_VAE(pl.LightningModule):
         times_padded = batch['times_padded'].float()
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
+        target_eos = batch['eos_target_padded'].float()
+        sequence_lengths = batch['sequence_lengths']
 
-        mse_t, mse_q = self.reconstruction_loss(
-            times_padded, counts_padded, z, attention_mask
+        mse_t, mse_q, eos_loss = self.reconstruction_loss(
+            times_padded, counts_padded, z, attention_mask, target_eos, sequence_lengths
         )
 
         reconstruction_loss_time = mse_t
         reconstruction_loss_charge = mse_q
-        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
+        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge + self.hparams.eos_loss_weight * eos_loss
 
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss)
@@ -268,6 +295,7 @@ class NT_VAE(pl.LightningModule):
         self.log("val_reco_loss_total", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
         self.log("val_reco_loss_time", reconstruction_loss_time, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("val_reco_loss_charge", reconstruction_loss_charge, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("val_eos_loss", eos_loss, batch_size=self.hparams.batch_size, sync_dist=True)
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -276,14 +304,16 @@ class NT_VAE(pl.LightningModule):
         times_padded = batch['times_padded'].float()
         counts_padded = batch['counts_padded'].float()
         attention_mask = batch['attention_mask'].bool()
+        target_eos = batch['eos_target_padded'].float()
+        sequence_lengths = batch['sequence_lengths']
 
-        mse_t, mse_q = self.reconstruction_loss(
-            times_padded, counts_padded, z, attention_mask
+        mse_t, mse_q, eos_loss = self.reconstruction_loss(
+            times_padded, counts_padded, z, attention_mask, target_eos, sequence_lengths
         )
 
         reconstruction_loss_time = mse_t
         reconstruction_loss_charge = mse_q
-        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge
+        reconstruction_loss = reconstruction_loss_time + reconstruction_loss_charge + self.hparams.eos_loss_weight * eos_loss
 
         kl_loss = self.kl_divergence(mu, logvar)
         loss = reconstruction_loss + (self.beta*kl_loss)
@@ -293,6 +323,7 @@ class NT_VAE(pl.LightningModule):
         self.log("test_reco_loss_total", reconstruction_loss, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("test_reco_loss_time", reconstruction_loss_time, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("test_reco_loss_charge", reconstruction_loss_charge, batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("test_eos_loss", eos_loss, batch_size=self.hparams.batch_size, sync_dist=True)
         return loss
     
     def configure_optimizers(self):
@@ -317,7 +348,7 @@ class Om2VecDecoder(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.z_proj = nn.Linear(latent_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, 2)  # Predict mean log(t), log(q)
+        self.out_proj = nn.Linear(embed_dim, 3)  # Predict mean log(t), log(q), eos_logit
 
     def forward(self, tgt, z, padding_mask=None):
         # tgt: (B, S_tgt, 2) - current target sequence
