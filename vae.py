@@ -341,11 +341,14 @@ class Om2VecDecoder(nn.Module):
         if padding_mask is not None:
             tgt_key_padding_mask = ~padding_mask
 
+        causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device)
+
         # 4. Pass to the actual nn.TransformerDecoder
         out = self.transformer_decoder(
             tgt=tgt_emb,
             memory=memory,
             tgt_key_padding_mask=tgt_key_padding_mask,
+            tgt_mask=causal_tgt_mask,
             tgt_is_causal=True
         )
         return self.out_proj(out)
