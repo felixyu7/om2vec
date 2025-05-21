@@ -121,15 +121,15 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     counts_pad  = torch.zeros_like(times_pad)
     raw_t_pad   = torch.zeros_like(times_pad)
     raw_c_pad   = torch.zeros_like(times_pad)
-    attn_mask   = torch.zeros(bsz, max_len, dtype=torch.bool, device=device)
-    
+    attn_mask   = torch.ones(bsz, max_len, dtype=torch.bool, device=device)
+        
     # Handle eos_target (pad to max_len)
     eos_targets = [item["eos_target"] for item in batch]
     eos_target_padded = torch.zeros(bsz, max_len, dtype=torch.float32, device=device)
     for row, eos in enumerate(eos_targets):
         L = eos.shape[0]
         eos_target_padded[row, :L] = eos
-
+    
     # Handle sensor_pos (fixed size per item, so just stack)
     # Assuming sensor_pos is a 1D tensor of 3 elements
     sensor_pos_list = [item["sensor_pos"] for item in batch if "sensor_pos" in item]
@@ -138,7 +138,7 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     else:
         # Fallback if no sensor_pos found
         sensor_pos_batched = torch.empty(bsz, 3, dtype=dtype, device=device)
-
+    
     # ---------- write each sequence ----------
     for row, item in enumerate(batch):
         L = int(item["sequence_length"])
@@ -154,8 +154,8 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         L_raw_counts = item["raw_counts"].numel() # Should be same as L_raw_times
         if L_raw_counts > 0:
             raw_c_pad[row,  :L_raw_counts] = item["raw_counts"]
-        attn_mask[row,  :L] = True
-
+        attn_mask[row,  :L] = False  # False = valid, True = padding
+    
     return {
         "times_padded":     times_pad,
         "counts_padded":    counts_pad,

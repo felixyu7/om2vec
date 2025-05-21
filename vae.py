@@ -3,7 +3,9 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from utils import PositionalEncoding
+from utils import PositionalEncoding, mixture_gaussian_nll
+from torch.distributions.normal import Normal
+from torch.distributions.bernoulli import Bernoulli
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -22,10 +24,11 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
+                 mog_components=3,  # Number of mixture components for MoG output
                  batch_size=32,
                  lr=1e-3,
                  lr_schedule=[2, 20],
-                 weight_decay=1e-5,
+                 weight_decay=1e-5
                  ):
         super().__init__()
         self.save_hyperparameters()
@@ -49,8 +52,18 @@ class NT_VAE(pl.LightningModule):
             encoder_layer,
             num_layers=self.hparams.transformer_encoder_layers
         )
-        # Input to these layers will be pooled_output (embed_dim) + sensor_pos (3)
-        self.encoder_to_latent_input_dim = self.hparams.embed_dim + 3
+
+        # --- Bidirectional RNN for sequence aggregation ---
+        self.encoder_rnn = nn.GRU(
+            input_size=self.hparams.embed_dim,
+            hidden_size=self.hparams.embed_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        # Input to these layers will be BiGRU_out (2*hidden_size) + sensor_pos (3)
+        self.encoder_to_latent_input_dim = 2 * self.hparams.embed_dim + 3
         self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
         self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
         
@@ -61,7 +74,8 @@ class NT_VAE(pl.LightningModule):
             num_layers=self.hparams.transformer_decoder_layers,
             num_heads=self.hparams.transformer_decoder_heads,
             ff_dim=self.hparams.transformer_decoder_ff_dim,
-            dropout=self.hparams.transformer_decoder_dropout
+            dropout=self.hparams.transformer_decoder_dropout,
+            mog_components=self.hparams.mog_components
         )
 
         self.beta = 0.
@@ -74,7 +88,7 @@ class NT_VAE(pl.LightningModule):
 
     def encode(self, times_data, counts_data, attention_mask, sensor_pos_batched):
         # times_data, counts_data: (B, S)
-        # attention_mask: (B, S), boolean, True for valid tokens (False for padding)
+        # attention_mask: (B, S), boolean, True for padding tokens (False for valid)
         # sensor_pos_batched: (B, 3)
         
         concatenated_input = torch.stack((times_data, counts_data), dim=-1).float() # (B, S, 2)
@@ -82,24 +96,28 @@ class NT_VAE(pl.LightningModule):
         embedded_input = self.pos_encoder(embedded_input) # Add positional encoding (B,S,E)
         
         # PyTorch TransformerEncoder expects src_key_padding_mask where True means PADDED/MASKED
-        # Current attention_mask is True for VALID tokens. So, invert it.
-        src_key_padding_mask = ~attention_mask # (B, S)
+        # Now attention_mask is True for padding tokens (False for valid), so pass directly.
+        src_key_padding_mask = attention_mask # (B, S)
         
         encoded_sequence = self.transformer_encoder(embedded_input, src_key_padding_mask=src_key_padding_mask) # (B, S, embed_dim)
         
-        # Masked average pooling over sequence dimension
-        # Ensure attention_mask is float for multiplication, and keepdim for division
-        float_attention_mask = attention_mask.unsqueeze(-1).float()
-        masked_encoded_sequence = encoded_sequence * float_attention_mask
-        
-        summed_pool = masked_encoded_sequence.sum(dim=1) # (B, embed_dim)
-        # Number of valid tokens for each sequence in the batch
-        num_valid_tokens = attention_mask.sum(dim=1, keepdim=True).float().clamp(min=1) # (B, 1), avoid division by zero
-        
-        pooled_output = summed_pool / num_valid_tokens # (B, embed_dim)
+        # --- Replace mean-pooling with BiGRU aggregation ---
+        # Pack the sequence for the RNN using the attention mask
+        lengths = (~attention_mask).sum(dim=1).cpu()
+        packed_sequence = nn.utils.rnn.pack_padded_sequence(
+            encoded_sequence, lengths, batch_first=True, enforce_sorted=False
+        )
+        packed_output, hidden = self.encoder_rnn(packed_sequence)
+        # hidden: (num_layers * num_directions, B, hidden_size)
+        # For BiGRU, concatenate the last hidden states from both directions
+        if self.encoder_rnn.bidirectional:
+            # hidden[-2] is last layer forward, hidden[-1] is last layer backward
+            last_hidden = torch.cat([hidden[-2], hidden[-1]], dim=1) # (B, 2*hidden_size)
+        else:
+            last_hidden = hidden[-1] # (B, hidden_size)
 
-        # Concatenate pooled_output with sensor_pos_batched
-        encoder_latent_input = torch.cat((pooled_output, sensor_pos_batched), dim=1) # (B, embed_dim + 3)
+        # Concatenate last_hidden with sensor_pos_batched
+        encoder_latent_input = torch.cat((last_hidden, sensor_pos_batched), dim=1) # (B, 2*hidden_size + 3)
         
         mu = self.to_latent_mu(encoder_latent_input)
         logvar = self.to_latent_logvar(encoder_latent_input)
@@ -120,12 +138,12 @@ class NT_VAE(pl.LightningModule):
             target_log_t: (B, S) log-normalized arrival times
             target_log_q: (B, S) log-normalized charges
             z: (B, latent_dim)
-            attention_mask: (B, S) boolean, True for valid tokens
+            attention_mask: (B, S) boolean, True for padding tokens (False for valid)
             target_eos: (B, S) float, EOS targets (0 or 1)
             sequence_lengths: (B,) int, true sequence lengths (including EOS)
         Returns:
-            mse_t: MSE for t (masked, excluding EOS and padding)
-            mse_q: MSE for q (masked, excluding EOS and padding)
+            nll_t: NLL for t (masked, excluding EOS and padding)
+            nll_q: NLL for q (masked, excluding EOS and padding)
             eos_loss: BCE loss for EOS prediction (masked, includes EOS)
         """
         B, S = target_log_t.shape
@@ -137,69 +155,129 @@ class NT_VAE(pl.LightningModule):
         main_mask_segment = attention_mask[:, :-1]
         shifted_attention_mask = torch.cat([sos_mask_segment, main_mask_segment], dim=1)
         # Forward through transformer decoder
-        pred_outputs = self.decoder(decoder_inputs, z, padding_mask=shifted_attention_mask)  # (B, S, 3)
-        pred_log_t = pred_outputs[..., 0]
-        pred_log_q = pred_outputs[..., 1]
-        pred_eos_logits = pred_outputs[..., 2]
+        pred_outputs = self.decoder(decoder_inputs, z, padding_mask=shifted_attention_mask)  # (B, S, out_dim)
+        mog_components = self.hparams.mog_components
+        # Output shape: (B, S, 2 * mog_components * 3 + 1)
+        # For each of log_t and log_q: [weights, means, logvars] * mog_components
+        # EOS logit is last channel
+        out_dim = 2 * mog_components * 3 + 1
+        pred_outputs = pred_outputs.view(B, S, out_dim)
+        # Split outputs
+        pred_eos_logits = pred_outputs[..., -1]
+        # For log_t
+        t_weights = pred_outputs[..., :mog_components]
+        t_means = pred_outputs[..., mog_components:2*mog_components]
+        t_logvars = pred_outputs[..., 2*mog_components:3*mog_components]
+        # For log_q
+        q_weights = pred_outputs[..., 3*mog_components:4*mog_components]
+        q_means = pred_outputs[..., 4*mog_components:5*mog_components]
+        q_logvars = pred_outputs[..., 5*mog_components:6*mog_components]
 
-        # Data step attention mask: True for indices 0 to sequence_lengths[i]-2 (excludes EOS and padding)
-        data_step_attention_mask = torch.zeros_like(attention_mask)
+        # NLL target padding mask: True for padding/EOS, False for valid data steps to include in NLL.
+        # The original attention_mask is True for padding. We want to calculate NLL only on actual data points,
+        # excluding the EOS token and any padding.
+        nll_padding_mask = torch.ones_like(attention_mask, dtype=torch.bool) # Initialize all as padding (True)
         for i in range(B):
-            seq_len = sequence_lengths[i].item()
-            if seq_len > 1:
-                data_step_attention_mask[i, :seq_len-1] = True
+            # sequence_lengths includes the EOS token.
+            # Valid data for NLL is up to sequence_lengths[i] - 1 (exclusive of EOS).
+            actual_data_len = sequence_lengths[i].item() - 1
+            if actual_data_len > 0:
+                nll_padding_mask[i, :actual_data_len] = False # Mark valid data steps as False (not padding for NLL)
 
-        mse_t = F.mse_loss(pred_log_t[data_step_attention_mask], target_log_t[data_step_attention_mask], reduction='mean')
-        mse_q = F.mse_loss(pred_log_q[data_step_attention_mask], target_log_q[data_step_attention_mask], reduction='mean')
+        # Masked indices for NLL (select non-padded, non-EOS data)
+        valid_nll_indices = ~nll_padding_mask
 
-        # EOS loss: use original attention_mask (covers all valid steps including EOS)
-        eos_loss = F.binary_cross_entropy_with_logits(
-            pred_eos_logits[attention_mask], target_eos[attention_mask], reduction='mean'
+        # NLL for log_t
+        nll_t = mixture_gaussian_nll(
+            target_log_t[valid_nll_indices],
+            t_weights[valid_nll_indices], t_means[valid_nll_indices], t_logvars[valid_nll_indices]
         )
-        return mse_t, mse_q, eos_loss
+        # NLL for log_q
+        nll_q = mixture_gaussian_nll(
+            target_log_q[valid_nll_indices],
+            q_weights[valid_nll_indices], q_means[valid_nll_indices], q_logvars[valid_nll_indices]
+        )
+
+        # EOS loss: use original attention_mask (True = padding, so use ~attention_mask for valid steps where EOS could occur)
+        eos_loss = F.binary_cross_entropy_with_logits(
+            pred_eos_logits[~attention_mask], target_eos[~attention_mask], reduction='mean'
+        )
+        return nll_t, nll_q, eos_loss
     
+
     def decode(self, z):
         """
-        Auto-regressively generate a sequence of (log t, log q) given latent z, stopping at EOS.
+        Auto‑regressively generate a sequence of (log t, log q) given latent z,
+        sampling from the mixture‑of‑Gaussians decoder distribution.
         Args:
             z: (B, latent_dim)
         Returns:
-            generated: (B, L_i, 2) log-normalized (t, q) sequence, padded to max generated length
+            generated: (B, L_i, 2)  log‑normalised (t, q) sequence, padded to max length
         """
-        B = z.shape[0]
-        device = z.device
-        max_steps = self.hparams.max_seq_len_padding
-        prev = torch.zeros((B, 1, 2), device=device)
-        active_sequences = torch.ones(B, dtype=torch.bool, device=device)
-        generated_lists = [[] for _ in range(B)]
-        eos_step = torch.full((B,), max_steps, dtype=torch.long, device=device)  # Track EOS step for each sequence
-        for step in range(max_steps):
-            # Build padding mask: True for positions < eos_step, False for >= eos_step
-            padding_mask = torch.arange(prev.shape[1], device=device).unsqueeze(0) < eos_step.unsqueeze(1)  # (B, S)
-            out = self.decoder(prev, z, padding_mask=padding_mask)  # (B, step+1, 3)
-            next_pred_all = out[:, -1:, :]  # (B, 1, 3)
-            next_token_tq_vals = next_pred_all[..., :2]  # (B, 1, 2)
-            next_eos_logit = next_pred_all[..., 2].squeeze(-1)  # (B,)
-            next_eos_prob = torch.sigmoid(next_eos_logit)  # (B,)
+        B, device = z.size(0), z.device
+        K              = self.hparams.mog_components          # mixture size
+        max_steps      = self.hparams.max_seq_len_padding
+        prev_tokens    = torch.zeros(B, 1, 2, device=device)  # SOS token: (log t, log q) = 0
+        alive          = torch.ones(B, dtype=torch.bool, device=device)
+        sequences      = [[] for _ in range(B)]
+
+        for _ in range(max_steps):
+            # padding mask – no padding so far (shape: B, S_prev)
+            padding_mask = torch.zeros_like(prev_tokens[..., 0], dtype=torch.bool)
+
+            # Transformer decoder forward pass
+            decoder_out  = self.decoder(prev_tokens, z, padding_mask)       # (B, S_prev, 6K+1)
+            step_params  = decoder_out[:, -1, :]                            # last time‑step (B, 6K+1)
+
+            # ---- split mixture parameters ----
+            t_w_logits   = step_params[:, 0*K : 1*K]
+            t_mu         = step_params[:, 1*K : 2*K]
+            t_logvar     = step_params[:, 2*K : 3*K]
+
+            q_w_logits   = step_params[:, 3*K : 4*K]
+            q_mu         = step_params[:, 4*K : 5*K]
+            q_logvar     = step_params[:, 5*K : 6*K]
+
+            eos_logits   = step_params[:, -1]                               # (B,)
+
+            # ---- sample (log t) ----
+            t_weights    = F.softmax(t_w_logits, dim=-1)                    # (B, K)
+            t_idx        = torch.multinomial(t_weights, 1)                  # (B, 1)
+            t_mu_sel     = t_mu.gather(1, t_idx)                            # (B, 1)
+            t_sigma_sel  = torch.exp(0.5 * t_logvar).gather(1, t_idx)       # (B, 1)
+            next_t       = Normal(t_mu_sel, t_sigma_sel).rsample()          # (B, 1)
+
+            # ---- sample (log q) ----
+            q_weights    = F.softmax(q_w_logits, dim=-1)
+            q_idx        = torch.multinomial(q_weights, 1)
+            q_mu_sel     = q_mu.gather(1, q_idx)
+            q_sigma_sel  = torch.exp(0.5 * q_logvar).gather(1, q_idx)
+            next_q       = Normal(q_mu_sel, q_sigma_sel).rsample()          # (B, 1)
+
+            next_token   = torch.cat([next_t, next_q], dim=-1).unsqueeze(1) # (B, 1, 2)
+
+            # ---- sample EOS ----
+            eos_prob     = torch.sigmoid(eos_logits)                        # (B,)
+            eos_sample   = Bernoulli(probs=eos_prob).sample()               # (B,)
 
             for i in range(B):
-                if active_sequences[i]:
-                    generated_lists[i].append(next_token_tq_vals[i, 0].detach().clone())
-                    if next_eos_prob[i] > 0.5:
-                        active_sequences[i] = False
-                        eos_step[i] = prev.shape[1]  # Mark EOS at this step (current length)
+                if alive[i]:
+                    sequences[i].append(next_token[i, 0].detach())
+                    if eos_sample[i] == 1:
+                        alive[i] = False
 
-            if not active_sequences.any():
+            if not alive.any():        # all sequences ended
                 break
 
-            prev = torch.cat((prev, next_token_tq_vals), dim=1)
+            prev_tokens = torch.cat([prev_tokens, next_token], dim=1)      # grow sequence
 
-        # Pad generated sequences to max length in batch
-        max_len = max(len(seq) for seq in generated_lists)
-        generated = torch.zeros((B, max_len, 2), device=device)
-        for i, seq in enumerate(generated_lists):
-            if len(seq) > 0:
-                generated[i, :len(seq), :] = torch.stack(seq, dim=0)
+        # ---- pad to max length in batch ----
+        max_len = max(len(seq) for seq in sequences)
+        generated = torch.zeros(B, max_len, 2, device=device)
+        for i, seq in enumerate(sequences):
+            if seq:
+                generated[i, :len(seq), :] = torch.stack(seq)
+
         return generated
     
     def forward(self, batch):
@@ -332,7 +410,7 @@ class NT_VAE(pl.LightningModule):
     
 # --- Om2VecDecoder module ---
 class Om2VecDecoder(nn.Module):
-    def __init__(self, latent_dim, embed_dim, num_layers=4, num_heads=8, ff_dim=256, dropout=0.1):
+    def __init__(self, latent_dim, embed_dim, num_layers=4, num_heads=8, ff_dim=256, dropout=0.1, mog_components=3):
         super().__init__()
         self.input_proj = nn.Linear(2, embed_dim)
         self.pos_encoder = PositionalEncoding(embed_dim, dropout)
@@ -347,12 +425,14 @@ class Om2VecDecoder(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.z_proj = nn.Linear(latent_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, 3)  # Predict mean log(t), log(q), eos_logit
+        self.mog_components = mog_components
+        # For each of log_t and log_q: weights, means, logvars (3 * mog_components), plus EOS logit
+        self.out_proj = nn.Linear(embed_dim, 2 * mog_components * 3 + 1)
 
     def forward(self, tgt, z, padding_mask=None):
         # tgt: (B, S_tgt, 2) - current target sequence
         # z: (B, latent_dim) - latent vector
-        # padding_mask: (B, S_tgt) - Optional, True for VALID tokens, False for PADDED tokens
+        # padding_mask: (B, S_tgt) - Optional, True for padding tokens, False for valid tokens
         
         B, S_tgt, _ = tgt.shape
         device = tgt.device
@@ -360,6 +440,9 @@ class Om2VecDecoder(nn.Module):
         # 1. Prepare target embeddings
         tgt_emb = self.input_proj(tgt)  # (B, S_tgt, embed_dim)
         tgt_emb = self.pos_encoder(tgt_emb)
+        # Inject latent z into every decoder position
+        z_proj = self.z_proj(z).unsqueeze(1)  # (B, 1, embed_dim)
+        tgt_emb = tgt_emb + z_proj  # broadcast add to every position
 
         # 2. Prepare memory (context from z)
         # memory shape: (B, S_mem, embed_dim). Here S_mem = 1.
@@ -369,8 +452,8 @@ class Om2VecDecoder(nn.Module):
         # Shape: (B, S_tgt)
         tgt_key_padding_mask = None
         if padding_mask is not None:
-            tgt_key_padding_mask = ~padding_mask
-
+            tgt_key_padding_mask = padding_mask
+        
         causal_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S_tgt, device=device).bool()
 
         # 4. Pass to the actual nn.TransformerDecoder
