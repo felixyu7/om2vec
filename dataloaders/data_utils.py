@@ -123,12 +123,13 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     raw_c_pad   = torch.zeros_like(times_pad)
     attn_mask   = torch.ones(bsz, max_len, dtype=torch.bool, device=device)
         
-    # Handle eos_target (pad to max_len)
-    eos_targets = [item["eos_target"] for item in batch]
-    eos_target_padded = torch.zeros(bsz, max_len, dtype=torch.float32, device=device)
-    for row, eos in enumerate(eos_targets):
-        L = eos.shape[0]
-        eos_target_padded[row, :L] = eos
+    # eos_target is no longer used by the model or dataset __getitem__
+    # eos_targets = [item["eos_target"] for item in batch if "eos_target" in item] # Defensively check
+    # eos_target_padded = torch.zeros(bsz, max_len, dtype=torch.float32, device=device)
+    # if eos_targets: # Only process if eos_target was actually present
+    #     for row, eos in enumerate(eos_targets):
+    #         L = eos.shape[0]
+    #         eos_target_padded[row, :L] = eos
     
     # Handle sensor_pos (fixed size per item, so just stack)
     # Assuming sensor_pos is a 1D tensor of 3 elements
@@ -163,7 +164,7 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         "raw_counts_padded": raw_c_pad,
         "attention_mask":   attn_mask,
         "sequence_lengths": seq_lens,
-        "eos_target_padded": eos_target_padded,
+        # "eos_target_padded": eos_target_padded, # Removed
         "sensor_pos_batched": sensor_pos_batched,
     }
 

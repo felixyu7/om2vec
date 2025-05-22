@@ -219,19 +219,18 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             rc_original = rc_original[idx]
 
         current_sequence_length = rt_original.numel()
-        # EOS token integration
-        times_for_model = torch.cat([nt_original, torch.tensor([0.0], dtype=torch.float32)])
-        counts_for_model = torch.cat([nq_original, torch.tensor([0.0], dtype=torch.float32)])
-        eos_target = torch.zeros(current_sequence_length + 1, dtype=torch.float32)
-        eos_target[current_sequence_length] = 1.0
+        # No EOS token integration needed anymore
+        times_for_model = nt_original
+        counts_for_model = nq_original
+        # eos_target is no longer needed
 
         return {
             "times":           times_for_model,
             "counts":          counts_for_model,
             "raw_times":       rt_original,
             "raw_counts":      rc_original,
-            "sequence_length": torch.tensor(current_sequence_length + 1, dtype=torch.long),
-            "eos_target":      eos_target,
+            "sequence_length": torch.tensor(current_sequence_length, dtype=torch.long), # Actual number of (t,q) pairs
+            # "eos_target":      eos_target, # Removed
             "sensor_pos":      sensor_pos,
         }
         
