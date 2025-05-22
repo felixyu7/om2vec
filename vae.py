@@ -3,9 +3,10 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from utils import PositionalEncoding
 from torch.distributions.normal import Normal
 from torch.distributions.bernoulli import Bernoulli
-from x_transformers import TransformerWrapper, Encoder, Decoder, ContinuousAutoregressiveWrapper
+from x_transformers import Encoder as XTEncoder, Decoder as XTDecoder
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -36,25 +37,28 @@ class NT_VAE(pl.LightningModule):
                  ):
         super().__init__()
         self.save_hyperparameters()
-        # Encoder input embedding
-        self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim)
+
+        # Encoder: PyTorch Transformer based
+        self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim) # Input: (time, count)
+        self.pos_encoder = PositionalEncoding(self.hparams.embed_dim,
+                                              self.hparams.transformer_encoder_dropout,
+                                              max_len=self.hparams.max_seq_len_padding + 1) # +1 for EOS token
+        
         # --- x-transformers Encoder ---
-        self.xt_encoder = TransformerWrapper(
-            attn_layers=Encoder(
-                dim=self.hparams.embed_dim,
-                depth=self.hparams.transformer_encoder_layers,
-                heads=self.hparams.transformer_encoder_heads,
-                ff_glu=True,
-                rotary_pos_emb=True,
-                flash_attn=True,
-                norm_type='rmsnorm',
-                qk_norm=True,
-                attn_dropout=self.hparams.transformer_encoder_dropout,
-                ff_dropout=self.hparams.transformer_encoder_dropout
-            ),
-            max_seq_len=self.hparams.max_seq_len_padding + 1,
-            emb_dim=None # input already embedded
+        self.xt_encoder = XTEncoder(
+            dim=self.hparams.embed_dim,
+            depth=self.hparams.transformer_encoder_layers,
+            heads=self.hparams.transformer_encoder_heads,
+            ff_mult=self.hparams.transformer_encoder_ff_dim // self.hparams.embed_dim,
+            attn_dropout=self.hparams.transformer_encoder_dropout,
+            ff_dropout=self.hparams.transformer_encoder_dropout,
+            rotary_pos_emb=True,
+            attn_flash=True,
+            use_rmsnorm=True,
+            ff_glu=True,
+            post_emb_norm=True
         )
+
         self.encoder_rnn = nn.GRU(
             input_size=self.hparams.embed_dim,
             hidden_size=self.hparams.embed_dim,
@@ -62,68 +66,81 @@ class NT_VAE(pl.LightningModule):
             batch_first=True,
             bidirectional=True
         )
+        
         self.encoder_to_latent_input_dim = 2 * self.hparams.embed_dim + 3
         self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
         self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
-        # --- x-transformers Decoder ---
-        self.decoder_input_proj = nn.Linear(2, self.hparams.embed_dim)
-        self.decoder_output_proj = nn.Linear(self.hparams.embed_dim, 3)
+        
+        # --- Decoder layers (from Om2VecDecoder) ---
+        self.decoder_input_embedding = nn.Linear(2, self.hparams.embed_dim)
+        self.decoder_pos_encoder = PositionalEncoding(self.hparams.embed_dim, 
+                                                      self.hparams.transformer_decoder_dropout, 
+                                                      max_len=self.hparams.max_seq_len_padding + 1)
         self.decoder_z_proj = nn.Linear(self.hparams.latent_dim, self.hparams.embed_dim)
-        inner_xt_decoder_model = TransformerWrapper(
-            attn_layers=Decoder(
-                dim=self.hparams.embed_dim,
-                depth=self.hparams.transformer_decoder_layers,
-                heads=self.hparams.transformer_decoder_heads,
-                cross_attend=True,
-                ff_glu=True,
-                rotary_pos_emb=True,
-                flash_attn=True,
-                norm_type='rmsnorm',
-                qk_norm=True,
-                attn_dropout=self.hparams.transformer_decoder_dropout,
-                ff_dropout=self.hparams.transformer_decoder_dropout
-            ),
-            max_seq_len=self.hparams.max_seq_len_padding + 1,
-            emb_dim=None # input already embedded
+        self.decoder_out_proj = nn.Linear(self.hparams.embed_dim, 3)
+        self.xt_decoder = XTDecoder(
+            dim=self.hparams.embed_dim,
+            depth=self.hparams.transformer_decoder_layers,
+            heads=self.hparams.transformer_decoder_heads,
+            cross_attend=True,
+            ff_mult=self.hparams.transformer_decoder_ff_dim // self.hparams.embed_dim,
+            attn_dropout=self.hparams.transformer_decoder_dropout,
+            ff_dropout=self.hparams.transformer_decoder_dropout,
+            rotary_pos_emb=True,
+            attn_flash=True,
+            use_rmsnorm=True,
+            ff_glu=True,
+            post_emb_norm=True
         )
-        self.actual_decoder_logic = XTDecoderWithProjection(
-            xt_transformer_decoder_core=inner_xt_decoder_model,
-            z_proj=self.decoder_z_proj,
-            input_proj=self.decoder_input_proj,
-            output_proj=self.decoder_output_proj
-        )
-        self.xt_decoder = ContinuousAutoregressiveWrapper(
-            model=self.actual_decoder_logic
-        )
+
         self.beta = 0.
-        self.current_train_iter = 0
+        self.current_train_iter = 0 # Renamed from self.iter for clarity
+
+        # EOS loss weight hyperparameter
         self.hparams.eos_loss_weight = getattr(self.hparams, "eos_loss_weight", 1.0)
+
+        # --- Teacher Forcing Curriculum State ---
         self.current_teacher_forcing_ratio = self.hparams.teacher_forcing_start_ratio
         self.total_steps_for_tf_warmup = 0
         self.total_steps_for_tf_decay = 0
         self.steps_initialized = False
-        self.test_step_results = {'num_hits': [], 'js_divs': []}
 
+        self.test_step_results = {'num_hits': [], 'js_divs': []}
 
     def encode(self, times_data, counts_data, attention_mask, sensor_pos_batched):
         # times_data, counts_data: (B, S)
         # attention_mask: (B, S), boolean, True for padding tokens (False for valid)
         # sensor_pos_batched: (B, 3)
+        
         concatenated_input = torch.stack((times_data, counts_data), dim=-1).float() # (B, S, 2)
         embedded_input = self.encoder_input_embedding(concatenated_input) # (B, S, embed_dim)
-        # x-transformers expects mask: True for padding
-        encoded_sequence = self.xt_encoder(embedded_input, mask=attention_mask) # (B, S, embed_dim)
+        embedded_input = self.pos_encoder(embedded_input) # Add positional encoding (B,S,E)
+        
+        # PyTorch TransformerEncoder expects src_key_padding_mask where True means PADDED/MASKED
+        # Now attention_mask is True for padding tokens (False for valid), so pass directly.
+        src_key_padding_mask = attention_mask # (B, S)
+        
+        encoded_sequence = self.xt_encoder(embedded_input, mask=src_key_padding_mask) # (B, S, embed_dim)
+        
         # Pack the sequence for the RNN using the attention mask
         lengths = (~attention_mask).sum(dim=1).cpu()
         packed_sequence = nn.utils.rnn.pack_padded_sequence(
             encoded_sequence, lengths, batch_first=True, enforce_sorted=False
         )
         packed_output, hidden = self.encoder_rnn(packed_sequence)
+        # hidden: (num_layers * num_directions, B, hidden_size)
+        # For BiGRU, concatenate the last hidden states from both directions
         last_hidden = torch.cat([hidden[-2], hidden[-1]], dim=1) # (B, 2*hidden_size)
+
+        # Concatenate last_hidden with sensor_pos_batched
         encoder_latent_input = torch.cat((last_hidden, sensor_pos_batched), dim=1) # (B, 2*hidden_size + 3)
+
         mu = self.to_latent_mu(encoder_latent_input)
         logvar = self.to_latent_logvar(encoder_latent_input)
+
+        # clamp logvar for stability
         logvar = torch.clamp(logvar, min=-10, max=10)
+
         return mu, logvar
     
     def reparameterize(self, mu, logvar):
@@ -149,28 +166,53 @@ class NT_VAE(pl.LightningModule):
         B, S = target_log_t.shape
         device = target_log_t.device
         use_tf = torch.rand(B, device=device) < teacher_forcing_ratio  # (B,)
+
         # 1. First pass: all-teacher-forced input
         teacher_inputs = torch.zeros(B, S, 2, device=device)
         teacher_inputs[:, 1:, :] = torch.stack([target_log_t, target_log_q], dim=-1)[:, :-1, :]
+
         with torch.no_grad():
-            teacher_logits = self.actual_decoder_logic(teacher_inputs, context=z, mask=attention_mask)  # (B, S, 3)
+            teacher_inputs_emb = self.decoder_input_embedding(teacher_inputs)
+            teacher_inputs_emb = self.decoder_pos_encoder(teacher_inputs_emb)
+            z_context = self.decoder_z_proj(z).unsqueeze(1)
+            context_mask = torch.ones(z.size(0), 1, device=z.device, dtype=torch.bool)
+            teacher_logits_emb = self.xt_decoder(
+                teacher_inputs_emb,
+                context=z_context,
+                mask=attention_mask,
+                context_mask=context_mask
+            )
+            teacher_logits = self.decoder_out_proj(teacher_logits_emb)
             teacher_pred_log_t = teacher_logits[..., 0]
             teacher_pred_log_q = teacher_logits[..., 1]
+
         # 2. Prepare mixed input: for no-teacher sequences, use model's own predictions
         mixed_inputs = teacher_inputs.clone()
         for b in range(B):
             if not use_tf[b]:
                 mixed_inputs[b, 1:, 0] = teacher_pred_log_t[b, :-1]
                 mixed_inputs[b, 1:, 1] = teacher_pred_log_q[b, :-1]
-        logits = self.actual_decoder_logic(mixed_inputs, context=z, mask=attention_mask)  # (B, S, 3)
+
+        mixed_inputs_emb = self.decoder_input_embedding(mixed_inputs)
+        mixed_inputs_emb = self.decoder_pos_encoder(mixed_inputs_emb)
+        z_context = self.decoder_z_proj(z).unsqueeze(1)
+        context_mask = torch.ones(z.size(0), 1, device=z.device, dtype=torch.bool)
+        logits_emb = self.xt_decoder(
+            mixed_inputs_emb,
+            context=z_context,
+            mask=attention_mask,
+            context_mask=context_mask
+        )
+        logits = self.decoder_out_proj(logits_emb)
         pred_log_t = logits[..., 0]
         pred_log_q = logits[..., 1]
         pred_eos_logits = logits[..., 2]
-        # Create a mask for NLL loss, excluding EOS token and padding
-        # sequence_lengths includes EOS, so we want to mask from sequence_lengths - 1 onwards
-        indices = torch.arange(S, device=device).unsqueeze(0) # (1, S)
-        expanded_lengths_minus_one = (sequence_lengths - 1).unsqueeze(1) # (B, 1)
-        nll_padding_mask = indices >= expanded_lengths_minus_one # (B, S), True for EOS and padding
+        # NLL target padding mask: True for padding/EOS, False for valid data steps to include in NLL.
+        nll_padding_mask = torch.ones_like(attention_mask, dtype=torch.bool)
+        for i in range(B):
+            actual_data_len = sequence_lengths[i].item() - 1
+            if actual_data_len > 0:
+                nll_padding_mask[i, :actual_data_len] = False
         valid_nll_indices = ~nll_padding_mask
         if valid_nll_indices.any():
             mse_t = F.mse_loss(pred_log_t[valid_nll_indices], target_log_t[valid_nll_indices])
@@ -182,6 +224,7 @@ class NT_VAE(pl.LightningModule):
             pred_eos_logits[~attention_mask], target_eos[~attention_mask], reduction='mean'
         )
         return mse_t, mse_q, eos_loss
+    
 
     def decode(self, z):
         """
@@ -193,35 +236,55 @@ class NT_VAE(pl.LightningModule):
             generated: (B, L_i, 2)  log‑normalised (t, q) sequence, padded to max length
         """
         B, device = z.size(0), z.device
-        max_steps = self.hparams.max_seq_len_padding
-        prev_tokens = torch.zeros(B, 1, 2, device=device)  # SOS token: (log t, log q) = 0
-        alive = torch.ones(B, dtype=torch.bool, device=device)
-        sequences = [[] for _ in range(B)]
+        max_steps      = self.hparams.max_seq_len_padding
+        prev_tokens    = torch.zeros(B, 1, 2, device=device)  # SOS token: (log t, log q) = 0
+        alive          = torch.ones(B, dtype=torch.bool, device=device)
+        sequences      = [[] for _ in range(B)]
+
         for _ in range(max_steps):
             padding_mask = torch.zeros_like(prev_tokens[..., 0], dtype=torch.bool)
-            decoder_out = self.actual_decoder_logic(prev_tokens, context=z, mask=padding_mask)  # (B, S_prev, 3)
-            step_params = decoder_out[:, -1, :]  # last time‑step (B, 3)
-            pred_log_t_step = step_params[:, 0]
-            pred_log_q_step = step_params[:, 1]
-            eos_logits = step_params[:, 2]
-            next_t = pred_log_t_step.unsqueeze(1)
-            next_q = pred_log_q_step.unsqueeze(1)
-            next_token = torch.cat([next_t, next_q], dim=-1).unsqueeze(1)
-            eos_prob = torch.sigmoid(eos_logits)
-            eos_sample = Bernoulli(probs=eos_prob).sample()
+            prev_tokens_emb = self.decoder_input_embedding(prev_tokens)
+            prev_tokens_emb = self.decoder_pos_encoder(prev_tokens_emb)
+            z_context = self.decoder_z_proj(z).unsqueeze(1)
+            current_padding_mask = padding_mask
+            context_mask = torch.ones(z.size(0), 1, device=z.device, dtype=torch.bool)
+            decoder_out_emb = self.xt_decoder(
+                prev_tokens_emb,
+                context=z_context,
+                mask=current_padding_mask,
+                context_mask=context_mask
+            )
+            step_params = self.decoder_out_proj(decoder_out_emb[:, -1, :])  # last time‑step (B, 3)
+
+            pred_log_t_step = step_params[:, 0]    # (B,)
+            pred_log_q_step = step_params[:, 1]    # (B,)
+            eos_logits      = step_params[:, 2]    # (B,)
+
+            next_t = pred_log_t_step.unsqueeze(1)  # (B, 1)
+            next_q = pred_log_q_step.unsqueeze(1)  # (B, 1)
+
+            next_token   = torch.cat([next_t, next_q], dim=-1).unsqueeze(1) # (B, 1, 2)
+
+            eos_prob     = torch.sigmoid(eos_logits)                        # (B,)
+            eos_sample   = Bernoulli(probs=eos_prob).sample()               # (B,)
+
             for i in range(B):
                 if alive[i]:
                     sequences[i].append(next_token[i, 0].detach())
                     if eos_sample[i] == 1:
                         alive[i] = False
-            if not alive.any():
+
+            if not alive.any():        # all sequences ended
                 break
-            prev_tokens = torch.cat([prev_tokens, next_token], dim=1)
+
+            prev_tokens = torch.cat([prev_tokens, next_token], dim=1)      # grow sequence
+
         max_len = max(len(seq) for seq in sequences)
         generated = torch.zeros(B, max_len, 2, device=device)
         for i, seq in enumerate(sequences):
             if seq:
                 generated[i, :len(seq), :] = torch.stack(seq)
+
         return generated
     
     def forward(self, batch):
@@ -369,24 +432,3 @@ class NT_VAE(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[0], eta_min=self.hparams.lr_schedule[1])
         return [optimizer], [scheduler]
-    
-# --- x-transformers Decoder Helper ---
-class XTDecoderWithProjection(nn.Module):
-    def __init__(self, xt_transformer_decoder_core, z_proj, input_proj, output_proj):
-        super().__init__()
-        self.core_model = xt_transformer_decoder_core # TransformerWrapper(Decoder)
-        self.z_proj = z_proj
-        self.input_proj = input_proj
-        self.output_proj = output_proj
-
-    def forward(self, x, context=None, mask=None, **kwargs):
-        # x: (B, S, 2) - current target sequence (log_t, log_q)
-        # context: (B, latent_dim) - latent vector z (to be projected)
-        tgt_emb = self.input_proj(x) # (B, S, embed_dim)
-        projected_z_context = None
-        if context is not None:
-            projected_z_context = self.z_proj(context) # (B, embed_dim)
-            if projected_z_context.ndim == 2: # Ensure context is 3D for cross-attention
-                 projected_z_context = projected_z_context.unsqueeze(1) # (B, 1, embed_dim)
-        core_out = self.core_model(tgt_emb, context=projected_z_context, mask=mask, **kwargs) # (B, S, embed_dim)
-        return self.output_proj(core_out) # (B, S, 3)
