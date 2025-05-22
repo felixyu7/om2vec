@@ -23,6 +23,7 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
+                 memory_bank_size=256, # Size of learnable memory bank
                  batch_size=32,
                  lr=1e-3,
                  lr_schedule=[2, 20],
@@ -31,11 +32,16 @@ class NT_VAE(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # Encoder: PyTorch Transformer based
+        # Encoder: PyTorch Transformer based with CLS token
         self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim) # Input: (time, count)
+        
+        # Learnable CLS token for sequence aggregation
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.hparams.embed_dim) * 0.02)
+        
+        # Positional encoding with +1 for CLS token
         self.pos_encoder = PositionalEncoding(self.hparams.embed_dim,
                                               self.hparams.transformer_encoder_dropout,
-                                              max_len=self.hparams.max_seq_len_padding) # No +1 for EOS token
+                                              max_len=self.hparams.max_seq_len_padding + 1) # +1 for CLS token
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hparams.embed_dim,
@@ -51,20 +57,18 @@ class NT_VAE(pl.LightningModule):
             num_layers=self.hparams.transformer_encoder_layers
         )
         
-        self.encoder_rnn = nn.GRU(
-            input_size=self.hparams.embed_dim,
-            hidden_size=self.hparams.embed_dim,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-        
-        self.encoder_to_latent_input_dim = 2 * self.hparams.embed_dim + 3
+        # CLS token approach replaces GRU - input dimension is now embed_dim + 3 (sensor pos)
+        self.encoder_to_latent_input_dim = self.hparams.embed_dim + 3
         # Output dim is latent_dim - 1 because z[0] will be reserved for sequence length
         self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim - 1)
         self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim - 1)
         
-        # --- Non-autoregressive Decoder Components ---
+        # --- Cross-Attention Decoder with Memory Bank ---
+        # Learnable memory bank that captures common patterns
+        self.memory_bank = nn.Parameter(
+            torch.randn(self.hparams.memory_bank_size, self.hparams.embed_dim) * 0.02
+        )
+        
         # Input dim is latent_dim - 1 as z[0] (length) is handled separately
         self.decoder_z_proj = nn.Linear(self.hparams.latent_dim - 1, self.hparams.embed_dim)
         self.decoder_pos_encoder = PositionalEncoding(
@@ -72,7 +76,9 @@ class NT_VAE(pl.LightningModule):
             self.hparams.transformer_decoder_dropout,
             max_len=self.hparams.max_seq_len_padding
         )
-        decoder_encoder_layer = nn.TransformerEncoderLayer(
+        
+        # Cross-attention decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.hparams.embed_dim,
             nhead=self.hparams.transformer_decoder_heads,
             dim_feedforward=self.hparams.transformer_decoder_ff_dim,
@@ -81,10 +87,11 @@ class NT_VAE(pl.LightningModule):
             batch_first=True,
             norm_first=True
         )
-        self.decoder_transformer_encoder = nn.TransformerEncoder(
-            decoder_encoder_layer,
+        self.decoder_transformer = nn.TransformerDecoder(
+            decoder_layer,
             num_layers=self.hparams.transformer_decoder_layers
         )
+        
         # Output projection to (log_t, log_q)
         self.decoder_out_proj = nn.Linear(self.hparams.embed_dim, 2)
 
@@ -100,43 +107,53 @@ class NT_VAE(pl.LightningModule):
         # attention_mask: (B, S), boolean, True for padding tokens (False for valid)
         # sensor_pos_batched: (B, 3)
         
+        B, S = times_data.shape
+        device = times_data.device
+        
+        # 1. Embed input sequences
         concatenated_input = torch.stack((times_data, counts_data), dim=-1).float() # (B, S, 2)
         embedded_input = self.encoder_input_embedding(concatenated_input) # (B, S, embed_dim)
-        embedded_input = self.pos_encoder(embedded_input) # Add positional encoding (B,S,E)
         
-        # PyTorch TransformerEncoder expects src_key_padding_mask where True means PADDED/MASKED
-        # Now attention_mask is True for padding tokens (False for valid), so pass directly.
-        src_key_padding_mask = attention_mask # (B, S)
+        # 2. Prepend CLS token to each sequence
+        cls_tokens = self.cls_token.expand(B, -1, -1) # (B, 1, embed_dim)
+        embedded_with_cls = torch.cat([cls_tokens, embedded_input], dim=1) # (B, 1+S, embed_dim)
         
-        encoded_sequence = self.transformer_encoder(embedded_input, src_key_padding_mask=src_key_padding_mask) # (B, S, embed_dim)
+        # 3. Apply positional encoding
+        embedded_with_cls = self.pos_encoder(embedded_with_cls) # (B, 1+S, embed_dim)
         
-        # Pack the sequence for the RNN using the attention mask
-        lengths = (~attention_mask).sum(dim=1).cpu()
-        packed_sequence = nn.utils.rnn.pack_padded_sequence(
-            encoded_sequence, lengths, batch_first=True, enforce_sorted=False
-        )
-        packed_output, hidden = self.encoder_rnn(packed_sequence)
-        # hidden: (num_layers * num_directions, B, hidden_size)
-        # For BiGRU, concatenate the last hidden states from both directions
-        last_hidden = torch.cat([hidden[-2], hidden[-1]], dim=1) # (B, 2*hidden_size)
+        # 4. Prepare attention mask for CLS token + sequence
+        # CLS token should never be masked (always attends to sequence)
+        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=device) # (B, 1) - False for CLS
+        extended_attention_mask = torch.cat([cls_mask, attention_mask], dim=1) # (B, 1+S)
+        
+        # 5. Pass through transformer encoder
+        encoded_sequence = self.transformer_encoder(
+            embedded_with_cls, 
+            src_key_padding_mask=extended_attention_mask
+        ) # (B, 1+S, embed_dim)
+        
+        # 6. Extract CLS token representation (first token)
+        cls_representation = encoded_sequence[:, 0, :] # (B, embed_dim)
+        
+        # 7. Concatenate CLS representation with sensor position
+        encoder_latent_input = torch.cat((cls_representation, sensor_pos_batched), dim=1) # (B, embed_dim + 3)
 
-        # Concatenate last_hidden with sensor_pos_batched
-        encoder_latent_input = torch.cat((last_hidden, sensor_pos_batched), dim=1) # (B, 2*hidden_size + 3)
-
+        # 8. Project to latent parameters
         mu_content = self.to_latent_mu(encoder_latent_input) # (B, latent_dim - 1)
         logvar_content = self.to_latent_logvar(encoder_latent_input) # (B, latent_dim - 1)
 
-        # clamp logvar_content for stability
+        # Clamp logvar_content for stability
         logvar_content = torch.clamp(logvar_content, min=-10, max=10)
 
-        # `lengths` from pack_padded_sequence (derived from ~attention_mask.sum())
-        # now directly represents the number of actual (t,q) pairs because dataloader no longer adds EOS.
-        actual_num_tq_pairs = lengths.float().clamp(min=1.0) # Ensure min length of 1 for log
-        log_true_lengths = torch.log(actual_num_tq_pairs.to(mu_content.device)).unsqueeze(1) # (B, 1)
+        # 9. Compute sequence lengths and log-lengths
+        # Use original attention_mask to get actual sequence lengths
+        lengths = (~attention_mask).sum(dim=1).float().clamp(min=1.0) # (B,)
+        log_true_lengths = torch.log(lengths.to(mu_content.device)).unsqueeze(1) # (B, 1)
         
         # Log-variance for length dimension (fixed, small variance)
         log_true_lengths_logvar = torch.full_like(log_true_lengths, -10.0) # (B, 1)
 
+        # 10. Combine length and content parameters
         mu = torch.cat((log_true_lengths, mu_content), dim=1) # (B, latent_dim)
         logvar = torch.cat((log_true_lengths_logvar, logvar_content), dim=1) # (B, latent_dim)
 
@@ -212,20 +229,38 @@ class NT_VAE(pl.LightningModule):
     
 
     def _decode_non_autoregressive(self, z):
-        """Internal helper for non-autoregressive decoding logic."""
+        """Internal helper for cross-attention decoding with memory bank."""
         B = z.size(0)
+        device = z.device
+        
         # z[:, 0] is log_true_length, z[:, 1:] is content_latent
         z_content = z[:, 1:] # (B, latent_dim - 1)
 
         # 1. Project z_content and expand to sequence length
         z_dec_input = self.decoder_z_proj(z_content) # (B, embed_dim)
         decoder_input_sequence = z_dec_input.unsqueeze(1).repeat(1, self.hparams.max_seq_len_padding, 1)
-        # 2. Add positional encoding
-        decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence)
-        # 3. Pass through Transformer Encoder stack
-        transformed_sequence = self.decoder_transformer_encoder(decoder_input_sequence) # (B, max_seq_len_padding, embed_dim)
-        # 4. Project to output (log_t, log_q)
-        # self.decoder_out_proj now outputs 2 features
+        
+        # 2. Add positional encoding to decoder input (queries)
+        decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence) # (B, max_seq_len_padding, embed_dim)
+        
+        # 3. Prepare memory for cross-attention
+        # Combine memory bank with latent information
+        # Expand z_content to match memory bank format and concatenate
+        z_expanded = z_dec_input.unsqueeze(1) # (B, 1, embed_dim)
+        memory_bank_expanded = self.memory_bank.unsqueeze(0).expand(B, -1, -1) # (B, memory_bank_size, embed_dim)
+        
+        # Memory is concatenation of latent info + memory bank
+        memory = torch.cat([z_expanded, memory_bank_expanded], dim=1) # (B, 1 + memory_bank_size, embed_dim)
+        
+        # 4. Pass through cross-attention decoder
+        # tgt: decoder_input_sequence (queries)
+        # memory: combined latent + memory bank (keys/values)
+        transformed_sequence = self.decoder_transformer(
+            tgt=decoder_input_sequence,  # (B, max_seq_len_padding, embed_dim)
+            memory=memory               # (B, 1 + memory_bank_size, embed_dim)
+        ) # (B, max_seq_len_padding, embed_dim)
+        
+        # 5. Project to output (log_t, log_q)
         predicted_log_tq = self.decoder_out_proj(transformed_sequence) # (B, max_seq_len_padding, 2)
         return predicted_log_tq
 
