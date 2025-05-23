@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn
+from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn, process_time_sequence_for_intervals
 from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
@@ -172,7 +172,15 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, item_tuple: Tuple[int, int]) -> Dict[str, torch.Tensor]:
         """
-        Returns one training example.
+        Returns one training example with time intervals and first absolute time.
+        
+        New data structure for time interval prediction:
+        - q_sequence: Log-normalized charges [length N]
+        - time_input_features: Time features for encoder input [length N]
+        - target_log_first_abs_time: Log of first absolute time [scalar]
+        - target_log_intervals: Log of time intervals [length N-1]
+        - sequence_length: Original sequence length N
+        
         item_tuple: (folder_idx, event_idx_in_folder)
         """
         folder_idx, event_idx_in_folder = item_tuple
@@ -195,16 +203,9 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
         grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
 
-        # ------------------------------------------------ tensors + log-normalization
+        # ------------------------------------------------ tensors + time processing
         rt_original = torch.from_numpy(grp_t_np)
         rc_original = torch.from_numpy(grp_c_np)
-
-        if rt_original.numel():  # non-empty
-            nt_original = torch.log1p(rt_original)
-            nq_original = torch.log1p(rc_original)
-        else:
-            nt_original = torch.empty(0, dtype=torch.float32)
-            nq_original = torch.empty(0, dtype=torch.float32)
 
         # if max_seq_len_padding is exceeded, randomly sample, count-weighted
         if self.max_seq_len_padding is not None and rt_original.numel() > self.max_seq_len_padding:
@@ -213,25 +214,37 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             idx = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
             # Sort indices to preserve time order
             idx, _ = torch.sort(idx)
-            nt_original = nt_original[idx]
-            nq_original = nq_original[idx]
             rt_original = rt_original[idx]
             rc_original = rc_original[idx]
 
+        # Process time data according to new requirements
+        if rt_original.numel() == 0:
+            # Empty sequence case
+            return {
+                "q_sequence": torch.empty(0, dtype=torch.float32),
+                "time_input_features": torch.empty(0, dtype=torch.float32),
+                "target_log_first_abs_time": torch.tensor(0.0, dtype=torch.float32),
+                "target_log_intervals": torch.empty(0, dtype=torch.float32),
+                "sequence_length": torch.tensor(0, dtype=torch.long),
+                "sensor_pos": sensor_pos,
+            }
+        
+        # Process absolute times and charges
+        t_abs = rt_original  # These are already sorted from reduce_by_window
+        q_sequence = torch.log1p(rc_original)  # Log-normalized charges
+        
+        # Use utility function to process time sequence
+        time_input_features, target_log_first_abs_time, target_log_intervals = process_time_sequence_for_intervals(t_abs)
+
         current_sequence_length = rt_original.numel()
-        # No EOS token integration needed anymore
-        times_for_model = nt_original
-        counts_for_model = nq_original
-        # eos_target is no longer needed
 
         return {
-            "times":           times_for_model,
-            "counts":          counts_for_model,
-            "raw_times":       rt_original,
-            "raw_counts":      rc_original,
-            "sequence_length": torch.tensor(current_sequence_length, dtype=torch.long), # Actual number of (t,q) pairs
-            # "eos_target":      eos_target, # Removed
-            "sensor_pos":      sensor_pos,
+            "q_sequence": q_sequence,
+            "time_input_features": time_input_features,
+            "target_log_first_abs_time": target_log_first_abs_time,
+            "target_log_intervals": target_log_intervals,
+            "sequence_length": torch.tensor(current_sequence_length, dtype=torch.long),
+            "sensor_pos": sensor_pos,
         }
         
 def reduce_by_window(arr, window_size):

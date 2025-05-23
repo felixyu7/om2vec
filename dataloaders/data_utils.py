@@ -8,6 +8,48 @@ from torch.utils.data import Sampler, Dataset
 from typing import List, Dict, Tuple # Added Tuple
 import pyarrow.parquet as pq # Added import
 
+def process_time_sequence_for_intervals(t_abs: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Process absolute time sequence to create time intervals and input features.
+    
+    Args:
+        t_abs: Tensor of absolute times [t_abs_1, t_abs_2, ..., t_abs_N]
+        eps: Small epsilon for log safety
+    
+    Returns:
+        time_input_features: Log-normalized time features for encoder input [length N]
+        target_log_first_abs_time: Log of first absolute time [scalar]
+        target_log_intervals: Log of time intervals [length N-1]
+    """
+    if t_abs.numel() == 0:
+        return (torch.empty(0, dtype=torch.float32),
+                torch.tensor(0.0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32))
+    
+    # Get first absolute time
+    first_abs_t = t_abs[0].item()
+    target_log_first_abs_time = torch.log(first_abs_t + eps)
+    
+    # Create shifted times: t_shifted_i = t_abs_i - first_abs_t
+    t_shifted = t_abs - first_abs_t
+    
+    # Calculate relative time intervals: t_interval_j = t_shifted_{j+1} - t_shifted_j
+    if len(t_shifted) > 1:
+        t_intervals = t_shifted[1:] - t_shifted[:-1]  # Length N-1
+        target_log_intervals = torch.log(t_intervals + eps)
+    else:
+        target_log_intervals = torch.empty(0, dtype=torch.float32)
+    
+    # Create time input features for encoder
+    time_input_features = torch.zeros_like(t_shifted)
+    # First hit: use log(eps) for t_shifted_1 = 0
+    time_input_features[0] = torch.log(torch.tensor(eps))
+    # Remaining hits: log(t_shifted_i) for i > 1
+    if len(t_shifted) > 1:
+        time_input_features[1:] = torch.log(t_shifted[1:] + eps)
+    
+    return time_input_features, target_log_first_abs_time, target_log_intervals
+
 def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> Tuple[List[List[str]], List[List[int]]]:
     """
     Get file names from directories within specified ranges, grouped by directory.
@@ -103,36 +145,32 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     """
     Collate after all per-item shortening is done in __getitem__.
     Pads to the longest sequence in the mini-batch and builds attention-mask.
+    Now handles new time interval prediction structure.
     """
 
     bsz      = len(batch)
-    device   = batch[0]["times"].device
-    dtype    = batch[0]["times"].dtype
+    device   = batch[0]["q_sequence"].device
+    dtype    = batch[0]["q_sequence"].dtype
 
     seq_lens = torch.tensor([it["sequence_length"].item() for it in batch],
                             dtype=torch.long, device=device)
     max_len  = int(seq_lens.max().item()) if bsz else 0
+    max_interval_len = max(it["target_log_intervals"].numel() for it in batch) if bsz else 0
 
     # ---------- pre-allocate padded buffers ----------
     shape      = (bsz, max_len)
     zeros_f32  = dict(size=shape, dtype=dtype, device=device)
 
-    times_pad   = torch.zeros(**zeros_f32)
-    counts_pad  = torch.zeros_like(times_pad)
-    raw_t_pad   = torch.zeros_like(times_pad)
-    raw_c_pad   = torch.zeros_like(times_pad)
+    # New structure fields
+    q_sequence_pad = torch.zeros(**zeros_f32)
+    time_input_features_pad = torch.zeros_like(q_sequence_pad)
+    target_log_intervals_pad = torch.zeros(bsz, max_interval_len, dtype=dtype, device=device)
+    target_log_first_abs_time = torch.stack([item["target_log_first_abs_time"] for item in batch])
+    
     attn_mask   = torch.ones(bsz, max_len, dtype=torch.bool, device=device)
-        
-    # eos_target is no longer used by the model or dataset __getitem__
-    # eos_targets = [item["eos_target"] for item in batch if "eos_target" in item] # Defensively check
-    # eos_target_padded = torch.zeros(bsz, max_len, dtype=torch.float32, device=device)
-    # if eos_targets: # Only process if eos_target was actually present
-    #     for row, eos in enumerate(eos_targets):
-    #         L = eos.shape[0]
-    #         eos_target_padded[row, :L] = eos
+    interval_mask = torch.ones(bsz, max_interval_len, dtype=torch.bool, device=device)
     
     # Handle sensor_pos (fixed size per item, so just stack)
-    # Assuming sensor_pos is a 1D tensor of 3 elements
     sensor_pos_list = [item["sensor_pos"] for item in batch if "sensor_pos" in item]
     if sensor_pos_list:
         sensor_pos_batched = torch.stack(sensor_pos_list, dim=0)
@@ -145,26 +183,30 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         L = int(item["sequence_length"])
         if L == 0:
             continue
-        times_pad[row,  :L] = item["times"]
-        counts_pad[row, :L] = item["counts"]
-        # For raw_times and raw_counts, use their actual length as they don't include EOS
-        L_raw_times = item["raw_times"].numel()
-        if L_raw_times > 0:
-            raw_t_pad[row,  :L_raw_times] = item["raw_times"]
+            
+        # New structure
+        q_sequence_pad[row, :L] = item["q_sequence"]
+        time_input_features_pad[row, :L] = item["time_input_features"]
         
-        L_raw_counts = item["raw_counts"].numel() # Should be same as L_raw_times
-        if L_raw_counts > 0:
-            raw_c_pad[row,  :L_raw_counts] = item["raw_counts"]
-        attn_mask[row,  :L] = False  # False = valid, True = padding
+        # Handle intervals (length N-1)
+        L_intervals = item["target_log_intervals"].numel()
+        if L_intervals > 0:
+            target_log_intervals_pad[row, :L_intervals] = item["target_log_intervals"]
+            interval_mask[row, :L_intervals] = False
+        
+        attn_mask[row, :L] = False  # False = valid, True = padding
     
     return {
-        "times_padded":     times_pad,
-        "counts_padded":    counts_pad,
-        "raw_times_padded": raw_t_pad,
-        "raw_counts_padded": raw_c_pad,
-        "attention_mask":   attn_mask,
+        # New structure for time interval prediction
+        "q_sequence_padded": q_sequence_pad,
+        "time_input_features_padded": time_input_features_pad,
+        "target_log_first_abs_time": target_log_first_abs_time,
+        "target_log_intervals_padded": target_log_intervals_pad,
+        "interval_mask": interval_mask,
+        
+        "attention_mask": attn_mask,
+        "src_key_padding_mask": attn_mask,  # Alias for consistency
         "sequence_lengths": seq_lens,
-        # "eos_target_padded": eos_target_padded, # Removed
         "sensor_pos_batched": sensor_pos_batched,
     }
 
