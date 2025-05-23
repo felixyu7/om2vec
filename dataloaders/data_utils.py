@@ -28,7 +28,7 @@ def process_time_sequence_for_intervals(t_abs: torch.Tensor, eps: float = 1e-8) 
     
     # Get first absolute time
     first_abs_t = t_abs[0].item()
-    target_log_first_abs_time = torch.log(first_abs_t + eps)
+    target_log_first_abs_time = torch.log(torch.tensor(first_abs_t + eps, dtype=torch.float32))
     
     # Create shifted times: t_shifted_i = t_abs_i - first_abs_t
     t_shifted = t_abs - first_abs_t

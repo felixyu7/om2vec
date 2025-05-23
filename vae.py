@@ -91,16 +91,16 @@ class NT_VAE(pl.LightningModule):
 
         # Length predictor head: outputs log-normalized sequence length
         self.length_predictor = nn.Sequential(
-            nn.Linear(self.hparams.latent_dim, self.hparams.latent_dim // 2),
+            nn.Linear(self.hparams.latent_dim, self.hparams.latent_dim),
             nn.ReLU(),
-            nn.Linear(self.hparams.latent_dim // 2, 1)
+            nn.Linear(self.hparams.latent_dim, 1)
         )
         
         # First absolute time predictor head: outputs log-normalized first absolute time
         self.first_abs_time_predictor = nn.Sequential(
-            nn.Linear(self.hparams.latent_dim, self.hparams.latent_dim // 2),
+            nn.Linear(self.hparams.latent_dim, self.hparams.latent_dim),
             nn.ReLU(),
-            nn.Linear(self.hparams.latent_dim // 2, 1)
+            nn.Linear(self.hparams.latent_dim, 1)
         )
 
         self.beta = 0.
@@ -188,10 +188,10 @@ class NT_VAE(pl.LightningModule):
         
         # Create valid mask for charges
         charge_valid_mask = torch.zeros_like(target_q_sliced, dtype=torch.bool)
-        for i in range(B):
-            actual_len = sequence_lengths[i].item()
-            if actual_len > 0:
-                charge_valid_mask[i, :min(actual_len, len_for_loss)] = True
+        # Create range tensor and compare with sequence lengths
+        range_tensor = torch.arange(len_for_loss, device=device).unsqueeze(0).expand(B, -1)  # (B, len_for_loss)
+        sequence_lengths_expanded = sequence_lengths.unsqueeze(1).expand(-1, len_for_loss)  # (B, len_for_loss)
+        charge_valid_mask = (range_tensor < sequence_lengths_expanded) & (sequence_lengths_expanded > 0)
         charge_valid_mask = charge_valid_mask & (~src_mask_sliced)
         
         if charge_valid_mask.any():
