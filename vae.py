@@ -55,8 +55,9 @@ class NT_VAE(pl.LightningModule):
         self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
 
         # --- Cross-Attention Decoder with Memory Bank ---
+        # Memory bank is now per-position up to max_seq_len_padding
         self.memory_bank = nn.Parameter(
-            torch.randn(self.hparams.memory_bank_size, self.hparams.embed_dim) * 0.02
+            torch.randn(self.hparams.max_seq_len_padding, self.hparams.embed_dim) * 0.02
         )
 
         # Decoder projections now use full latent_dim
@@ -65,6 +66,10 @@ class NT_VAE(pl.LightningModule):
             self.hparams.embed_dim,
             self.hparams.transformer_decoder_dropout,
             max_len=self.hparams.max_seq_len_padding
+        )
+        # Learnable query embeddings for the decoder input
+        self.decoder_query_embeds = nn.Parameter(
+            torch.randn(self.hparams.max_seq_len_padding, self.hparams.embed_dim) * 0.02
         )
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -146,25 +151,34 @@ class NT_VAE(pl.LightningModule):
         B, S_padded = target_log_t.shape
         device = target_log_t.device
 
-        # Get full sequence predictions from the non-autoregressive decoder
-        predicted_log_tq = self._decode_non_autoregressive(z) # (B, max_seq_len_padding, 2)
+        # Get sequence predictions using the decode method, respecting true_sequence_lengths
+        # self.decode returns (B, L_max_in_batch, 2) where L_max_in_batch is determined by true_sequence_lengths
+        predicted_log_tq_decoded = self.decode(z, true_sequence_lengths=true_sequence_lengths) # (B, L_batch_max, 2)
 
-        # Slice predictions to match batch's S_padded length for loss calculation
-        pred_log_t_batch = predicted_log_tq[..., 0][:, :S_padded]  # (B, S_padded)
-        pred_log_q_batch = predicted_log_tq[..., 1][:, :S_padded]  # (B, S_padded)
+        # Ensure predicted_log_tq_decoded is sliced or padded to match S_padded for consistent loss calculation
+        len_for_loss = min(predicted_log_tq_decoded.shape[1], S_padded)
 
-        # Mask for actual data points based on true_sequence_lengths
-        data_points_mask = torch.zeros_like(target_log_t, dtype=torch.bool) # (B, S_padded)
+        pred_log_t_batch = predicted_log_tq_decoded[:, :len_for_loss, 0]  # (B, len_for_loss)
+        pred_log_q_batch = predicted_log_tq_decoded[:, :len_for_loss, 1]  # (B, len_for_loss)
+        
+        # Target needs to be sliced to len_for_loss as well for comparison
+        target_log_t_sliced = target_log_t[:, :len_for_loss]
+        target_log_q_sliced = target_log_q[:, :len_for_loss]
+
+        # Mask for actual data points based on true_sequence_lengths, applied to the sliced tensors
+        data_points_mask = torch.zeros_like(target_log_t_sliced, dtype=torch.bool) # (B, len_for_loss)
         for i in range(B):
             actual_len = true_sequence_lengths[i].item()
             if actual_len > 0:
                 data_points_mask[i, :actual_len] = True
 
-        valid_loss_mask = data_points_mask & (~attention_mask)
+        # attention_mask is (B, S_padded), slice it too
+        attention_mask_sliced = attention_mask[:, :len_for_loss]
+        valid_loss_mask = data_points_mask & (~attention_mask_sliced)
 
         if valid_loss_mask.any():
-            mse_t = F.mse_loss(pred_log_t_batch[valid_loss_mask], target_log_t[valid_loss_mask])
-            mse_q = F.mse_loss(pred_log_q_batch[valid_loss_mask], target_log_q[valid_loss_mask])
+            mse_t = F.mse_loss(pred_log_t_batch[valid_loss_mask], target_log_t_sliced[valid_loss_mask])
+            mse_q = F.mse_loss(pred_log_q_batch[valid_loss_mask], target_log_q_sliced[valid_loss_mask])
         else:
             mse_t = torch.tensor(0.0, device=device, requires_grad=True)
             mse_q = torch.tensor(0.0, device=device, requires_grad=True)
@@ -180,15 +194,29 @@ class NT_VAE(pl.LightningModule):
 
         # 1. Project z_content and expand to sequence length
         z_dec_input = self.decoder_z_proj(z_content) # (B, embed_dim)
-        decoder_input_sequence = z_dec_input.unsqueeze(1).repeat(1, self.hparams.max_seq_len_padding, 1)
 
-        # 2. Add positional encoding to decoder input (queries)
+        # Create decoder input sequence:
+        # Start with learnable query embeddings (position-specific)
+        base_queries = self.decoder_query_embeds.unsqueeze(0).expand(B, -1, -1) # (B, max_seq_len_padding, embed_dim)
+        # Add z-conditioning (broadcast z_dec_input to each position)
+        z_conditioning = z_dec_input.unsqueeze(1).expand(-1, self.hparams.max_seq_len_padding, -1) # (B, max_seq_len_padding, embed_dim)
+        decoder_input_sequence = base_queries + z_conditioning
+        
+        # 2. Add sinusoidal positional encoding on top
         decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence) # (B, max_seq_len_padding, embed_dim)
 
-        # 3. Prepare memory for cross-attention
-        z_expanded = z_dec_input.unsqueeze(1) # (B, 1, embed_dim)
-        memory_bank_expanded = self.memory_bank.unsqueeze(0).expand(B, -1, -1) # (B, memory_bank_size, embed_dim)
-        memory = torch.cat([z_expanded, memory_bank_expanded], dim=1) # (B, 1 + memory_bank_size, embed_dim)
+        # 3. Prepare memory for cross-attention (already updated in previous step)
+        # z_dec_input is (B, embed_dim)
+        # self.memory_bank is (max_seq_len_padding, embed_dim)
+
+        # Expand z_dec_input to be (B, max_seq_len_padding, embed_dim)
+        # so it can be added to the memory bank for conditioning.
+        z_conditioned_memory = self.memory_bank.unsqueeze(0).expand(B, -1, -1) # (B, max_seq_len_padding, embed_dim)
+        z_dec_input_expanded_for_memory = z_dec_input.unsqueeze(1).expand(-1, self.hparams.max_seq_len_padding, -1) # (B, max_seq_len_padding, embed_dim)
+        
+        # Add z conditioning to the memory bank.
+        # This makes the memory specific to the input z, while still being position-aware.
+        memory = z_conditioned_memory + z_dec_input_expanded_for_memory # (B, max_seq_len_padding, embed_dim)
 
         # 4. Pass through cross-attention decoder
         transformed_sequence = self.decoder_transformer(
@@ -261,7 +289,11 @@ class NT_VAE(pl.LightningModule):
 
     def kl_divergence(self, mu, logvar, free_bits_lambda=0.1):
         kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar)
-        kl_per_dim = F.relu(kl_per_dim - free_bits_lambda)
+        # Apply free bits: ensure KL per dimension is at least free_bits_lambda
+        # This ensures gradients flow even for dimensions with small KL.
+        # Note: If free_bits_lambda is 0, this is equivalent to the original KL.
+        # If free_bits_lambda is positive, it encourages KL to be at least that value.
+        kl_per_dim = torch.maximum(kl_per_dim, torch.full_like(kl_per_dim, free_bits_lambda))
         return kl_per_dim.sum(dim=1).mean()
 
     def training_step(self, batch, batch_idx):
