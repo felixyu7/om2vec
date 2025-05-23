@@ -176,10 +176,14 @@ class NT_VAE(pl.LightningModule):
         
         # Extract masks
         # For loss calculation, masks should be True for VALID elements.
-        # Assuming batch's src_key_padding_mask/attention_mask is True for VALID, False for PADDING.
-        src_mask_for_loss = batch.get('src_key_padding_mask', batch['attention_mask']).bool()
-        # Assuming batch's interval_mask is True for VALID, False for PADDING.
-        interval_mask_for_loss = batch['interval_mask'].bool()
+        # Batch's src_key_padding_mask/attention_mask is False for VALID, True for PADDING (from data_utils.py).
+        # So, we invert it for loss calculation.
+        _src_mask_from_batch = batch.get('src_key_padding_mask', batch['attention_mask']).bool() # False=valid, True=pad
+        src_mask_for_loss = ~_src_mask_from_batch  # Now True=valid, False=pad
+        # Batch's interval_mask is False for VALID, True for PADDING (from data_utils.py).
+        # So, we invert it for loss calculation.
+        _interval_mask_from_batch = batch['interval_mask'].bool() # False=valid, True=pad
+        interval_mask_for_loss = ~_interval_mask_from_batch # Now True=valid, False=pad
         
         # 1. Charge reconstruction loss
         B, S_padded = target_q_sequence.shape
@@ -337,10 +341,10 @@ class NT_VAE(pl.LightningModule):
     def forward(self, batch):
         q_sequence_padded = batch['q_sequence_padded'].float()
         time_input_features_padded = batch['time_input_features_padded'].float()
-        # Assuming batch mask (src_key_padding_mask/attention_mask) is True for VALID tokens, False for PADDING
-        raw_src_key_padding_mask = batch.get('src_key_padding_mask', batch['attention_mask']).bool()
-        # PyTorch Transformer's src_key_padding_mask expects True for PADDING tokens
-        transformer_src_key_padding_mask = ~raw_src_key_padding_mask
+        # Batch's src_key_padding_mask/attention_mask is False for VALID, True for PADDING (from data_utils.py).
+        # PyTorch Transformer's src_key_padding_mask also expects True for PADDING tokens.
+        # So, the mask from batch can be used directly.
+        transformer_src_key_padding_mask = batch.get('src_key_padding_mask', batch['attention_mask']).bool()
         sensor_pos_batched = batch['sensor_pos_batched'].float() # (B, 3)
 
         mu, logvar = self.encode(q_sequence_padded, time_input_features_padded, transformer_src_key_padding_mask, sensor_pos_batched)
