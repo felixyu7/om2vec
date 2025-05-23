@@ -175,8 +175,11 @@ class NT_VAE(pl.LightningModule):
         sequence_lengths = batch['sequence_lengths']  # (B,)
         
         # Extract masks
-        src_mask = batch.get('src_key_padding_mask', batch['attention_mask']).bool()  # (B, max_seq_len)
-        interval_mask = batch['interval_mask'].bool()  # (B, max_interval_len)
+        # For loss calculation, masks should be True for VALID elements.
+        # Assuming batch's src_key_padding_mask/attention_mask is True for VALID, False for PADDING.
+        src_mask_for_loss = batch.get('src_key_padding_mask', batch['attention_mask']).bool()
+        # Assuming batch's interval_mask is True for VALID, False for PADDING.
+        interval_mask_for_loss = batch['interval_mask'].bool()
         
         # 1. Charge reconstruction loss
         B, S_padded = target_q_sequence.shape
@@ -184,7 +187,7 @@ class NT_VAE(pl.LightningModule):
         
         pred_q_sliced = pred_q_sequence[:, :len_for_loss]
         target_q_sliced = target_q_sequence[:, :len_for_loss]
-        src_mask_sliced = src_mask[:, :len_for_loss]
+        src_mask_for_loss_sliced = src_mask_for_loss[:, :len_for_loss]
         
         # Create valid mask for charges
         charge_valid_mask = torch.zeros_like(target_q_sliced, dtype=torch.bool)
@@ -192,26 +195,29 @@ class NT_VAE(pl.LightningModule):
         range_tensor = torch.arange(len_for_loss, device=device).unsqueeze(0).expand(B, -1)  # (B, len_for_loss)
         sequence_lengths_expanded = sequence_lengths.unsqueeze(1).expand(-1, len_for_loss)  # (B, len_for_loss)
         charge_valid_mask = (range_tensor < sequence_lengths_expanded) & (sequence_lengths_expanded > 0)
-        charge_valid_mask = charge_valid_mask & (~src_mask_sliced)
+        # charge_valid_mask is True for valid elements based on sequence_lengths.
+        # src_mask_for_loss_sliced is also True for valid elements from input mask.
+        charge_valid_mask = charge_valid_mask & src_mask_for_loss_sliced
         
         if charge_valid_mask.any():
             charge_loss = F.smooth_l1_loss(pred_q_sliced[charge_valid_mask], target_q_sliced[charge_valid_mask])
         else:
-            charge_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            charge_loss = torch.tensor(0.0, device=device) # No requires_grad=True for non-graph-connected tensor
         
         # 2. Interval reconstruction loss
         interval_len_for_loss = min(pred_log_intervals.shape[1], target_log_intervals.shape[1])
         pred_intervals_sliced = pred_log_intervals[:, :interval_len_for_loss]
         target_intervals_sliced = target_log_intervals[:, :interval_len_for_loss]
-        interval_mask_sliced = interval_mask[:, :interval_len_for_loss]
+        interval_mask_for_loss_sliced = interval_mask_for_loss[:, :interval_len_for_loss]
         
         # Valid intervals mask (intervals exist for sequences of length > 1)
-        interval_valid_mask = ~interval_mask_sliced
+        # interval_mask_for_loss_sliced is True for valid intervals.
+        interval_valid_mask = interval_mask_for_loss_sliced
         
         if interval_valid_mask.any():
             interval_loss = F.smooth_l1_loss(pred_intervals_sliced[interval_valid_mask], target_intervals_sliced[interval_valid_mask])
         else:
-            interval_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            interval_loss = torch.tensor(0.0, device=device) # No requires_grad=True for non-graph-connected tensor
         
         # 3. First absolute time loss
         first_time_loss = F.smooth_l1_loss(pred_log_first_abs_time, target_log_first_abs_time)
@@ -331,10 +337,13 @@ class NT_VAE(pl.LightningModule):
     def forward(self, batch):
         q_sequence_padded = batch['q_sequence_padded'].float()
         time_input_features_padded = batch['time_input_features_padded'].float()
-        src_key_padding_mask = batch.get('src_key_padding_mask', batch['attention_mask']).bool()
+        # Assuming batch mask (src_key_padding_mask/attention_mask) is True for VALID tokens, False for PADDING
+        raw_src_key_padding_mask = batch.get('src_key_padding_mask', batch['attention_mask']).bool()
+        # PyTorch Transformer's src_key_padding_mask expects True for PADDING tokens
+        transformer_src_key_padding_mask = ~raw_src_key_padding_mask
         sensor_pos_batched = batch['sensor_pos_batched'].float() # (B, 3)
 
-        mu, logvar = self.encode(q_sequence_padded, time_input_features_padded, src_key_padding_mask, sensor_pos_batched)
+        mu, logvar = self.encode(q_sequence_padded, time_input_features_padded, transformer_src_key_padding_mask, sensor_pos_batched)
         z = self.reparameterize(mu, logvar) # (B, latent_dim)
 
         # Predict length and first absolute time
@@ -363,11 +372,21 @@ class NT_VAE(pl.LightningModule):
         mu, logvar = predictions['mu'], predictions['logvar']
 
         if not hasattr(self, "steps_initialized") or not self.steps_initialized:
+            steps_per_epoch = 100  # Default steps per epoch
             if self.trainer and hasattr(self.trainer, 'train_dataloader') and self.trainer.train_dataloader:
-                steps_per_epoch = len(self.trainer.train_dataloader)
-                self.total_steps_for_beta_annealing = self.hparams.beta_peak_epoch * steps_per_epoch
-            else:
-                self.total_steps_for_beta_annealing = self.hparams.beta_peak_epoch * 100
+                if hasattr(self.trainer.train_dataloader, "__len__"):
+                    try:
+                        current_dataloader_len = len(self.trainer.train_dataloader)
+                        if current_dataloader_len > 0:
+                            steps_per_epoch = current_dataloader_len
+                        # If len is 0 or less, default of 100 is used.
+                    except TypeError:
+                        # len() failed or not supported, default of 100 is used.
+                        pass
+                # If no __len__ attribute, default of 100 is used.
+            self.total_steps_for_beta_annealing = self.hparams.beta_peak_epoch * steps_per_epoch
+            # Note: self.total_steps_for_beta_annealing can be 0 if beta_peak_epoch is 0.
+            # This is handled by the check `if self.total_steps_for_beta_annealing > 0:` later in the code (line 380).
             self.steps_initialized = True
 
         # Compute reconstruction losses
