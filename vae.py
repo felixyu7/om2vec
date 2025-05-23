@@ -20,10 +20,9 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
-                 memory_bank_size=256,
                  batch_size=32,
                  lr=1e-3,
-                 lr_schedule=[2, 20],
+                 lr_schedule=[10, 1e-6],
                  weight_decay=1e-5
                  ):
         super().__init__()
@@ -54,14 +53,9 @@ class NT_VAE(pl.LightningModule):
         self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
         self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
 
-        # --- Cross-Attention Decoder with Memory Bank ---
-        # Memory bank is now per-position up to max_seq_len_padding
-        self.memory_bank = nn.Parameter(
-            torch.randn(self.hparams.max_seq_len_padding, self.hparams.embed_dim) * 0.02
-        )
-
-        # Decoder projections now use full latent_dim
-        self.decoder_z_proj = nn.Linear(self.hparams.latent_dim, self.hparams.embed_dim)
+        # --- Cross-Attention Decoder with Latent Token ---
+        # Project latent z to a single memory token for cross-attention
+        self.decoder_z_to_memory = nn.Linear(self.hparams.latent_dim, self.hparams.embed_dim)
         self.decoder_pos_encoder = PositionalEncoding(
             self.hparams.embed_dim,
             self.hparams.transformer_decoder_dropout,
@@ -88,11 +82,11 @@ class NT_VAE(pl.LightningModule):
 
         self.decoder_out_proj = nn.Linear(self.hparams.embed_dim, 2)
 
-        # Length predictor head: simple MLP
+        # Length predictor head: outputs log-normalized sequence length
         self.length_predictor = nn.Sequential(
             nn.Linear(self.hparams.latent_dim, self.hparams.latent_dim // 2),
             nn.ReLU(),
-            nn.Linear(self.hparams.latent_dim // 2, self.hparams.max_seq_len_padding)
+            nn.Linear(self.hparams.latent_dim // 2, 1)
         )
 
         self.beta = 0.
@@ -153,7 +147,7 @@ class NT_VAE(pl.LightningModule):
 
         # Get sequence predictions using the decode method, respecting true_sequence_lengths
         # self.decode returns (B, L_max_in_batch, 2) where L_max_in_batch is determined by true_sequence_lengths
-        predicted_log_tq_decoded = self.decode(z, true_sequence_lengths=true_sequence_lengths) # (B, L_batch_max, 2)
+        predicted_log_tq_decoded = self.decode(z, true_seq_len=true_sequence_lengths) # (B, L_batch_max, 2)
 
         # Ensure predicted_log_tq_decoded is sliced or padded to match S_padded for consistent loss calculation
         len_for_loss = min(predicted_log_tq_decoded.shape[1], S_padded)
@@ -177,8 +171,8 @@ class NT_VAE(pl.LightningModule):
         valid_loss_mask = data_points_mask & (~attention_mask_sliced)
 
         if valid_loss_mask.any():
-            mse_t = F.mse_loss(pred_log_t_batch[valid_loss_mask], target_log_t_sliced[valid_loss_mask])
-            mse_q = F.mse_loss(pred_log_q_batch[valid_loss_mask], target_log_q_sliced[valid_loss_mask])
+            mse_t = F.smooth_l1_loss(pred_log_t_batch[valid_loss_mask], target_log_t_sliced[valid_loss_mask])
+            mse_q = F.smooth_l1_loss(pred_log_q_batch[valid_loss_mask], target_log_q_sliced[valid_loss_mask])
         else:
             mse_t = torch.tensor(0.0, device=device, requires_grad=True)
             mse_q = torch.tensor(0.0, device=device, requires_grad=True)
@@ -189,43 +183,25 @@ class NT_VAE(pl.LightningModule):
         B = z.size(0)
         device = z.device
 
-        # Use full z as content
-        z_content = z # (B, latent_dim)
+        # 1. Project z to a single memory token for cross-attention
+        memory_token = self.decoder_z_to_memory(z)  # (B, embed_dim)
+        memory_token = memory_token.unsqueeze(1)  # (B, 1, embed_dim)
 
-        # 1. Project z_content and expand to sequence length
-        z_dec_input = self.decoder_z_proj(z_content) # (B, embed_dim)
-
-        # Create decoder input sequence:
-        # Start with learnable query embeddings (position-specific)
-        base_queries = self.decoder_query_embeds.unsqueeze(0).expand(B, -1, -1) # (B, max_seq_len_padding, embed_dim)
-        # Add z-conditioning (broadcast z_dec_input to each position)
-        z_conditioning = z_dec_input.unsqueeze(1).expand(-1, self.hparams.max_seq_len_padding, -1) # (B, max_seq_len_padding, embed_dim)
-        decoder_input_sequence = base_queries + z_conditioning
+        # 2. Create decoder input sequence using learnable query embeddings
+        decoder_input_sequence = self.decoder_query_embeds.unsqueeze(0).expand(B, -1, -1)  # (B, max_seq_len_padding, embed_dim)
         
-        # 2. Add sinusoidal positional encoding on top
-        decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence) # (B, max_seq_len_padding, embed_dim)
-
-        # 3. Prepare memory for cross-attention (already updated in previous step)
-        # z_dec_input is (B, embed_dim)
-        # self.memory_bank is (max_seq_len_padding, embed_dim)
-
-        # Expand z_dec_input to be (B, max_seq_len_padding, embed_dim)
-        # so it can be added to the memory bank for conditioning.
-        z_conditioned_memory = self.memory_bank.unsqueeze(0).expand(B, -1, -1) # (B, max_seq_len_padding, embed_dim)
-        z_dec_input_expanded_for_memory = z_dec_input.unsqueeze(1).expand(-1, self.hparams.max_seq_len_padding, -1) # (B, max_seq_len_padding, embed_dim)
-        
-        # Add z conditioning to the memory bank.
-        # This makes the memory specific to the input z, while still being position-aware.
-        memory = z_conditioned_memory + z_dec_input_expanded_for_memory # (B, max_seq_len_padding, embed_dim)
+        # 3. Add sinusoidal positional encoding to decoder input
+        decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence)  # (B, max_seq_len_padding, embed_dim)
 
         # 4. Pass through cross-attention decoder
+        # Memory is just the single projected latent token
         transformed_sequence = self.decoder_transformer(
             tgt=decoder_input_sequence,
-            memory=memory
-        ) # (B, max_seq_len_padding, embed_dim)
+            memory=memory_token
+        )  # (B, max_seq_len_padding, embed_dim)
 
         # 5. Project to output (log_t, log_q)
-        predicted_log_tq = self.decoder_out_proj(transformed_sequence) # (B, max_seq_len_padding, 2)
+        predicted_log_tq = self.decoder_out_proj(transformed_sequence)  # (B, max_seq_len_padding, 2)
         return predicted_log_tq
 
     def decode(self, z, true_seq_len=None):
@@ -245,8 +221,8 @@ class NT_VAE(pl.LightningModule):
             predicted_lengths = true_seq_len.long().clamp(min=1, max=self.hparams.max_seq_len_padding)
         else:
             # Predict length from z using the length predictor head (inference)
-            length_logits = self.length_predictor(z) # (B, max_seq_len_padding)
-            predicted_lengths = torch.argmax(length_logits, dim=1) + 1 # lengths in [1, max_seq_len_padding]
+            log_length = self.length_predictor(z).squeeze(-1)  # (B,)
+            predicted_lengths = torch.exp(log_length).round().long()  # Convert back from log space
             predicted_lengths = predicted_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding)
 
         # Get full sequence predictions (log_t, log_q)
@@ -287,13 +263,8 @@ class NT_VAE(pl.LightningModule):
 
         return mu, logvar, z
 
-    def kl_divergence(self, mu, logvar, free_bits_lambda=0.1):
+    def kl_divergence(self, mu, logvar):
         kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar)
-        # Apply free bits: ensure KL per dimension is at least free_bits_lambda
-        # This ensures gradients flow even for dimensions with small KL.
-        # Note: If free_bits_lambda is 0, this is equivalent to the original KL.
-        # If free_bits_lambda is positive, it encourages KL to be at least that value.
-        kl_per_dim = torch.maximum(kl_per_dim, torch.full_like(kl_per_dim, free_bits_lambda))
         return kl_per_dim.sum(dim=1).mean()
 
     def training_step(self, batch, batch_idx):
@@ -324,11 +295,11 @@ class NT_VAE(pl.LightningModule):
         else:
             self.beta = self.hparams.beta_factor
 
-        # Length prediction loss (classification)
-        # Target: true_sequence_lengths in [1, max_seq_len_padding] -> shift to [0, max_seq_len_padding-1]
-        length_logits = self.length_predictor(z) # (B, max_seq_len_padding)
-        length_targets = true_sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding) - 1
-        length_loss = F.cross_entropy(length_logits, length_targets)
+        # Length prediction loss (regression with MSE)
+        # Target: log-normalized sequence lengths
+        predicted_log_lengths = self.length_predictor(z).squeeze(-1)  # (B,)
+        target_log_lengths = torch.log(true_sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding).float())  # (B,)
+        length_loss = F.smooth_l1_loss(predicted_log_lengths, target_log_lengths)
 
         loss = reconstruction_loss + (self.beta * kl_loss) + length_loss
         self.current_train_iter += 1
@@ -353,9 +324,9 @@ class NT_VAE(pl.LightningModule):
         )
         reconstruction_loss = mse_t + mse_q
         kl_loss = self.kl_divergence(mu, logvar)
-        length_logits = self.length_predictor(z)
-        length_targets = true_sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding) - 1
-        length_loss = F.cross_entropy(length_logits, length_targets)
+        predicted_log_lengths = self.length_predictor(z).squeeze(-1)  # (B,)
+        target_log_lengths = torch.log(true_sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding).float())  # (B,)
+        length_loss = F.smooth_l1_loss(predicted_log_lengths, target_log_lengths)
 
         loss = reconstruction_loss + (self.beta * kl_loss) + length_loss
         self.log("val_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
@@ -376,9 +347,9 @@ class NT_VAE(pl.LightningModule):
         )
         reconstruction_loss = mse_t + mse_q
         kl_loss = self.kl_divergence(mu, logvar)
-        length_logits = self.length_predictor(z)
-        length_targets = true_sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding) - 1
-        length_loss = F.cross_entropy(length_logits, length_targets)
+        predicted_log_lengths = self.length_predictor(z).squeeze(-1)  # (B,)
+        target_log_lengths = torch.log(true_sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding).float())  # (B,)
+        length_loss = F.smooth_l1_loss(predicted_log_lengths, target_log_lengths)
 
         loss = reconstruction_loss + (self.beta * kl_loss) + length_loss
         self.log("test_loss", loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
@@ -389,4 +360,9 @@ class NT_VAE(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.hparams.lr_schedule[0],
+            eta_min=self.hparams.lr_schedule[1]
+        )
+        return [optimizer], [scheduler]
