@@ -303,11 +303,10 @@ class NT_VAE(pl.LightningModule):
 
         if not inference:
             # Only return what's needed for loss calculation when inference is False
+            # Only return logits; masks are applied internally to logits
             return {
                 'charge_logits': masked_charge_scores,
-                'interval_logits': masked_interval_scores,
-                'charge_valid_mask': valid_mask,
-                'interval_valid_mask': interval_valid_mask
+                'interval_logits': masked_interval_scores
             }
         else:
             output_tq_pairs = []
@@ -372,8 +371,6 @@ class NT_VAE(pl.LightningModule):
             'logvar': logvar,
             'charge_logits': decoded_output['charge_logits'],
             'interval_logits': decoded_output['interval_logits'],
-            'charge_valid_mask': decoded_output['charge_valid_mask'],
-            'interval_valid_mask': decoded_output['interval_valid_mask'],
             'original_charges_log_norm_padded': charges_log_norm_padded, # Target for charge recon
             'original_intervals_log_norm_padded': encoder_time_features_target, # Target for interval recon
             'original_lengths': original_lengths # For unpadding targets in loss
@@ -388,8 +385,7 @@ class NT_VAE(pl.LightningModule):
         original_intervals_log_norm_padded = forward_output['original_intervals_log_norm_padded']
         charge_logits = forward_output['charge_logits']
         interval_logits = forward_output['interval_logits']
-        pred_charge_valid_mask = forward_output['charge_valid_mask'] # Mask for predicted sequence based on z
-        pred_interval_valid_mask = forward_output['interval_valid_mask'] # Mask for predicted intervals based on z
+        # pred_charge_valid_mask and pred_interval_valid_mask are implicitly handled by logits being -inf
         original_lengths = forward_output['original_lengths'] # Actual lengths of input sequences
 
         device = mu_full.device
@@ -462,27 +458,20 @@ class NT_VAE(pl.LightningModule):
         
         charge_ce_token_wise = -torch.sum(target_charge_probs * log_softmax_charge_logits, dim=-1) # (B, max_len)
         
-        # Mask the loss by where the decoder was allowed to make predictions
-        masked_charge_ce = charge_ce_token_wise * pred_charge_valid_mask.float()
-        
-        valid_charge_preds_count = pred_charge_valid_mask.sum()
-        if valid_charge_preds_count > 0:
-            charge_recon_loss = masked_charge_ce.sum() / valid_charge_preds_count
-        else:
-            charge_recon_loss = torch.tensor(0.0, device=device)
+        # The pred_charge_valid_mask is incorporated into charge_logits (masked with -inf).
+        # Target_charge_probs are 0 for padded target positions.
+        # So, the sum correctly computes CE for valid regions.
+        charge_recon_loss = charge_ce_token_wise.mean()
 
         # Interval Reconstruction Loss
-        log_softmax_interval_logits = F.log_softmax(interval_logits, dim=-1)
-        interval_ce_token_wise = -torch.sum(target_interval_probs * log_softmax_interval_logits, dim=-1) # (B, max_len)
-        
-        # Mask the loss by where the decoder was allowed to make interval predictions
-        masked_interval_ce = interval_ce_token_wise * pred_interval_valid_mask.float()
+        log_softmax_interval_logits = F.log_softmax(interval_logits, dim=-1) # Can produce NaNs if interval_logits are all -inf
+        interval_ce_token_wise = -torch.sum(target_interval_probs * log_softmax_interval_logits, dim=-1) # (B,)
 
-        valid_interval_preds_count = pred_interval_valid_mask.sum()
-        if valid_interval_preds_count > 0:
-            interval_recon_loss = masked_interval_ce.sum() / valid_interval_preds_count
-        else:
-            interval_recon_loss = torch.tensor(0.0, device=device)
+        # Handle potential NaNs from log_softmax on all-negative-infinity logits
+        are_interval_logits_all_inf = torch.all(interval_logits == -float('inf'), dim=-1)
+        interval_ce_token_wise[are_interval_logits_all_inf] = 0.0
+        
+        interval_recon_loss = interval_ce_token_wise.mean()
             
         return {
             'kld_loss': kld_loss,
