@@ -80,8 +80,6 @@ if __name__=="__main__":
             "weight_decay": cfg['training_options']['weight_decay'],
             "charge_loss_weight": cfg['model_options']['charge_loss_weight'],
             "interval_loss_weight": cfg['model_options']['interval_loss_weight'],
-            "first_time_loss_weight": cfg['model_options']['first_time_loss_weight'],
-            "length_loss_weight": cfg['model_options']['length_loss_weight'],
         }
 
         net = NT_VAE(**vae_init_args)

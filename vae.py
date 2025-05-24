@@ -294,7 +294,8 @@ class NT_VAE(pl.LightningModule):
         if not torch.all(all_inf_rows):
             # Only apply softmax to rows that have at least one valid position
             valid_rows = ~all_inf_rows
-            interval_probs[valid_rows] = torch.softmax(masked_interval_scores[valid_rows], dim=-1)
+            softmax_result = torch.softmax(masked_interval_scores[valid_rows], dim=-1)
+            interval_probs[valid_rows] = softmax_result.to(interval_probs.dtype)
         # Rows with all -inf remain zero
         
         # Calculate total duration and partition it
@@ -305,7 +306,16 @@ class NT_VAE(pl.LightningModule):
         reconstructed_intervals = interval_probs * total_duration.unsqueeze(-1)  # (B, max_len)
 
         if not inference:
-            return reconstructed_charges, reconstructed_intervals
+            return {
+                'reconstructed_charges': reconstructed_charges,
+                'reconstructed_intervals': reconstructed_intervals,
+                'charge_logits': masked_charge_scores,
+                'interval_logits': masked_interval_scores,
+                'charge_probs': charge_probs,
+                'interval_probs': interval_probs,
+                'charge_valid_mask': valid_mask,
+                'interval_valid_mask': interval_valid_mask
+            }
         else:
             output_tq_pairs = []
             for i in range(B):
@@ -366,7 +376,8 @@ class NT_VAE(pl.LightningModule):
         # Decode
         # When training/evaluating losses, inference is False
         decoded_output = self.decode(z=z, inference=False)
-        reconstructed_charges, reconstructed_intervals = decoded_output
+        reconstructed_charges = decoded_output['reconstructed_charges']
+        reconstructed_intervals = decoded_output['reconstructed_intervals']
         
         # For loss calculation:
         # 'original_charges' are the input log-normalized charges (unpadded by loss function)
@@ -379,6 +390,12 @@ class NT_VAE(pl.LightningModule):
             'logvar': logvar,
             'reconstructed_charges': reconstructed_charges,
             'reconstructed_intervals': reconstructed_intervals,
+            'charge_logits': decoded_output['charge_logits'],
+            'interval_logits': decoded_output['interval_logits'],
+            'charge_probs': decoded_output['charge_probs'],
+            'interval_probs': decoded_output['interval_probs'],
+            'charge_valid_mask': decoded_output['charge_valid_mask'],
+            'interval_valid_mask': decoded_output['interval_valid_mask'],
             'original_charges_log_norm_padded': charges_log_norm_padded, # Target for charge recon
             'original_intervals_log_norm_padded': encoder_time_features_target, # Target for interval recon
             'attention_mask': attention_mask, # For unpadding targets in loss
@@ -413,6 +430,35 @@ class NT_VAE(pl.LightningModule):
         # Vectorized reconstruction losses with proper masking
         # Create masks for valid positions
         max_len = reconstructed_charges.size(1)
+        
+        # Ensure original targets match decoder output size
+        original_charges_size = original_charges_log_norm_padded.size(1)
+        original_intervals_size = original_intervals_log_norm_padded.size(1)
+        
+        # Pad or truncate original charges to match decoder output size
+        if original_charges_size < max_len:
+            # Pad with zeros
+            padding_size = max_len - original_charges_size
+            original_charges_log_norm_padded = torch.cat([
+                original_charges_log_norm_padded,
+                torch.zeros(B, padding_size, device=device, dtype=original_charges_log_norm_padded.dtype)
+            ], dim=1)
+        elif original_charges_size > max_len:
+            # Truncate
+            original_charges_log_norm_padded = original_charges_log_norm_padded[:, :max_len]
+        
+        # Pad or truncate original intervals to match decoder output size
+        if original_intervals_size < max_len:
+            # Pad with zeros
+            padding_size = max_len - original_intervals_size
+            original_intervals_log_norm_padded = torch.cat([
+                original_intervals_log_norm_padded,
+                torch.zeros(B, padding_size, device=device, dtype=original_intervals_log_norm_padded.dtype)
+            ], dim=1)
+        elif original_intervals_size > max_len:
+            # Truncate
+            original_intervals_log_norm_padded = original_intervals_log_norm_padded[:, :max_len]
+        
         range_tensor = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
         charge_valid_mask = range_tensor < original_lengths.unsqueeze(1)
         
