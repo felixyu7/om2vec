@@ -429,7 +429,11 @@ class NT_VAE(pl.LightningModule):
         target_charge_sums = target_charges_unnorm_masked.sum(dim=1, keepdim=True)
         # Avoid division by zero for empty sequences if any (though original_lengths >= 1)
         # If sum is 0 for a valid sequence, probs become 0.
-        target_charge_probs = target_charges_unnorm_masked / (target_charge_sums + 1e-12)
+        target_charge_probs = torch.where(
+            target_charge_sums == 0,
+            torch.zeros_like(target_charges_unnorm_masked),
+            target_charges_unnorm_masked / target_charge_sums
+        )
         target_charge_probs = target_charge_probs.masked_fill(~target_charge_mask, 0.0) # Ensure padded are zero
 
         # 2. Interval Target Probabilities
@@ -442,7 +446,11 @@ class NT_VAE(pl.LightningModule):
         
         target_intervals_unnorm_masked = target_intervals_unnorm.masked_fill(~target_interval_mask, 0.0)
         target_interval_sums = target_intervals_unnorm_masked.sum(dim=1, keepdim=True)
-        target_interval_probs = target_intervals_unnorm_masked / (target_interval_sums + 1e-12)
+        target_interval_probs = torch.where(
+            target_interval_sums == 0,
+            torch.zeros_like(target_intervals_unnorm_masked),
+            target_intervals_unnorm_masked / target_interval_sums
+        )
         target_interval_probs = target_interval_probs.masked_fill(~target_interval_mask, 0.0)
 
         # --- Cross-Entropy Loss Calculation ---
@@ -461,6 +469,8 @@ class NT_VAE(pl.LightningModule):
         # The pred_charge_valid_mask is incorporated into charge_logits (masked with -inf).
         # Target_charge_probs are 0 for padded target positions.
         # So, the sum correctly computes CE for valid regions.
+        # Safeguard against NaNs before averaging
+        charge_ce_token_wise = torch.nan_to_num(charge_ce_token_wise, nan=0.0)
         charge_recon_loss = charge_ce_token_wise.mean()
 
         # Interval Reconstruction Loss
@@ -469,8 +479,10 @@ class NT_VAE(pl.LightningModule):
 
         # Handle potential NaNs from log_softmax on all-negative-infinity logits
         are_interval_logits_all_inf = torch.all(interval_logits == -float('inf'), dim=-1)
-        interval_ce_token_wise[are_interval_logits_all_inf] = 0.0
+        interval_ce_token_wise[are_interval_logits_all_inf] = 0.0 # This handles NaNs from log_softmax
         
+        # Safeguard against any other NaNs (e.g., if target_interval_probs somehow became NaN)
+        interval_ce_token_wise = torch.nan_to_num(interval_ce_token_wise, nan=0.0)
         interval_recon_loss = interval_ce_token_wise.mean()
             
         return {
