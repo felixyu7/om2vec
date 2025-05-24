@@ -54,35 +54,34 @@ class NT_VAE(pl.LightningModule):
         )
 
         self.encoder_to_latent_input_dim = self.hparams.embed_dim + 3
-        # Output dim is now latent_dim (no reserved slot for length)
         self.to_latent_mu = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
         self.to_latent_logvar = nn.Linear(self.encoder_to_latent_input_dim, self.hparams.latent_dim)
 
-        # --- Cross-Attention Decoder with Latent Token ---
-        # Project latent z to a single memory token for cross-attention
-        self.decoder_z_to_memory = nn.Linear(self.hparams.latent_dim, self.hparams.embed_dim)
+        # --- Transformer Encoder based Decoder ---
+        self.decoder_latent_to_input_proj = nn.Linear(self.hparams.latent_dim, self.hparams.embed_dim)
         self.decoder_pos_encoder = PositionalEncoding(
             self.hparams.embed_dim,
-            self.hparams.transformer_decoder_dropout,
+            self.hparams.transformer_decoder_dropout, # Configures dropout for the decoder's TransformerEncoder
             max_len=self.hparams.max_seq_len_padding
         )
-        # Learnable query embeddings for the decoder input
-        self.decoder_query_embeds = nn.Parameter(
+        # Learnable content embeddings for each decoder position
+        self.query_embed = nn.Parameter(
             torch.randn(self.hparams.max_seq_len_padding, self.hparams.embed_dim) * 0.02
         )
+        # Input to the decoder's transformer is derived from z + positional content embeds + pos encoding.
 
-        decoder_layer = nn.TransformerDecoderLayer(
+        decoder_encoder_layer = nn.TransformerEncoderLayer( # Changed from TransformerDecoderLayer
             d_model=self.hparams.embed_dim,
-            nhead=self.hparams.transformer_decoder_heads,
-            dim_feedforward=self.hparams.transformer_decoder_ff_dim,
+            nhead=self.hparams.transformer_decoder_heads,    # Configures heads for the decoder's TransformerEncoder
+            dim_feedforward=self.hparams.transformer_decoder_ff_dim, # Configures ff_dim for the decoder's TransformerEncoder
             activation='gelu',
-            dropout=self.hparams.transformer_decoder_dropout,
+            dropout=self.hparams.transformer_decoder_dropout, # Reused: dropout for the decoder's TransformerEncoder
             batch_first=True,
             norm_first=True
         )
-        self.decoder_transformer = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=self.hparams.transformer_decoder_layers
+        self.decoder_transformer = nn.TransformerEncoder( # Changed from TransformerDecoder
+            decoder_encoder_layer,
+            num_layers=self.hparams.transformer_decoder_layers # Configures layers for the decoder's TransformerEncoder
         )
 
         # Decoder outputs: charges and relative time intervals
@@ -204,7 +203,7 @@ class NT_VAE(pl.LightningModule):
         charge_valid_mask = charge_valid_mask & src_mask_for_loss_sliced
         
         if charge_valid_mask.any():
-            charge_loss = F.smooth_l1_loss(pred_q_sliced[charge_valid_mask], target_q_sliced[charge_valid_mask])
+            charge_loss = F.mse_loss(pred_q_sliced[charge_valid_mask], target_q_sliced[charge_valid_mask])
         else:
             charge_loss = torch.tensor(0.0, device=device) # No requires_grad=True for non-graph-connected tensor
         
@@ -219,16 +218,16 @@ class NT_VAE(pl.LightningModule):
         interval_valid_mask = interval_mask_for_loss_sliced
         
         if interval_valid_mask.any():
-            interval_loss = F.smooth_l1_loss(pred_intervals_sliced[interval_valid_mask], target_intervals_sliced[interval_valid_mask])
+            interval_loss = F.mse_loss(pred_intervals_sliced[interval_valid_mask], target_intervals_sliced[interval_valid_mask])
         else:
             interval_loss = torch.tensor(0.0, device=device) # No requires_grad=True for non-graph-connected tensor
         
         # 3. First absolute time loss
-        first_time_loss = F.smooth_l1_loss(pred_log_first_abs_time, target_log_first_abs_time)
+        first_time_loss = F.mse_loss(pred_log_first_abs_time, target_log_first_abs_time)
         
         # 4. Length prediction loss
         target_log_lengths = torch.log(sequence_lengths.clamp(min=1, max=self.hparams.max_seq_len_padding).float())
-        length_loss = F.smooth_l1_loss(pred_log_length, target_log_lengths)
+        length_loss = F.mse_loss(pred_log_length, target_log_lengths)
         
         return {
             'charge_loss': charge_loss,
@@ -241,21 +240,24 @@ class NT_VAE(pl.LightningModule):
         B = z.size(0)
         device = z.device
 
-        # 1. Project z to a single memory token for cross-attention
-        memory_token = self.decoder_z_to_memory(z)  # (B, embed_dim)
-        memory_token = memory_token.unsqueeze(1)  # (B, 1, embed_dim)
-
-        # 2. Create decoder input sequence using learnable query embeddings
-        decoder_input_sequence = self.decoder_query_embeds.unsqueeze(0).expand(B, -1, -1)  # (B, max_seq_len_padding, embed_dim)
+        # 1. Project latent z and expand to sequence length for Transformer Encoder input
+        z_projected = self.decoder_latent_to_input_proj(z)  # (B, embed_dim)
         
-        # 3. Add sinusoidal positional encoding to decoder input
+        # Expand z_projected and add learnable positional content embeddings
+        # z_projected_expanded: (B, max_seq_len_padding, embed_dim)
+        z_projected_expanded = z_projected.unsqueeze(1).expand(-1, self.hparams.max_seq_len_padding, -1)
+        
+        # query_embed: (max_seq_len_padding, embed_dim)
+        # Add to z_projected_expanded (broadcasts across batch)
+        decoder_input_sequence = z_projected_expanded + self.query_embed.unsqueeze(0) # (B, max_seq_len_padding, embed_dim)
+        
+        # 2. Add sinusoidal positional encoding to the combined decoder input sequence
         decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence)  # (B, max_seq_len_padding, embed_dim)
 
-        # 4. Pass through cross-attention decoder
-        # Memory is just the single projected latent token
+        # 3. Pass through Transformer Encoder (acting as the decoder)
+        # This uses self-attention on the sequence derived from z + learnable content + pos_enc.
         transformed_sequence = self.decoder_transformer(
-            tgt=decoder_input_sequence,
-            memory=memory_token
+            src=decoder_input_sequence
         )  # (B, max_seq_len_padding, embed_dim)
 
         # 5. Project to outputs: charges and intervals separately
@@ -389,8 +391,6 @@ class NT_VAE(pl.LightningModule):
                         pass
                 # If no __len__ attribute, default of 100 is used.
             self.total_steps_for_beta_annealing = self.hparams.beta_peak_epoch * steps_per_epoch
-            # Note: self.total_steps_for_beta_annealing can be 0 if beta_peak_epoch is 0.
-            # This is handled by the check `if self.total_steps_for_beta_annealing > 0:` later in the code (line 380).
             self.steps_initialized = True
 
         # Compute reconstruction losses
