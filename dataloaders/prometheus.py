@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn, process_time_sequence_for_intervals
+from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn # Removed process_time_sequence_for_intervals
 from functools import partial # For passing max_seq_len_padding to collate_fn
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
@@ -172,14 +172,13 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, item_tuple: Tuple[int, int]) -> Dict[str, torch.Tensor]:
         """
-        Returns one training example with time intervals and first absolute time.
+        Returns one training example.
+        The VAE's encode() method will now handle calculation of summary stats and time intervals.
         
-        New data structure for time interval prediction:
-        - q_sequence: Log-normalized charges [length N]
-        - time_input_features: Time features for encoder input [length N]
-        - target_log_first_abs_time: Log of first absolute time [scalar]
-        - target_log_intervals: Log of time intervals [length N-1]
-        - sequence_length: Original sequence length N
+        Data structure:
+        - charges_log_norm: Log1p-normalized charges [length N]
+        - times_log_norm: Log-normalized ABSOLUTE times [length N]
+        - sensor_pos: Sensor position [3D vector]
         
         item_tuple: (folder_idx, event_idx_in_folder)
         """
@@ -203,47 +202,44 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
 
         grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
 
-        # ------------------------------------------------ tensors + time processing
-        rt_original = torch.from_numpy(grp_t_np)
-        rc_original = torch.from_numpy(grp_c_np)
+        # ------------------------------------------------ tensors
+        rt_original = torch.from_numpy(grp_t_np) # Absolute times
+        rc_original = torch.from_numpy(grp_c_np) # Original charges
 
         # if max_seq_len_padding is exceeded, randomly sample, count-weighted
         if self.max_seq_len_padding is not None and rt_original.numel() > self.max_seq_len_padding:
             # Count-weighted random sampling
-            probs = rc_original.float() / rc_original.sum()
-            idx = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
+            probs = rc_original.float() / rc_original.sum().clamp(min=1e-9) # Avoid division by zero for empty sequences
+            if rc_original.sum() <= 1e-9 : # if all charges are zero or empty
+                 idx = torch.randperm(rt_original.numel())[:self.max_seq_len_padding] # random sample if no charge
+            else:
+                idx = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
+
             # Sort indices to preserve time order
             idx, _ = torch.sort(idx)
             rt_original = rt_original[idx]
             rc_original = rc_original[idx]
 
-        # Process time data according to new requirements
+        epsilon = 1e-9 # For log stability
         if rt_original.numel() == 0:
             # Empty sequence case
             return {
-                "q_sequence": torch.empty(0, dtype=torch.float32),
-                "time_input_features": torch.empty(0, dtype=torch.float32),
-                "target_log_first_abs_time": torch.tensor(0.0, dtype=torch.float32),
-                "target_log_intervals": torch.empty(0, dtype=torch.float32),
-                "sequence_length": torch.tensor(0, dtype=torch.long),
+                "charges_log_norm": torch.empty(0, dtype=torch.float32),
+                "times_log_norm": torch.empty(0, dtype=torch.float32), # Log-normalized absolute times
                 "sensor_pos": sensor_pos,
+                # The collate_fn will handle creating an attention_mask based on these empty tensors
             }
         
-        # Process absolute times and charges
-        t_abs = rt_original  # These are already sorted from reduce_by_window
-        q_sequence = torch.log1p(rc_original)  # Log-normalized charges
+        # Log-normalized charges
+        charges_log_norm = torch.log1p(rc_original.clamp(min=0.0))
         
-        # Use utility function to process time sequence
-        time_input_features, target_log_first_abs_time, target_log_intervals = process_time_sequence_for_intervals(t_abs)
-
-        current_sequence_length = rt_original.numel()
+        # Log-normalized ABSOLUTE times
+        # Times should be positive before log. rt_original are absolute times, should be >= 0.
+        times_log_norm = torch.log(rt_original.clamp(min=0.0) + epsilon)
 
         return {
-            "q_sequence": q_sequence,
-            "time_input_features": time_input_features,
-            "target_log_first_abs_time": target_log_first_abs_time,
-            "target_log_intervals": target_log_intervals,
-            "sequence_length": torch.tensor(current_sequence_length, dtype=torch.long),
+            "charges_log_norm": charges_log_norm,
+            "times_log_norm": times_log_norm, # These are log-normalized ABSOLUTE times
             "sensor_pos": sensor_pos,
         }
         

@@ -8,48 +8,6 @@ from torch.utils.data import Sampler, Dataset
 from typing import List, Dict, Tuple # Added Tuple
 import pyarrow.parquet as pq # Added import
 
-def process_time_sequence_for_intervals(t_abs: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Process absolute time sequence to create time intervals and input features.
-    
-    Args:
-        t_abs: Tensor of absolute times [t_abs_1, t_abs_2, ..., t_abs_N]
-        eps: Small epsilon for log safety
-    
-    Returns:
-        time_input_features: Log-normalized time features for encoder input [length N]
-        target_log_first_abs_time: Log of first absolute time [scalar]
-        target_log_intervals: Log of time intervals [length N-1]
-    """
-    if t_abs.numel() == 0:
-        return (torch.empty(0, dtype=torch.float32),
-                torch.tensor(0.0, dtype=torch.float32),
-                torch.empty(0, dtype=torch.float32))
-    
-    # Get first absolute time
-    first_abs_t = t_abs[0].item()
-    target_log_first_abs_time = torch.log(torch.tensor(first_abs_t + eps, dtype=torch.float32))
-    
-    # Create shifted times: t_shifted_i = t_abs_i - first_abs_t
-    t_shifted = t_abs - first_abs_t
-    
-    # Calculate relative time intervals: t_interval_j = t_shifted_{j+1} - t_shifted_j
-    if len(t_shifted) > 1:
-        t_intervals = t_shifted[1:] - t_shifted[:-1]  # Length N-1
-        target_log_intervals = torch.log(t_intervals + eps)
-    else:
-        target_log_intervals = torch.empty(0, dtype=torch.float32)
-    
-    # Create time input features for encoder
-    time_input_features = torch.zeros_like(t_shifted)
-    # First hit: use log(eps) for t_shifted_1 = 0
-    time_input_features[0] = torch.log(torch.tensor(eps))
-    # Remaining hits: log(t_shifted_i) for i > 1
-    if len(t_shifted) > 1:
-        time_input_features[1:] = torch.log(t_shifted[1:] + eps)
-    
-    return time_input_features, target_log_first_abs_time, target_log_intervals
-
 def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> Tuple[List[List[str]], List[List[int]]]:
     """
     Get file names from directories within specified ranges, grouped by directory.
@@ -145,69 +103,65 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     """
     Collate after all per-item shortening is done in __getitem__.
     Pads to the longest sequence in the mini-batch and builds attention-mask.
-    Now handles new time interval prediction structure.
+    Now expects 'charges_log_norm' and 'times_log_norm' (absolute times).
     """
+    if not batch:
+        return {}
 
-    bsz      = len(batch)
-    device   = batch[0]["q_sequence"].device
-    dtype    = batch[0]["q_sequence"].dtype
+    bsz = len(batch)
+    # Determine device and dtype from the first item, assuming consistency
+    # Handle empty batch items if they somehow occur
+    first_valid_item = next((item for item in batch if item.get("charges_log_norm") is not None and item["charges_log_norm"].numel() > 0), None)
+    if first_valid_item is None: # All items are empty or invalid
+        # Fallback: create structure based on expected types if possible, or return minimal
+        # This case should ideally be prevented by dataset filtering empty sequences if not desired
+        # For now, let's assume at least one item might give a clue or we default.
+        # If all items are truly empty as per __getitem__, they'll have empty tensors.
+        # We'll proceed, and padding will handle it.
+        # If even sensor_pos is missing, we might have issues.
+        # Let's assume sensor_pos is always there.
+        device = batch[0]["sensor_pos"].device
+        dtype = batch[0]["sensor_pos"].dtype # Fallback dtype
+        if "charges_log_norm" in batch[0]: # Check if key exists even if tensor is empty
+            dtype = batch[0]["charges_log_norm"].dtype
 
-    seq_lens = torch.tensor([it["sequence_length"].item() for it in batch],
-                            dtype=torch.long, device=device)
-    max_len  = int(seq_lens.max().item()) if bsz else 0
-    max_interval_len = max(it["target_log_intervals"].numel() for it in batch) if bsz else 0
+    else:
+        device = first_valid_item["charges_log_norm"].device
+        dtype = first_valid_item["charges_log_norm"].dtype
+
+    # Get sequence lengths from 'charges_log_norm' (or 'times_log_norm')
+    seq_lens_list = [item["charges_log_norm"].numel() for item in batch]
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.long, device=device)
+    max_len = int(seq_lens.max().item()) if bsz and seq_lens.numel() > 0 and seq_lens.max().item() > 0 else 0
 
     # ---------- pre-allocate padded buffers ----------
-    shape      = (bsz, max_len)
-    zeros_f32  = dict(size=shape, dtype=dtype, device=device)
-
-    # New structure fields
-    q_sequence_pad = torch.zeros(**zeros_f32)
-    time_input_features_pad = torch.zeros_like(q_sequence_pad)
-    target_log_intervals_pad = torch.zeros(bsz, max_interval_len, dtype=dtype, device=device)
-    target_log_first_abs_time = torch.stack([item["target_log_first_abs_time"] for item in batch])
+    charges_padded = torch.zeros(bsz, max_len, dtype=dtype, device=device)
+    times_padded = torch.zeros(bsz, max_len, dtype=dtype, device=device) # For absolute times
     
-    attn_mask   = torch.ones(bsz, max_len, dtype=torch.bool, device=device)
-    interval_mask = torch.ones(bsz, max_interval_len, dtype=torch.bool, device=device)
+    # True for padding, False for valid data
+    attention_mask = torch.ones(bsz, max_len, dtype=torch.bool, device=device)
     
-    # Handle sensor_pos (fixed size per item, so just stack)
     sensor_pos_list = [item["sensor_pos"] for item in batch if "sensor_pos" in item]
     if sensor_pos_list:
         sensor_pos_batched = torch.stack(sensor_pos_list, dim=0)
     else:
-        # Fallback if no sensor_pos found
-        sensor_pos_batched = torch.empty(bsz, 3, dtype=dtype, device=device)
+        sensor_pos_batched = torch.empty(bsz, 3, dtype=dtype, device=device) # Fallback
     
     # ---------- write each sequence ----------
-    for row, item in enumerate(batch):
-        L = int(item["sequence_length"])
-        if L == 0:
-            continue
-            
-        # New structure
-        q_sequence_pad[row, :L] = item["q_sequence"]
-        time_input_features_pad[row, :L] = item["time_input_features"]
-        
-        # Handle intervals (length N-1)
-        L_intervals = item["target_log_intervals"].numel()
-        if L_intervals > 0:
-            target_log_intervals_pad[row, :L_intervals] = item["target_log_intervals"]
-            interval_mask[row, :L_intervals] = False
-        
-        attn_mask[row, :L] = False  # False = valid, True = padding
+    for i, item in enumerate(batch):
+        L = item["charges_log_norm"].numel() # Length of current sequence
+        if L > 0:
+            charges_padded[i, :L] = item["charges_log_norm"]
+            times_padded[i, :L] = item["times_log_norm"]
+            attention_mask[i, :L] = False  # Valid data positions
     
     return {
-        # New structure for time interval prediction
-        "q_sequence_padded": q_sequence_pad,
-        "time_input_features_padded": time_input_features_pad,
-        "target_log_first_abs_time": target_log_first_abs_time,
-        "target_log_intervals_padded": target_log_intervals_pad,
-        "interval_mask": interval_mask,
-        
-        "attention_mask": attn_mask,
-        "src_key_padding_mask": attn_mask,  # Alias for consistency
-        "sequence_lengths": seq_lens,
+        "charges_log_norm_padded": charges_padded,
+        "times_log_norm_padded": times_padded, # These are log-normalized ABSOLUTE times
+        "attention_mask": attention_mask,      # True for padding
         "sensor_pos_batched": sensor_pos_batched,
+        # The VAE's encode method will derive original_lengths from attention_mask
+        # and other summary stats from these inputs.
     }
 
 class InterleavedFileBatchSampler:
