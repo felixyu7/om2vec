@@ -302,11 +302,9 @@ class NT_VAE(pl.LightningModule):
         reconstructed_intervals = interval_probs * total_duration.unsqueeze(-1)  # (B, max_len)
 
         if not inference:
-            # Only return what's needed for loss calculation when inference is False
-            # Only return logits; masks are applied internally to logits
             return {
-                'charge_logits': masked_charge_scores,
-                'interval_logits': masked_interval_scores
+                'reconstructed_charges': reconstructed_charges,
+                'reconstructed_intervals': reconstructed_intervals
             }
         else:
             output_tq_pairs = []
@@ -357,8 +355,8 @@ class NT_VAE(pl.LightningModule):
         # Decode
         # When training/evaluating losses, inference is False
         decoded_output = self.decode(z=z, inference=False)
-        # reconstructed_charges and reconstructed_intervals are no longer needed directly from forward()
-        # charge_probs and interval_probs are also not needed in forward() output.
+        reconstructed_charges = decoded_output['reconstructed_charges']
+        reconstructed_intervals = decoded_output['reconstructed_intervals']
         
         # For loss calculation:
         # 'original_charges' are the input log-normalized charges (unpadded by loss function)
@@ -369,8 +367,8 @@ class NT_VAE(pl.LightningModule):
         return {
             'mu': mu,
             'logvar': logvar,
-            'charge_logits': decoded_output['charge_logits'],
-            'interval_logits': decoded_output['interval_logits'],
+            'reconstructed_charges': reconstructed_charges,
+            'reconstructed_intervals': reconstructed_intervals,
             'original_charges_log_norm_padded': charges_log_norm_padded, # Target for charge recon
             'original_intervals_log_norm_padded': encoder_time_features_target, # Target for interval recon
             'original_lengths': original_lengths # For unpadding targets in loss
@@ -380,111 +378,91 @@ class NT_VAE(pl.LightningModule):
         """Calculate reconstruction and KL divergence losses."""
         mu_full = forward_output['mu']
         logvar_full = forward_output['logvar']
-        # Retrieve data from forward_output
+        reconstructed_charges = forward_output['reconstructed_charges']
+        reconstructed_intervals = forward_output['reconstructed_intervals']
+        # These are the targets for reconstruction, already log-normalized and padded.
+        # The loss function will handle unpadding based on original_lengths.
         original_charges_log_norm_padded = forward_output['original_charges_log_norm_padded']
         original_intervals_log_norm_padded = forward_output['original_intervals_log_norm_padded']
-        charge_logits = forward_output['charge_logits']
-        interval_logits = forward_output['interval_logits']
-        # pred_charge_valid_mask and pred_interval_valid_mask are implicitly handled by logits being -inf
-        original_lengths = forward_output['original_lengths'] # Actual lengths of input sequences
+        
+        original_lengths = forward_output['original_lengths']
 
         device = mu_full.device
         B = mu_full.size(0)
-        max_len = charge_logits.size(1) # Decoder output length
 
         # Split mu and logvar to get content parts only for KL divergence
-        mu_content = mu_full[:, self.summary_stats_dim:]
-        logvar_content = logvar_full[:, self.summary_stats_dim:]
+        mu_content = mu_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
+        logvar_content = logvar_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
 
         # KL divergence on content part only
         kld_loss = -0.5 * torch.sum(1 + logvar_content - mu_content.pow(2) - logvar_content.exp(), dim=1)
         kld_loss = kld_loss.mean()
 
-        # --- Prepare Target Probabilities ---
-
-        # Pad original targets to match decoder output size (max_len)
-        # This logic remains from previous version, ensuring alignment.
-        if original_charges_log_norm_padded.size(1) < max_len:
-            padding_size = max_len - original_charges_log_norm_padded.size(1)
+        # Vectorized reconstruction losses with proper masking
+        # Create masks for valid positions
+        max_len = reconstructed_charges.size(1)
+        
+        # Ensure original targets match decoder output size
+        original_charges_size = original_charges_log_norm_padded.size(1)
+        original_intervals_size = original_intervals_log_norm_padded.size(1)
+        
+        # Pad original charges to match decoder output size
+        if original_charges_size < max_len:
+            # Pad with zeros
+            padding_size = max_len - original_charges_size
             original_charges_log_norm_padded = torch.cat([
                 original_charges_log_norm_padded,
                 torch.zeros(B, padding_size, device=device, dtype=original_charges_log_norm_padded.dtype)
             ], dim=1)
 
-
-        if original_intervals_log_norm_padded.size(1) < max_len:
-            padding_size = max_len - original_intervals_log_norm_padded.size(1)
+        # Pad original intervals to match decoder output size
+        if original_intervals_size < max_len:
+            # Pad with zeros
+            padding_size = max_len - original_intervals_size
             original_intervals_log_norm_padded = torch.cat([
                 original_intervals_log_norm_padded,
                 torch.zeros(B, padding_size, device=device, dtype=original_intervals_log_norm_padded.dtype)
             ], dim=1)
-
-        # 1. Charge Target Probabilities
-        target_charges_unnorm = torch.exp(original_charges_log_norm_padded) - 1.0
         
         range_tensor = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
-        target_charge_mask = range_tensor < original_lengths.unsqueeze(1) # Mask based on original input lengths
+        charge_valid_mask = range_tensor < original_lengths.unsqueeze(1)
         
-        target_charges_unnorm_masked = target_charges_unnorm.masked_fill(~target_charge_mask, 0.0)
-        target_charge_sums = target_charges_unnorm_masked.sum(dim=1, keepdim=True)
-        # Avoid division by zero for empty sequences if any (though original_lengths >= 1)
-        # If sum is 0 for a valid sequence, probs become 0.
-        target_charge_probs = torch.where(
-            target_charge_sums == 0,
-            torch.zeros_like(target_charges_unnorm_masked),
-            target_charges_unnorm_masked / target_charge_sums
-        )
-        target_charge_probs = target_charge_probs.masked_fill(~target_charge_mask, 0.0) # Ensure padded are zero
+        # Charge reconstruction loss (vectorized)
+        # Fix: Convert linear reconstructed values to log-normalized to match targets
+        pred_charges_log_norm = torch.log1p(reconstructed_charges)
+        
+        # Compute squared errors and mask invalid positions
+        charge_squared_errors = (pred_charges_log_norm - original_charges_log_norm_padded) ** 2
+        charge_squared_errors = charge_squared_errors * charge_valid_mask.float()
+        
+        # Average over valid positions only
+        valid_charge_count = charge_valid_mask.sum()
+        charge_recon_loss = charge_squared_errors.sum() / (valid_charge_count + 1e-8)
 
-        # 2. Interval Target Probabilities
-        target_intervals_unnorm = torch.exp(original_intervals_log_norm_padded)
+        # Interval reconstruction loss (vectorized)
+        # Create mask for valid interval positions (seq_len > 1 and within interval range)
+        interval_valid_mask = charge_valid_mask.clone()
+        # For intervals, we need seq_len-1 valid positions, so shift the mask
+        interval_valid_mask = interval_valid_mask[:, :-1]  # Remove last column
+        # Also mask out sequences with length <= 1
+        sequences_with_intervals = (original_lengths > 1).unsqueeze(1)
+        interval_valid_mask = interval_valid_mask & sequences_with_intervals
         
-        target_interval_mask = torch.zeros((B, max_len), dtype=torch.bool, device=device)
-        for i in range(B):
-            if original_lengths[i].item() > 1:
-                target_interval_mask[i, :original_lengths[i].item()-1] = True
-        
-        target_intervals_unnorm_masked = target_intervals_unnorm.masked_fill(~target_interval_mask, 0.0)
-        target_interval_sums = target_intervals_unnorm_masked.sum(dim=1, keepdim=True)
-        target_interval_probs = torch.where(
-            target_interval_sums == 0,
-            torch.zeros_like(target_intervals_unnorm_masked),
-            target_intervals_unnorm_masked / target_interval_sums
-        )
-        target_interval_probs = target_interval_probs.masked_fill(~target_interval_mask, 0.0)
-
-        # --- Cross-Entropy Loss Calculation ---
-
-        # Charge Reconstruction Loss
-        log_softmax_charge_logits = F.log_softmax(charge_logits, dim=-1)
-        # Element-wise CE: sum(target_probs * log_softmax(logits))
-        # Target_charge_probs might have zeros where target_charge_mask is False.
-        # Log_softmax_charge_logits will have -inf where pred_charge_valid_mask was False (due to masked_charge_scores in decode).
-        # The multiplication target_probs * log_softmax will be 0 if target_prob is 0.
-        # It will be -inf if log_softmax is -inf and target_prob > 0.
-        # We only care about positions where pred_charge_valid_mask is True.
-        
-        charge_ce_token_wise = -torch.sum(target_charge_probs * log_softmax_charge_logits, dim=-1) # (B, max_len)
-        
-        # The pred_charge_valid_mask is incorporated into charge_logits (masked with -inf).
-        # Target_charge_probs are 0 for padded target positions.
-        # So, the sum correctly computes CE for valid regions.
-        # Safeguard against NaNs before averaging
-        charge_ce_token_wise = torch.nan_to_num(charge_ce_token_wise, nan=0.0)
-        charge_recon_loss = charge_ce_token_wise.mean()
-
-        # Interval Reconstruction Loss
-        log_softmax_interval_logits = F.log_softmax(interval_logits, dim=-1) # Can produce NaNs if interval_logits are all -inf
-        interval_ce_token_wise = -torch.sum(target_interval_probs * log_softmax_interval_logits, dim=-1) # (B,)
-
-        # Handle potential NaNs from log_softmax on all-negative-infinity logits
-        are_interval_logits_all_inf = torch.all(interval_logits == -float('inf'), dim=-1)
-        interval_ce_token_wise[are_interval_logits_all_inf] = 0.0 # This handles NaNs from log_softmax
-        
-        # Safeguard against any other NaNs (e.g., if target_interval_probs somehow became NaN)
-        interval_ce_token_wise = torch.nan_to_num(interval_ce_token_wise, nan=0.0)
-        interval_recon_loss = interval_ce_token_wise.mean()
+        if interval_valid_mask.any():
+            # Fix: Convert linear reconstructed intervals to log-normalized to match targets
+            pred_intervals_log_norm = torch.log(reconstructed_intervals[:, :-1].clamp(min=1e-9))
+            target_intervals = original_intervals_log_norm_padded[:, :-1]
             
+            # Compute squared errors and mask invalid positions
+            interval_squared_errors = (pred_intervals_log_norm - target_intervals) ** 2
+            interval_squared_errors = interval_squared_errors * interval_valid_mask.float()
+            
+            # Average over valid positions only
+            valid_interval_count = interval_valid_mask.sum()
+            interval_recon_loss = interval_squared_errors.sum() / (valid_interval_count + 1e-8)
+        else:
+            interval_recon_loss = torch.tensor(0.0, device=device)
+
         return {
             'kld_loss': kld_loss,
             'charge_recon_loss': charge_recon_loss,
