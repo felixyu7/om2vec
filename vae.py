@@ -248,19 +248,21 @@ class NT_VAE(pl.LightningModule):
         # 2. Add sinusoidal positional encoding
         decoder_input_sequence = self.decoder_pos_encoder(decoder_input_sequence)  # (B, max_len, embed_dim)
 
-        # 3. Pass through Transformer Encoder (acting as decoder)
-        transformed_sequence = self.decoder_transformer(
-            src=decoder_input_sequence
-        )  # (B, max_len, embed_dim)
-
-        # 4. Project to raw scores (logits) for softmax partitioning
-        raw_charge_scores = self.output_projection_charge(transformed_sequence).squeeze(-1)  # (B, max_len)
-        raw_interval_scores = self.output_projection_intervals(transformed_sequence).squeeze(-1)  # (B, max_len)
-
-        # 5. Create masks for valid positions based on actual sequence lengths
+        # 3. Create masks for valid positions based on actual sequence lengths (used by Transformer and later)
         range_tensor = torch.arange(self.hparams.max_seq_len_padding, device=device).unsqueeze(0).expand(B, -1)
         actual_seq_lengths_expanded = actual_seq_lengths.unsqueeze(1).expand(-1, self.hparams.max_seq_len_padding)
-        valid_mask = range_tensor < actual_seq_lengths_expanded  # (B, max_len)
+        valid_mask = range_tensor < actual_seq_lengths_expanded  # (B, max_len). True for valid, False for padding.
+
+        # 4. Pass through Transformer Encoder (acting as decoder)
+        # Pass ~valid_mask as src_key_padding_mask (True for padding positions)
+        transformed_sequence = self.decoder_transformer(
+            src=decoder_input_sequence,
+            src_key_padding_mask=~valid_mask
+        )  # (B, max_len, embed_dim)
+
+        # 5. Project to raw scores (logits) for softmax partitioning
+        raw_charge_scores = self.output_projection_charge(transformed_sequence).squeeze(-1)  # (B, max_len)
+        raw_interval_scores = self.output_projection_intervals(transformed_sequence).squeeze(-1)  # (B, max_len)
 
         # 6. Softmax partitioning for charges
         masked_charge_scores = raw_charge_scores.clone()
@@ -450,7 +452,7 @@ class NT_VAE(pl.LightningModule):
         
         if interval_valid_mask.any():
             # Fix: Convert linear reconstructed intervals to log-normalized to match targets
-            pred_intervals_log_norm = torch.log(reconstructed_intervals[:, :-1].clamp(min=1e-9))
+            pred_intervals_log_norm = torch.log(reconstructed_intervals[:, :-1].clamp(min=0) + 1e-9)
             target_intervals = original_intervals_log_norm_padded[:, :-1]
             
             # Compute squared errors and mask invalid positions
