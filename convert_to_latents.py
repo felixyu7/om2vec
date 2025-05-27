@@ -218,36 +218,41 @@ def main():
         
         try:
             # Load file data
-            data = ak.from_parquet(file_path)
-            print(f"  Loaded {len(data)} events from file")
+            data_ak = ak.from_parquet(file_path)
+            print(f"  Loaded {len(data_ak)} events from file, converting to Python list...")
+            # Convert all events to a list of Python dictionaries immediately after loading
+            events_py_list = ak.to_list(data_ak)
+            data_ak = None # Free memory from awkward array if possible
+            print(f"  Conversion complete. Processing {len(events_py_list)} events.")
             
-            for event_idx, original_event_record in enumerate(data):
+            for event_idx, original_event_py_dict in enumerate(events_py_list):
                 if (event_idx + 1) % 100 == 0:
-                    print(f"    Processing event {event_idx + 1}/{len(data)}")
+                    print(f"    Processing event {event_idx + 1}/{len(events_py_list)}")
 
-                original_mc_truth = getattr(original_event_record, 'mc_truth', None)
-                original_photons_field = getattr(original_event_record, 'photons', None)
+                # Access fields using dictionary .get() method for safety
+                original_mc_truth = original_event_py_dict.get('mc_truth')
+                # original_photons_field will now be a Python list of dicts, or None
+                original_photons_field_py_list = original_event_py_dict.get('photons')
                 
                 om2vec_records_for_event = []
 
-                if original_photons_field is not None and len(original_photons_field) > 0:
-                    # Group photon hits by unique sensor positions
+                if original_photons_field_py_list is not None and len(original_photons_field_py_list) > 0:
                     sensor_hits_map = {}
-                    for photon_hit in original_photons_field:
-                        # Ensure all components of sensor_pos are present
-                        if not (hasattr(photon_hit, 'sensor_pos_x') and \
-                                hasattr(photon_hit, 'sensor_pos_y') and \
-                                hasattr(photon_hit, 'sensor_pos_z') and \
-                                hasattr(photon_hit, 't')):
-                            # print(f"Skipping photon hit due to missing sensor_pos or t: {photon_hit}")
+                    for photon_hit_py_dict in original_photons_field_py_list:
+                        # Ensure all components of sensor_pos are present in the dictionary
+                        if not all(k in photon_hit_py_dict for k in ['sensor_pos_x', 'sensor_pos_y', 'sensor_pos_z', 't']):
+                            # print(f"Skipping photon hit dict due to missing keys: {photon_hit_py_dict}")
                             continue
-
-                        sx = float(photon_hit.sensor_pos_x)
-                        sy = float(photon_hit.sensor_pos_y)
-                        sz = float(photon_hit.sensor_pos_z)
-                        t = float(photon_hit.t)
-                        sensor_coord_tuple = (sx, sy, sz)
-                        sensor_hits_map.setdefault(sensor_coord_tuple, []).append(t)
+                        try:
+                            sx = float(photon_hit_py_dict['sensor_pos_x'])
+                            sy = float(photon_hit_py_dict['sensor_pos_y'])
+                            sz = float(photon_hit_py_dict['sensor_pos_z'])
+                            t_val = float(photon_hit_py_dict['t'])
+                            sensor_coord_tuple = (sx, sy, sz)
+                            sensor_hits_map.setdefault(sensor_coord_tuple, []).append(t_val)
+                        except (TypeError, ValueError) as e:
+                            # print(f"Warning: Could not convert photon hit data from dict {photon_hit_py_dict}: {e}")
+                            continue # Skip this problematic hit
 
                     # Process data for each unique sensor in the event
                     for sensor_coord_tuple, hit_times_list in sensor_hits_map.items():
@@ -315,7 +320,7 @@ def main():
                 # Construct the final output structure for this event
                 output_event_structure_for_file = {
                     'mc_truth': original_mc_truth,
-                    'photons': original_photons_field, # Store the original full photons list
+                    'photons': original_photons_field_py_list, # Store the Python list of dicts
                     'om2vec': om2vec_records_for_event # List of per-sensor om2vec data
                 }
                 output_event_records.append(output_event_structure_for_file)
