@@ -86,54 +86,36 @@ def compute_summary_stats(grouped_times_np: np.ndarray, grouped_charges_np: np.n
     
     return stats
 
-def preprocess_event(event_data, grouping_window_ns: float, max_seq_len_padding: int, epsilon: float) -> Dict:
+def preprocess_sensor_hits(
+    raw_t_for_sensor: np.ndarray,
+    sensor_pos_for_vae: torch.Tensor,
+    grouping_window_ns: float,
+    max_seq_len_padding: int,
+    epsilon: float
+) -> Dict:
     """
-    Preprocess a single event using the same logic as the training pipeline.
+    Preprocesses hit data for a single sensor.
     
     Args:
-        event_data: Single event from awkward array
-        grouping_window_ns: Time window for grouping hits
-        max_seq_len_padding: Maximum sequence length after padding
-        epsilon: Epsilon value for log normalization of times
+        raw_t_for_sensor: Numpy array of hit times for this sensor.
+        sensor_pos_for_vae: Scaled sensor position tensor for VAE input.
+        grouping_window_ns: Time window for grouping hits.
+        max_seq_len_padding: Maximum sequence length after padding for VAE.
+        epsilon: Epsilon value for log normalization of times for VAE.
         
     Returns:
-        Dictionary with preprocessed tensors ready for model input
+        Dictionary with preprocessed tensors for VAE and summary stats.
     """
-    # Extract parameters from config
-    # Parameters are now passed directly
-    
-    # Check if event has photons/hits
-    if hasattr(event_data, 'photons') and hasattr(event_data.photons, 't'):
-        raw_t = np.asarray(event_data.photons.t, dtype=np.float32)
-    elif hasattr(event_data, 'hits_t'):
-        raw_t = np.asarray(event_data.hits_t, dtype=np.float32)
-    else:
-        # Return empty tensors for events without hits
+    if len(raw_t_for_sensor) == 0:
         return {
             "charges_log_norm": torch.empty(0, dtype=torch.float32),
             "times_log_norm": torch.empty(0, dtype=torch.float32),
-            "sensor_pos": torch.zeros(3, dtype=torch.float32),
-            "summary_stats": compute_summary_stats(np.array([]), np.array([])), # Default for no hits
+            "sensor_pos": sensor_pos_for_vae, # Still pass the sensor pos
+            "summary_stats": compute_summary_stats(np.array([]), np.array([])),
         }
-    
-    # Skip events with no hits
-    if len(raw_t) == 0:
-        return {
-            "charges_log_norm": torch.empty(0, dtype=torch.float32),
-            "times_log_norm": torch.empty(0, dtype=torch.float32),
-            "sensor_pos": torch.zeros(3, dtype=torch.float32),
-            "summary_stats": compute_summary_stats(np.array([]), np.array([])), # Default for no hits
-        }
-    
-    # Extract sensor position - try different field names for compatibility
-    sensor_pos_x = float(event_data.sensor_pos_x)
-    sensor_pos_y = float(event_data.sensor_pos_y) 
-    sensor_pos_z = float(event_data.sensor_pos_z)
-    
-    sensor_pos = torch.tensor([sensor_pos_x, sensor_pos_y, sensor_pos_z], dtype=torch.float32) / 1000.0  # Convert to km
-    
-    # Apply time-window grouping using the same function as training pipeline
-    grp_t_np, grp_c_np = reduce_by_window(raw_t, grouping_window_ns)
+
+    # Apply time-window grouping
+    grp_t_np, grp_c_np = reduce_by_window(raw_t_for_sensor, grouping_window_ns)
     
     # Compute summary statistics from the *full* grouped data (before VAE truncation)
     summary_stats_vec = compute_summary_stats(grp_t_np, grp_c_np)
@@ -162,7 +144,7 @@ def preprocess_event(event_data, grouping_window_ns: float, max_seq_len_padding:
         return {
             "charges_log_norm": torch.empty(0, dtype=torch.float32),
             "times_log_norm": torch.empty(0, dtype=torch.float32),
-            "sensor_pos": sensor_pos, # sensor_pos is still valid
+            "sensor_pos": sensor_pos_for_vae, # sensor_pos is still valid
             "summary_stats": summary_stats_vec,
         }
     
@@ -175,62 +157,12 @@ def preprocess_event(event_data, grouping_window_ns: float, max_seq_len_padding:
     return {
         "charges_log_norm": charges_log_norm_vae,
         "times_log_norm": times_log_norm_vae,
-        "sensor_pos": sensor_pos,
+        "sensor_pos": sensor_pos_for_vae,
         "summary_stats": summary_stats_vec, # Include the computed summary stats
     }
 
-def extract_original_sensor_pos(event_data) -> tuple[float, float, float]:
-    """Extracts original, unscaled sensor positions from event data."""
-    sensor_pos_x = 0.0
-    sensor_pos_y = 0.0
-    sensor_pos_z = 0.0
-    if hasattr(event_data, 'sensor_pos_x'):
-        sensor_pos_x = float(event_data.sensor_pos_x)
-    if hasattr(event_data, 'sensor_pos_y'):
-        sensor_pos_y = float(event_data.sensor_pos_y)
-    if hasattr(event_data, 'sensor_pos_z'):
-        sensor_pos_z = float(event_data.sensor_pos_z)
-    # If top-level sensor_pos_x,y,z are not present, they default to 0.0.
-    # The request "om2vec.sensor_pos_ are from the originals" implies event-level.
-    return sensor_pos_x, sensor_pos_y, sensor_pos_z
-
-def process_batch(batch_data: List[Dict], model, device) -> np.ndarray:
-    """
-    Process a batch of preprocessed events through the model.
-    
-    Args:
-        batch_data: List of preprocessed event dictionaries
-        model: Loaded NT_VAE model
-        device: Device for computation
-        
-    Returns:
-        Numpy array of latent vectors
-    """
-    if not batch_data:
-        return np.array([])
-    
-    # Use the same collate function as training pipeline
-    collated_batch = variable_length_collate_fn(batch_data)
-    
-    # Move to device
-    for key in collated_batch:
-        if isinstance(collated_batch[key], torch.Tensor):
-            collated_batch[key] = collated_batch[key].to(device)
-    
-    # Run through model encoder
-    with torch.no_grad():
-        mu_full, logvar_full, _, _ = model.encode(
-            collated_batch["charges_log_norm_padded"],
-            collated_batch["times_log_norm_padded"], 
-            collated_batch["sensor_pos_batched"],
-            collated_batch["attention_mask"]
-        )
-        
-        # Use mu (mean) as the latent representation
-        # For deterministic latents, could also use reparameterize for sampling
-        latents = mu_full.cpu().numpy()
-    
-    return latents
+# process_batch function is removed as encoding is now per-sensor.
+# extract_original_sensor_pos is removed as sensor positions are handled in main loop.
 
 def main():
     parser = argparse.ArgumentParser(description='Convert events to latent space using the current om2vec model.')
@@ -246,9 +178,7 @@ def main():
                        help='Maximum sequence length after padding (default: 1024). Set to 0 or negative for no limit.')
     parser.add_argument('--log_epsilon', type=float, default=1e-9,
                        help='Epsilon value for log normalization of times (default: 1e-9).')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size for processing events.')
-    parser.add_argument('--chunk_size', type=int, default=5000,
+    parser.add_argument('--chunk_size', type=int, default=1000, # Adjusted default chunk size for potentially more records
                        help='Number of events per output chunk.')
     
     args = parser.parse_args()
@@ -291,79 +221,113 @@ def main():
             data = ak.from_parquet(file_path)
             print(f"  Loaded {len(data)} events from file")
             
-            # Process events in batches
-            current_batch_preprocessed_for_model = []
-            current_batch_original_events = []
-            
             for event_idx, original_event_record in enumerate(data):
-                # Preprocess event
-                preprocessed_for_model = preprocess_event(original_event_record, args.grouping_window_ns, args.max_seq_len_padding, args.log_epsilon)
-                
-                # Skip empty events (those that result in no charges after preprocessing)
-                if preprocessed_for_model["charges_log_norm"].numel() == 0:
-                    continue
-                
-                current_batch_preprocessed_for_model.append(preprocessed_for_model)
-                current_batch_original_events.append(original_event_record) # Store original awkward record
-                
-                # Process batch when full
-                if len(current_batch_preprocessed_for_model) >= args.batch_size:
-                    latents_for_batch = process_batch(current_batch_preprocessed_for_model, model, device)
-                    
-                    for i, latent_vec in enumerate(latents_for_batch):
-                        original_event = current_batch_original_events[i]
-                        preprocessed_data_for_event = current_batch_preprocessed_for_model[i]
-                        summary_stats_vector = preprocessed_data_for_event["summary_stats"]
+                if (event_idx + 1) % 100 == 0:
+                    print(f"    Processing event {event_idx + 1}/{len(data)}")
 
-                        orig_sensor_x, orig_sensor_y, orig_sensor_z = extract_original_sensor_pos(original_event)
+                original_mc_truth = getattr(original_event_record, 'mc_truth', None)
+                original_photons_field = getattr(original_event_record, 'photons', None)
+                
+                om2vec_records_for_event = []
+
+                if original_photons_field is not None and len(original_photons_field) > 0:
+                    # Group photon hits by unique sensor positions
+                    sensor_hits_map = {}
+                    for photon_hit in original_photons_field:
+                        # Ensure all components of sensor_pos are present
+                        if not (hasattr(photon_hit, 'sensor_pos_x') and \
+                                hasattr(photon_hit, 'sensor_pos_y') and \
+                                hasattr(photon_hit, 'sensor_pos_z') and \
+                                hasattr(photon_hit, 't')):
+                            # print(f"Skipping photon hit due to missing sensor_pos or t: {photon_hit}")
+                            continue
+
+                        sx = float(photon_hit.sensor_pos_x)
+                        sy = float(photon_hit.sensor_pos_y)
+                        sz = float(photon_hit.sensor_pos_z)
+                        t = float(photon_hit.t)
+                        sensor_coord_tuple = (sx, sy, sz)
+                        sensor_hits_map.setdefault(sensor_coord_tuple, []).append(t)
+
+                    # Process data for each unique sensor in the event
+                    for sensor_coord_tuple, hit_times_list in sensor_hits_map.items():
+                        original_sx, original_sy, original_sz = sensor_coord_tuple
+                        raw_t_for_sensor = np.array(sorted(hit_times_list), dtype=np.float32) # Ensure sorted times
+
+                        sensor_pos_for_vae = torch.tensor(
+                            [original_sx, original_sy, original_sz], dtype=torch.float32
+                        ) / 1000.0  # Convert to km
+
+                        preprocessed_sensor_dict = preprocess_sensor_hits(
+                            raw_t_for_sensor,
+                            sensor_pos_for_vae,
+                            args.grouping_window_ns,
+                            args.max_seq_len_padding,
+                            args.log_epsilon
+                        )
+
+                        if preprocessed_sensor_dict["charges_log_norm"].numel() == 0:
+                            # No valid VAE data for this sensor, but we might still want to record its position and empty stats
+                            # For now, let's create a record with NaN latents if desired, or skip
+                            # To match previous behavior of skipping, we continue
+                            # If you want to include it with NaN latents, create the record here.
+                            # For now, we skip if no VAE input can be formed.
+                            # However, summary_stats are computed before VAE truncation, so they might be valid.
+                            # Let's include sensors if they have summary stats, even if VAE input is empty.
+                            if np.all(np.isnan(preprocessed_sensor_dict["summary_stats"])): # if all summary stats are NaN (e.g. no hits at all for sensor)
+                                continue # Truly nothing to record for this sensor
+
+                        # Prepare single sensor data for model (batch of 1)
+                        # Ensure all required keys are present for collate_fn, even if empty for VAE
+                        keys_for_collate = ["charges_log_norm", "times_log_norm", "sensor_pos", "summary_stats"]
+                        collate_input_dict = {k: preprocessed_sensor_dict[k] for k in keys_for_collate if k in preprocessed_sensor_dict}
                         
-                        output_record = {
-                            'mc_truth': getattr(original_event, 'mc_truth', None),
-                            'photons': getattr(original_event, 'photons', None),
-                            'om2vec': {
-                                'sensor_pos_x': orig_sensor_x,
-                                'sensor_pos_y': orig_sensor_y,
-                                'sensor_pos_z': orig_sensor_z,
-                                'latents': latent_vec,
-                                'summary_stats': summary_stats_vector
-                            }
-                        }
-                        output_event_records.append(output_record)
-                    
-                    current_batch_preprocessed_for_model = []
-                    current_batch_original_events = []
-                    
-                    # Save chunk if needed
-                    if len(output_event_records) >= args.chunk_size:
-                        output_file = os.path.join(args.output_dir, f"om2vec_chunk_{chunk_iter}.parquet")
-                        ak.to_parquet(ak.Array(output_event_records), output_file)
-                        print(f"  Saved chunk {chunk_iter} with {len(output_event_records)} events to {output_file}")
-                        chunk_iter += 1
-                        output_event_records = []
-            
-            # Process remaining batch
-            if current_batch_preprocessed_for_model:
-                latents_for_batch = process_batch(current_batch_preprocessed_for_model, model, device)
-                
-                for i, latent_vec in enumerate(latents_for_batch):
-                    original_event = current_batch_original_events[i]
-                    preprocessed_data_for_event = current_batch_preprocessed_for_model[i]
-                    summary_stats_vector = preprocessed_data_for_event["summary_stats"]
-                    
-                    orig_sensor_x, orig_sensor_y, orig_sensor_z = extract_original_sensor_pos(original_event)
+                        # Add dummy attention_mask if not present (collate_fn might expect it)
+                        # The collate_fn creates it based on charges_log_norm_padded, so it should be fine.
 
-                    output_record = {
-                        'mc_truth': getattr(original_event, 'mc_truth', None),
-                        'photons': getattr(original_event, 'photons', None),
-                        'om2vec': {
-                            'sensor_pos_x': orig_sensor_x,
-                            'sensor_pos_y': orig_sensor_y,
-                            'sensor_pos_z': orig_sensor_z,
-                            'latents': latent_vec,
-                            'summary_stats': summary_stats_vector
+                        latent_vector = np.full(model.latent_dim, np.nan, dtype=np.float32) # Default to NaN
+
+                        if preprocessed_sensor_dict["charges_log_norm"].numel() > 0 : # Only run VAE if there's data
+                            single_sensor_collated_input = variable_length_collate_fn([collate_input_dict])
+                            
+                            for key_to_move in single_sensor_collated_input:
+                                if isinstance(single_sensor_collated_input[key_to_move], torch.Tensor):
+                                    single_sensor_collated_input[key_to_move] = single_sensor_collated_input[key_to_move].to(device)
+                            
+                            with torch.no_grad():
+                                mu_full, _, _, _ = model.encode(
+                                    single_sensor_collated_input["charges_log_norm_padded"],
+                                    single_sensor_collated_input["times_log_norm_padded"],
+                                    single_sensor_collated_input["sensor_pos_batched"],
+                                    single_sensor_collated_input["attention_mask"]
+                                )
+                                latent_vector = mu_full.cpu().numpy().squeeze(axis=0) # Squeeze batch dim
+
+                        om2vec_sensor_record = {
+                            'sensor_pos_x': float(original_sx),
+                            'sensor_pos_y': float(original_sy),
+                            'sensor_pos_z': float(original_sz),
+                            'latents': latent_vector,
+                            'summary_stats': preprocessed_sensor_dict["summary_stats"]
                         }
-                    }
-                    output_event_records.append(output_record)
+                        om2vec_records_for_event.append(om2vec_sensor_record)
+                
+                # Construct the final output structure for this event
+                output_event_structure_for_file = {
+                    'mc_truth': original_mc_truth,
+                    'photons': original_photons_field, # Store the original full photons list
+                    'om2vec': om2vec_records_for_event # List of per-sensor om2vec data
+                }
+                output_event_records.append(output_event_structure_for_file)
+
+                # Save chunk if needed (based on number of *events* processed)
+                if len(output_event_records) >= args.chunk_size:
+                    output_file = os.path.join(args.output_dir, f"om2vec_chunk_{chunk_iter}.parquet")
+                    # Ensure awkward array handles list of lists for om2vec field correctly
+                    ak.to_parquet(ak.Array(output_event_records), output_file)
+                    print(f"  Saved chunk {chunk_iter} with {len(output_event_records)} events to {output_file}")
+                    chunk_iter += 1
+                    output_event_records = []
                     
         except Exception as e:
             print(f"  Error processing file {file_path}: {e}")
