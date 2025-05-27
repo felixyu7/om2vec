@@ -276,25 +276,32 @@ class NT_VAE(pl.LightningModule):
         
         reconstructed_charges = charge_probs * actual_total_charge.unsqueeze(-1)  # (B, max_len)
 
-        # 7. Softmax partitioning for time intervals
-        interval_valid_mask = valid_mask.clone()
-        # Fix: Use explicit indexing to avoid in-place assignment issues
-        rows_with_short_seqs = (actual_seq_lengths <= 1).nonzero(as_tuple=True)[0]
-        if len(rows_with_short_seqs) > 0:
-            interval_valid_mask[rows_with_short_seqs, :] = False # No intervals for length <= 1
+        # 7. L-1 Mask Interval Partitioning for guaranteed last hit time
+        # For each sequence of length L, there are exactly L-1 intervals between hits
+        # We partition the total duration over exactly these L-1 positions
         
+        # Create interval mask: True for first (L-1) positions, False elsewhere
+        interval_mask = torch.zeros_like(valid_mask, dtype=torch.bool)  # (B, max_len)
+        
+        # Vectorized mask creation
+        seq_len_minus_one = (actual_seq_lengths - 1).clamp(min=0)  # (B,)
+        range_tensor = torch.arange(self.hparams.max_seq_len_padding, device=device).unsqueeze(0).expand(B, -1)  # (B, max_len)
+        interval_mask = (range_tensor < seq_len_minus_one.unsqueeze(1)) & (actual_seq_lengths.unsqueeze(1) > 1)
+        
+        # Apply masking to interval scores
         masked_interval_scores = raw_interval_scores.clone()
-        masked_interval_scores[~interval_valid_mask] = -float('inf')
+        masked_interval_scores[~interval_mask] = -float('inf')  # Mask positions outside L-1 range
         
-        # Fix: Handle all-inf rows to avoid NaN in softmax
+        # Handle L=1 sequences (no intervals to partition)
         all_inf_rows = torch.all(masked_interval_scores == -float('inf'), dim=-1)
         interval_probs = torch.zeros_like(masked_interval_scores)
+        
+        # Only apply softmax to sequences with L > 1 (which have valid intervals)
         if not torch.all(all_inf_rows):
-            # Only apply softmax to rows that have at least one valid position
-            valid_rows = ~all_inf_rows
+            valid_rows = ~all_inf_rows  # Sequences with at least one interval to partition
             softmax_result = torch.softmax(masked_interval_scores[valid_rows], dim=-1)
             interval_probs[valid_rows] = softmax_result.to(interval_probs.dtype)
-        # Rows with all -inf remain zero
+        # Sequences with L=1 remain with all-zero interval probabilities
         
         # Calculate total duration and partition it
         actual_t_first = torch.exp(log_t_first_original_z)
@@ -433,13 +440,13 @@ class NT_VAE(pl.LightningModule):
         # Fix: Convert linear reconstructed values to log-normalized to match targets
         pred_charges_log_norm = torch.log1p(reconstructed_charges)
         
-        # Compute squared errors and mask invalid positions
-        charge_squared_errors = (pred_charges_log_norm - original_charges_log_norm_padded) ** 2
-        charge_squared_errors = charge_squared_errors * charge_valid_mask.float()
+        # Compute smooth L1 loss and mask invalid positions
+        charge_losses = F.smooth_l1_loss(pred_charges_log_norm, original_charges_log_norm_padded, reduction='none')
+        charge_losses = charge_losses * charge_valid_mask.float()
         
         # Average over valid positions only
         valid_charge_count = charge_valid_mask.sum()
-        charge_recon_loss = charge_squared_errors.sum() / (valid_charge_count + 1e-8)
+        charge_recon_loss = charge_losses.sum() / (valid_charge_count + 1e-8)
 
         # Interval reconstruction loss (vectorized)
         # Create mask for valid interval positions (seq_len > 1 and within interval range)
@@ -455,13 +462,13 @@ class NT_VAE(pl.LightningModule):
             pred_intervals_log_norm = torch.log(reconstructed_intervals[:, :-1].clamp(min=0) + 1e-9)
             target_intervals = original_intervals_log_norm_padded[:, :-1]
             
-            # Compute squared errors and mask invalid positions
-            interval_squared_errors = (pred_intervals_log_norm - target_intervals) ** 2
-            interval_squared_errors = interval_squared_errors * interval_valid_mask.float()
+            # Compute smooth L1 loss and mask invalid positions
+            interval_losses = F.smooth_l1_loss(pred_intervals_log_norm, target_intervals, reduction='none')
+            interval_losses = interval_losses * interval_valid_mask.float()
             
             # Average over valid positions only
             valid_interval_count = interval_valid_mask.sum()
-            interval_recon_loss = interval_squared_errors.sum() / (valid_interval_count + 1e-8)
+            interval_recon_loss = interval_losses.sum() / (valid_interval_count + 1e-8)
         else:
             interval_recon_loss = torch.tensor(0.0, device=device)
 
