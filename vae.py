@@ -403,9 +403,13 @@ class NT_VAE(pl.LightningModule):
         mu_content = mu_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
         logvar_content = logvar_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
 
-        # KL divergence on content part only
-        kld_loss = -0.5 * torch.sum(1 + logvar_content - mu_content.pow(2) - logvar_content.exp(), dim=1)
-        kld_loss = kld_loss.mean()
+        # kl divergence loss with free-bits
+        free_nats = 0.2
+        kl_per_dim = 0.5 * (mu_content.pow(2) + logvar_content.exp() - 1.0 - logvar_content)
+        # “Information floor”: each dim must pay at least `free_nats`
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_nats)
+        # Sum over latent dims, then mean over the batch
+        kld_loss = kl_per_dim.sum(dim=1).mean()
 
         # Vectorized reconstruction losses with proper masking
         # Create masks for valid positions
@@ -441,7 +445,7 @@ class NT_VAE(pl.LightningModule):
         pred_charges_log_norm = torch.log1p(reconstructed_charges)
         
         # Compute smooth L1 loss and mask invalid positions
-        charge_losses = F.smooth_l1_loss(pred_charges_log_norm, original_charges_log_norm_padded, reduction='none')
+        charge_losses = F.mse_loss(pred_charges_log_norm, original_charges_log_norm_padded, reduction='none')
         charge_losses = charge_losses * charge_valid_mask.float()
         
         # Average over valid positions only
@@ -463,7 +467,7 @@ class NT_VAE(pl.LightningModule):
             target_intervals = original_intervals_log_norm_padded[:, :-1]
             
             # Compute smooth L1 loss and mask invalid positions
-            interval_losses = F.smooth_l1_loss(pred_intervals_log_norm, target_intervals, reduction='none')
+            interval_losses = F.mse_loss(pred_intervals_log_norm, target_intervals, reduction='none')
             interval_losses = interval_losses * interval_valid_mask.float()
             
             # Average over valid positions only
@@ -548,7 +552,6 @@ class NT_VAE(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        # Fix: Use trainer's max_epochs for T_max to avoid premature decay
         if hasattr(self.trainer, 'max_epochs') and self.trainer.max_epochs:
             T_max = self.trainer.max_epochs
         else:
