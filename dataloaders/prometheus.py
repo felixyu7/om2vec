@@ -124,7 +124,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         for file_path in tqdm(all_files):
             try:
                 pf = pq.ParquetFile(file_path)
-                num_events = pf.num_row_groups # In prometheus format, one row group is one event
+                num_events = pf.num_rows # Each row is an event
                 for i in range(num_events):
                     index.append((file_path, i))
             except Exception as e:
@@ -162,8 +162,16 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
             return []
 
         # Find unique sensors in the event
-        sensor_keys = ak.zip([photons.string_id, photons.sensor_id])
-        unique_sensor_keys = ak.unique(sensor_keys)
+        # To find unique sensors, we convert the awkward array to a numpy structured array
+        # and use np.unique. This is a robust way to handle this without new dependencies.
+        sensor_keys_ak = ak.zip([photons.string_id, photons.sensor_id])
+        sensor_keys_np = ak.to_numpy(sensor_keys_ak)
+        
+        # np.unique on structured arrays returns the unique rows
+        unique_sensor_keys_np = np.unique(sensor_keys_np)
+        
+        # Convert back to a list of tuples for iteration
+        unique_sensor_keys = [tuple(row) for row in unique_sensor_keys_np]
         
         event_sensors_data = []
 
@@ -173,7 +181,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         truth_energy = torch.tensor(float(event.mc_truth.initial_state_energy), dtype=torch.float32)
 
         for key in unique_sensor_keys:
-            string_id_to_match, sensor_id_to_match = key['0'], key['1']
+            string_id_to_match, sensor_id_to_match = key[0], key[1]
             
             # Create a mask to select hits for the specific sensor
             mask = (photons.string_id == string_id_to_match) & (photons.sensor_id == sensor_id_to_match)
