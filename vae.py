@@ -3,7 +3,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pytorch_lightning as pl
-from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, calculate_sequence_lengths
+from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals
+
+# Critic network for Jensen-Shannon MI estimator
+class Critic(nn.Module):
+    def __init__(self, z_dim, theta_dim, hidden_dim=256):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(z_dim + theta_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, z, theta):
+        # z: (B, z_dim)
+        # theta: (B, theta_dim)
+        combined = torch.cat([z, theta], dim=1)
+        return self.model(combined)
+
+# Jensen-Shannon Mutual Information Estimator
+class JensenShannonMI(nn.Module):
+    def __init__(self, z_dim, theta_dim, hidden_dim=256):
+        super().__init__()
+        self.critic = Critic(z_dim, theta_dim, hidden_dim)
+
+    def forward(self, z, theta):
+        # z: (B, z_dim) - event_level_feat
+        # theta: (B, theta_dim) - truth_params
+        
+        # Positive samples (true pairs)
+        positive_score = self.critic(z, theta)
+
+        # Negative samples (shuffled pairs)
+        theta_shuffled = theta[torch.randperm(theta.size(0))]
+        negative_score = self.critic(z, theta_shuffled)
+
+        # Jensen-Shannon MI estimator: E_pos[-softplus(-T)] - E_neg[softplus(T)]
+        E_pos = -F.softplus(-positive_score).mean()
+        E_neg = F.softplus(negative_score).mean()
+        
+        mi_estimate = E_pos - E_neg
+        
+        return mi_estimate
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -20,15 +63,20 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
-                 batch_size=32,
                  lr=1e-3,
                  lr_schedule=[10, 1e-6],
                  weight_decay=1e-5,
                  charge_loss_weight=1.0,
-                 interval_loss_weight=1.0
+                 interval_loss_weight=1.0,
+                 event_feat_dim=64,  # New: event-level feature dimension
+                 mi_loss_weight=1.0  # Weight for mutual information loss
                  ):
         super().__init__()
         self.save_hyperparameters()
+        # New: Event-level aggregation head
+        self.event_agg_head = nn.Linear(self.hparams.embed_dim, self.hparams.event_feat_dim)
+        # Mutual Information Estimator (Jensen-Shannon)
+        self.mi_estimator = JensenShannonMI(self.hparams.event_feat_dim, 3)
 
         # Summary stats dimensions - stored directly in latent vector z
         self.summary_stats_dim = 4
@@ -186,7 +234,8 @@ class NT_VAE(pl.LightningModule):
         deterministic_logvar = torch.full_like(summary_stats_tensor, -10.0)  # Very small but not underflowing variance
         logvar_full = torch.cat([deterministic_logvar, logvar_content], dim=-1)  # (B, latent_dim)
 
-        return mu_full, logvar_full, stats_dict, encoder_time_features_padded
+        # Also return encoded_sequence for event-level aggregation
+        return mu_full, logvar_full, stats_dict, encoder_time_features_padded, encoded_sequence
 
     def reparameterize(self, mu, logvar):
         """Standard VAE reparameterization trick."""
@@ -347,9 +396,11 @@ class NT_VAE(pl.LightningModule):
         times_log_norm_abs_padded = batch['times_log_norm_padded'].float() # These are absolute times
         attention_mask = batch['attention_mask'].bool()  # True for padding
         sensor_pos_padded = batch['sensor_pos_batched'].float()
+        event_indices = batch['event_indices'] # New: maps each sensor to an event
+        num_events = batch['truth_zenith'].size(0)
 
         # Encode - this now calculates summary stats and encoder_time_features (intervals) internally
-        mu, logvar, stats_dict_from_encode, encoder_time_features_target = self.encode(
+        mu, logvar, stats_dict_from_encode, encoder_time_features_target, encoded_sequence = self.encode(
             charges_log_norm_padded=charges_log_norm_padded,
             times_log_norm_abs_padded=times_log_norm_abs_padded, # Pass absolute times
             sensor_pos_padded=sensor_pos_padded,
@@ -367,6 +418,25 @@ class NT_VAE(pl.LightningModule):
         reconstructed_charges = decoded_output['reconstructed_charges']
         reconstructed_intervals = decoded_output['reconstructed_intervals']
         
+        # --- Event-level aggregation branch ---
+        # Extract the CLS token representation for each sensor in the batch
+        cls_representation = encoded_sequence[:, 0, :] # (num_sensors, embed_dim)
+        
+        # Aggregate sensor representations into event-level representations
+        # Initialize a tensor to hold the summed representations for each event
+        event_level_repr = torch.zeros(num_events, cls_representation.size(1), device=self.device)
+        # Expand event_indices to match the dimensions of cls_representation for scatter_add
+        event_indices_expanded = event_indices.view(-1, 1).expand_as(cls_representation)
+        # Sum the representations for all sensors belonging to the same event
+        event_level_repr.scatter_add_(0, event_indices_expanded, cls_representation)
+        
+        # Normalize the summed representations by the number of sensors in each event
+        event_counts = torch.bincount(event_indices, minlength=num_events).float().clamp(min=1).view(-1, 1)
+        event_level_repr = event_level_repr / event_counts
+        
+        # Project the aggregated representation to the final event feature dimension
+        event_level_feat = self.event_agg_head(event_level_repr)  # (num_events, event_feat_dim)
+
         # For loss calculation:
         # 'original_charges' are the input log-normalized charges (unpadded by loss function)
         # 'original_intervals' are the log-normalized intervals that the encoder would have used as input
@@ -380,7 +450,8 @@ class NT_VAE(pl.LightningModule):
             'reconstructed_intervals': reconstructed_intervals,
             'original_charges_log_norm_padded': charges_log_norm_padded, # Target for charge recon
             'original_intervals_log_norm_padded': encoder_time_features_target, # Target for interval recon
-            'original_lengths': original_lengths # For unpadding targets in loss
+            'original_lengths': original_lengths, # For unpadding targets in loss
+            'event_level_feat': event_level_feat  # New: event-level feature vector for MI objective
         }
 
     def _calculate_loss(self, forward_output):
@@ -486,6 +557,18 @@ class NT_VAE(pl.LightningModule):
         forward_output = self(batch)
         losses = self._calculate_loss(forward_output)
 
+        # Mutual Information Loss Calculation
+        # The goal is to maximize the MI between the learned event features and the true event parameters.
+        # We use a neural estimator (JensenShannonMI) which returns an estimate of the MI.
+        # To maximize it, we negate the value, turning it into a loss to be minimized.
+        event_level_feat = forward_output['event_level_feat']  # (num_events, event_feat_dim)
+        truth_params = torch.stack([
+            batch['truth_zenith'].float(),
+            batch['truth_azimuth'].float(),
+            batch['truth_energy'].float()
+        ], dim=1) # (num_events, 3)
+        mi_loss = -self.mi_estimator(event_level_feat, truth_params)
+
         # Beta annealing - Fix: Use global_step from trainer for checkpoint compatibility
         steps_per_epoch = len(self.trainer.train_dataloader)
         self.total_steps_for_beta_annealing = self.hparams.beta_peak_epoch * steps_per_epoch
@@ -502,16 +585,15 @@ class NT_VAE(pl.LightningModule):
         # Total loss
         total_loss = (self.beta * losses['kld_loss'] +
                      self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
-                     self.hparams.interval_loss_weight * losses['interval_recon_loss'])
-
-        # Keep manual counter as backup
-        # self.current_train_iter is no longer used
+                     self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
+                     self.hparams.mi_loss_weight * mi_loss)
 
         # Logging
         self.log("train_loss", total_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
         self.log("train_kl_loss", losses['kld_loss'], batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("train_charge_recon_loss", losses['charge_recon_loss'], batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("train_interval_recon_loss", losses['interval_recon_loss'], batch_size=self.hparams.batch_size, sync_dist=True)
+        self.log("train_mi_loss", mi_loss, batch_size=self.hparams.batch_size, sync_dist=True)
         self.log("beta", self.beta, batch_size=self.hparams.batch_size, sync_dist=True)
 
         return total_loss

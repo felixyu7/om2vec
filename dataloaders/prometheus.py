@@ -10,7 +10,7 @@ from typing import Dict, Tuple, List
 from collections import OrderedDict
 from tqdm import tqdm
 
-from .data_utils import get_file_names, variable_length_collate_fn
+from .data_utils import get_file_names, variable_length_collate_fn, FileAwareSampler
 from functools import partial
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
@@ -58,10 +58,13 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         """Returns the training dataloader."""
         collate_fn_with_padding = partial(variable_length_collate_fn)
+        
+        # Use the FileAwareSampler to improve performance by reducing random disk I/O
+        sampler = FileAwareSampler(self.train_dataset)
 
         dataloader = torch.utils.data.DataLoader(self.train_dataset,
                                             batch_size=self.cfg['training_options']['batch_size'],
-                                            shuffle=True,
+                                            sampler=sampler, # Use the custom sampler
                                             collate_fn=collate_fn_with_padding,
                                             pin_memory=True,
                                             persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
@@ -74,7 +77,7 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
 
         return torch.utils.data.DataLoader(self.valid_dataset,
                                            batch_size=self.cfg['training_options']['batch_size'],
-                                           shuffle=False,
+                                           shuffle=False, # Validation data is processed sequentially
                                            collate_fn=collate_fn_with_padding,
                                            pin_memory=True,
                                            persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
@@ -87,8 +90,8 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
 class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     """
     Dataset class for Prometheus data.
-    This dataset reads event-based parquet files, builds an index of all sensors,
-    and returns data for one sensor at a time.
+    This dataset reads event-based parquet files, builds an index of all events,
+    and returns all sensor data for one event at a time.
     """
     def __init__(self,
                  files_by_folder: List[List[str]],
@@ -104,43 +107,26 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         self.cache_size = cache_size
         self.data_cache = OrderedDict()
 
-        # Build an index that maps a dataset index to a specific sensor in a specific event in a specific file
-        self.sensor_index = self._build_sensor_index()
-        self.dataset_size = len(self.sensor_index)
-        print(f"[{dataset_type}] Created dataset with {self.dataset_size} total sensors.")
+        # Build an index that maps a dataset index to a specific event in a specific file
+        self.event_index = self._build_event_index()
+        self.dataset_size = len(self.event_index)
+        print(f"[{dataset_type}] Created dataset with {self.dataset_size} total events.")
 
-    def _build_sensor_index(self) -> List[Tuple[str, int, tuple]]:
+    def _build_event_index(self) -> List[Tuple[str, int]]:
         """
-        Scans all parquet files to build an index of (file_path, event_idx_in_file, sensor_key).
-        A sensor_key is a tuple of (string_id, sensor_id).
+        Scans all parquet files to build an index of (file_path, event_idx_in_file).
         """
         index = []
-        print("Building sensor index...")
+        print("Building event index...")
         # Flatten the list of files from all folders
         all_files = [file_path for folder in self.files_by_folder for file_path in folder]
 
         for file_path in tqdm(all_files):
             try:
                 pf = pq.ParquetFile(file_path)
-                # Here we assume files are small enough to be loaded into memory for index building.
-                # For very large files, a row-group-based approach would be needed.
-                data = ak.from_parquet(file_path, columns=["photons.string_id", "photons.sensor_id"])
-                
-                for event_idx, event in enumerate(data):
-                    photons = event.photons
-                    if photons is None or len(photons.string_id) == 0:
-                        continue
-                    
-                    # Create a unique sensor key tuple for each hit
-                    sensor_keys = ak.zip([photons.string_id, photons.sensor_id])
-                    
-                    # Find the unique sensor keys in this event
-                    unique_sensor_keys = ak.unique(sensor_keys)
-                    
-                    for key in unique_sensor_keys:
-                        # key is a record like {'0': string_id, '1': sensor_id}
-                        sensor_tuple = (key['0'], key['1'])
-                        index.append((file_path, event_idx, sensor_tuple))
+                num_events = pf.num_row_groups # In prometheus format, one row group is one event
+                for i in range(num_events):
+                    index.append((file_path, i))
             except Exception as e:
                 print(f"Warning: Could not process file {file_path}: {e}. Skipping.")
                 continue
@@ -161,66 +147,81 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         self.data_cache[file_path] = data
         return data
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> List[Dict[str, torch.Tensor]]:
         """
-        Returns one training example for a single sensor.
+        Returns a list of training examples, one for each sensor in an event.
         """
-        file_path, event_idx, sensor_key = self.sensor_index[idx]
+        file_path, event_idx = self.event_index[idx]
         
         ak_data_for_file = self._load_data_from_file(file_path)
         
         event = ak_data_for_file[event_idx]
         photons = event.photons
         
-        string_id_to_match, sensor_id_to_match = sensor_key
-        
-        # Create a mask to select hits for the specific sensor
-        mask = (photons.string_id == string_id_to_match) & (photons.sensor_id == sensor_id_to_match)
-        
-        # Get times and positions for the selected sensor
-        sensor_hits_t = photons.t[mask]
-        
-        # All hits for a sensor have the same position, so we can take the first one
-        sensor_pos_x = photons.sensor_pos_x[mask][0]
-        sensor_pos_y = photons.sensor_pos_y[mask][0]
-        sensor_pos_z = photons.sensor_pos_z[mask][0]
-        
-        sensor_pos = torch.tensor([sensor_pos_x, sensor_pos_y, sensor_pos_z], dtype=torch.float32) / 1000.0 # convert to km
+        if photons is None or len(photons.string_id) == 0:
+            return []
 
-        raw_t = np.asarray(sensor_hits_t, dtype=np.float32)
+        # Find unique sensors in the event
+        sensor_keys = ak.zip([photons.string_id, photons.sensor_id])
+        unique_sensor_keys = ak.unique(sensor_keys)
         
-        grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
+        event_sensors_data = []
 
-        rt_original = torch.from_numpy(grp_t_np)
-        rc_original = torch.from_numpy(grp_c_np)
+        # Extract event-level truth parameters once
+        truth_zenith = torch.tensor(float(event.mc_truth.initial_state_zenith), dtype=torch.float32)
+        truth_azimuth = torch.tensor(float(event.mc_truth.initial_state_azimuth), dtype=torch.float32)
+        truth_energy = torch.tensor(float(event.mc_truth.initial_state_energy), dtype=torch.float32)
 
-        if self.max_seq_len_padding is not None and rt_original.numel() > self.max_seq_len_padding:
-            probs = rc_original.float() / rc_original.sum().clamp(min=1e-9)
-            if rc_original.sum() <= 1e-9:
-                idx_perm = torch.randperm(rt_original.numel())[:self.max_seq_len_padding]
-            else:
-                idx_perm = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
+        for key in unique_sensor_keys:
+            string_id_to_match, sensor_id_to_match = key['0'], key['1']
             
-            idx_sorted, _ = torch.sort(idx_perm)
-            rt_original = rt_original[idx_sorted]
-            rc_original = rc_original[idx_sorted]
+            # Create a mask to select hits for the specific sensor
+            mask = (photons.string_id == string_id_to_match) & (photons.sensor_id == sensor_id_to_match)
+            
+            sensor_hits_t = photons.t[mask]
+            
+            # All hits for a sensor have the same position, so we can take the first one
+            sensor_pos_x = photons.sensor_pos_x[mask][0]
+            sensor_pos_y = photons.sensor_pos_y[mask][0]
+            sensor_pos_z = photons.sensor_pos_z[mask][0]
+            
+            sensor_pos = torch.tensor([sensor_pos_x, sensor_pos_y, sensor_pos_z], dtype=torch.float32) / 1000.0
 
-        epsilon = 1e-9
-        if rt_original.numel() == 0:
-            return {
-                "charges_log_norm": torch.empty(0, dtype=torch.float32),
-                "times_log_norm": torch.empty(0, dtype=torch.float32),
+            raw_t = np.asarray(sensor_hits_t, dtype=np.float32)
+            grp_t_np, grp_c_np = reduce_by_window(raw_t, self.grouping_window_ns)
+
+            rt_original = torch.from_numpy(grp_t_np)
+            rc_original = torch.from_numpy(grp_c_np)
+
+            if self.max_seq_len_padding is not None and rt_original.numel() > self.max_seq_len_padding:
+                probs = rc_original.float() / rc_original.sum().clamp(min=1e-9)
+                if rc_original.sum() <= 1e-9:
+                    idx_perm = torch.randperm(rt_original.numel())[:self.max_seq_len_padding]
+                else:
+                    idx_perm = torch.multinomial(probs, self.max_seq_len_padding, replacement=False)
+                
+                idx_sorted, _ = torch.sort(idx_perm)
+                rt_original = rt_original[idx_sorted]
+                rc_original = rc_original[idx_sorted]
+
+            epsilon = 1e-9
+            if rt_original.numel() == 0:
+                continue # Skip sensors with no hits after processing
+            
+            charges_log_norm = torch.log1p(rc_original.clamp(min=0.0))
+            times_log_norm = torch.log(rt_original.clamp(min=0.0) + epsilon)
+
+            sensor_data = {
+                "charges_log_norm": charges_log_norm,
+                "times_log_norm": times_log_norm,
                 "sensor_pos": sensor_pos,
+                "truth_zenith": truth_zenith,
+                "truth_azimuth": truth_azimuth,
+                "truth_energy": truth_energy,
             }
-        
-        charges_log_norm = torch.log1p(rc_original.clamp(min=0.0))
-        times_log_norm = torch.log(rt_original.clamp(min=0.0) + epsilon)
-
-        return {
-            "charges_log_norm": charges_log_norm,
-            "times_log_norm": times_log_norm,
-            "sensor_pos": sensor_pos,
-        }
+            event_sensors_data.append(sensor_data)
+            
+        return event_sensors_data
 
 def reduce_by_window(arr, window_size):
     if arr.size == 0:
