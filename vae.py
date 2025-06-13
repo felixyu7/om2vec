@@ -25,10 +25,23 @@ class NT_VAE(pl.LightningModule):
                  lr_schedule=[10, 1e-6],
                  weight_decay=1e-5,
                  charge_loss_weight=1.0,
-                 interval_loss_weight=1.0
+                 interval_loss_weight=1.0,
+                 infomax: bool = False,
+                 infomax_gamma: float = 1.0
                  ):
         super().__init__()
         self.save_hyperparameters()
+
+        if self.hparams.infomax:
+            # Score function for InfoNCE
+            # It takes concatenated [cls_representation, z]
+            # cls_representation is embed_dim, z is latent_dim
+            infomax_input_dim = self.hparams.embed_dim + self.hparams.latent_dim
+            self.infomax_score_nn = nn.Sequential(
+                nn.Linear(infomax_input_dim, infomax_input_dim // 2),
+                nn.ReLU(),
+                nn.Linear(infomax_input_dim // 2, 1)
+            )
 
         # Summary stats dimensions - stored directly in latent vector z
         self.summary_stats_dim = 4
@@ -111,6 +124,7 @@ class NT_VAE(pl.LightningModule):
             stats_dict: Dictionary containing calculated summary statistics and original_lengths.
                         Used by forward pass for loss calculation targets.
             encoder_time_features_padded: (B,S) - log_normalized time intervals for loss calculation.
+            cls_representation: (B, embed_dim) - The CLS token representation from the encoder.
         """
         B, S = charges_log_norm_padded.shape
         device = charges_log_norm_padded.device
@@ -186,7 +200,7 @@ class NT_VAE(pl.LightningModule):
         deterministic_logvar = torch.full_like(summary_stats_tensor, -10.0)  # Very small but not underflowing variance
         logvar_full = torch.cat([deterministic_logvar, logvar_content], dim=-1)  # (B, latent_dim)
 
-        return mu_full, logvar_full, stats_dict, encoder_time_features_padded
+        return mu_full, logvar_full, stats_dict, encoder_time_features_padded, cls_representation
 
     def reparameterize(self, mu, logvar):
         """Standard VAE reparameterization trick."""
@@ -349,7 +363,7 @@ class NT_VAE(pl.LightningModule):
         sensor_pos_padded = batch['sensor_pos_batched'].float()
 
         # Encode - this now calculates summary stats and encoder_time_features (intervals) internally
-        mu, logvar, stats_dict_from_encode, encoder_time_features_target = self.encode(
+        mu, logvar, stats_dict_from_encode, encoder_time_features_target, cls_representation = self.encode(
             charges_log_norm_padded=charges_log_norm_padded,
             times_log_norm_abs_padded=times_log_norm_abs_padded, # Pass absolute times
             sensor_pos_padded=sensor_pos_padded,
@@ -373,15 +387,49 @@ class NT_VAE(pl.LightningModule):
         # (these are also unpadded by the loss function).
         # The 'encoder_time_features_target' from encode output are these target intervals.
 
-        return {
+        output = {
             'mu': mu,
             'logvar': logvar,
+            'z': z,
             'reconstructed_charges': reconstructed_charges,
             'reconstructed_intervals': reconstructed_intervals,
             'original_charges_log_norm_padded': charges_log_norm_padded, # Target for charge recon
             'original_intervals_log_norm_padded': encoder_time_features_target, # Target for interval recon
             'original_lengths': original_lengths # For unpadding targets in loss
         }
+        if self.hparams.infomax:
+           output['cls_representation'] = cls_representation
+        
+        return output
+
+    def _calculate_infonce_loss(self, z, cls_representation):
+       """
+       Calculates the InfoNCE loss to maximize mutual information between
+       the input representation (cls_representation) and the latent code (z).
+       """
+       B = z.size(0)
+       # The score function f(x, z) is approximated by a small neural network.
+       # Here, 'x' is the cls_representation from the encoder.
+
+       # Positive scores: f(x_i, z_i) for each item in the batch
+       positive_pairs = torch.cat((cls_representation, z), dim=1)
+       positive_scores = self.infomax_score_nn(positive_pairs) # (B, 1)
+
+       # Negative scores: f(x_i, z_j) for all i != j
+       # We can compute this efficiently by creating all pairs (x_i, z_j)
+       cls_expanded = cls_representation.unsqueeze(1).expand(-1, B, -1) # (B, B, embed_dim)
+       z_expanded = z.unsqueeze(0).expand(B, -1, -1) # (B, B, latent_dim)
+       
+       all_pairs = torch.cat((cls_expanded, z_expanded), dim=2) # (B, B, embed_dim + latent_dim)
+       all_scores = self.infomax_score_nn(all_pairs.view(B * B, -1)).view(B, B) # (B, B)
+
+       # The InfoNCE loss for each x_i is log [ exp(f(x_i, z_i)) / sum_j(exp(f(x_i, z_j))) ]
+       # This is equivalent to CrossEntropyLoss where logits are the scores
+       # and labels are the indices of the positive pairs (0, 1, 2, ..., B-1)
+       labels = torch.arange(B, device=z.device)
+       infonce_loss = F.cross_entropy(all_scores, labels)
+
+       return infonce_loss
 
     def _calculate_loss(self, forward_output):
         """Calculate reconstruction and KL divergence losses."""
@@ -403,13 +451,30 @@ class NT_VAE(pl.LightningModule):
         mu_content = mu_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
         logvar_content = logvar_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
 
-        # kl divergence loss with free-bits
-        free_nats = 0.2
-        kl_per_dim = 0.5 * (mu_content.pow(2) + logvar_content.exp() - 1.0 - logvar_content)
-        # “Information floor”: each dim must pay at least `free_nats`
-        kl_per_dim = torch.clamp(kl_per_dim, min=free_nats)
-        # Sum over latent dims, then mean over the batch
-        kld_loss = kl_per_dim.sum(dim=1).mean()
+        # KL divergence on the aggregated posterior KL(q(z)||p(z))
+        # where q(z) = 1/B * sum_i q(z|x_i)
+        z = forward_output['z']
+        z_content = z[:, self.summary_stats_dim:]
+        B, D = z_content.shape
+
+        # 1. log p(z_i) for each z_i in the batch, where p(z) = N(0, I)
+        log_p_z = (-0.5 * (torch.log(torch.tensor(2. * np.pi)) + z_content.pow(2))).sum(dim=1)
+
+        # 2. log q(z_i) for each z_i, where q(z) is the mixture of posteriors
+        # log q(z_i) = logsumexp_j(log q(z_i|x_j)) - log B
+        mu_j = mu_content.unsqueeze(0)
+        logvar_j = logvar_content.unsqueeze(0)
+        z_i = z_content.unsqueeze(1)
+
+        log_q_z_given_x_per_dim = -0.5 * (
+            torch.log(torch.tensor(2. * np.pi)) + logvar_j + (z_i - mu_j).pow(2) / logvar_j.exp()
+        )
+        log_q_z_given_x = log_q_z_given_x_per_dim.sum(dim=2)
+        log_q_z = torch.logsumexp(log_q_z_given_x, dim=1) - torch.log(torch.tensor(B, dtype=torch.float32))
+
+        # KL(q(z)||p(z)) = E_q(z)[log q(z) - log p(z)]
+        # Approximated as a sample mean over the batch
+        kld_loss = (log_q_z - log_p_z).mean()
 
         # Vectorized reconstruction losses with proper masking
         # Create masks for valid positions
@@ -476,11 +541,20 @@ class NT_VAE(pl.LightningModule):
         else:
             interval_recon_loss = torch.tensor(0.0, device=device)
 
-        return {
+        losses = {
             'kld_loss': kld_loss,
             'charge_recon_loss': charge_recon_loss,
             'interval_recon_loss': interval_recon_loss
         }
+
+        # --- InfoMax Loss Calculation ---
+        if self.hparams.infomax:
+           z = forward_output['z']
+           cls_representation = forward_output['cls_representation']
+           infonce_loss = self._calculate_infonce_loss(z, cls_representation)
+           losses['infonce_loss'] = infonce_loss
+        
+        return losses
 
     def training_step(self, batch, batch_idx):
         forward_output = self(batch)
@@ -503,6 +577,11 @@ class NT_VAE(pl.LightningModule):
         total_loss = (self.beta * losses['kld_loss'] +
                      self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
                      self.hparams.interval_loss_weight * losses['interval_recon_loss'])
+
+        if self.hparams.infomax:
+            infonce_loss = losses['infonce_loss']
+            total_loss += self.hparams.infomax_gamma * infonce_loss
+            self.log('train_infonce_loss', infonce_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=self.hparams.batch_size)
 
         # Keep manual counter as backup
         # self.current_train_iter is no longer used
