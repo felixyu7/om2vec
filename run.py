@@ -63,8 +63,8 @@ if __name__=="__main__":
         vae_init_args = {
             "latent_dim": cfg['model_options']['latent_dim'],
             "embed_dim": cfg['model_options']['embed_dim'],
-            "beta_factor": cfg['model_options']['beta_factor'],
-            "beta_peak_epoch": cfg['model_options']['beta_peak_epoch'],
+            "alpha": cfg['model_options']['alpha'],
+            "lambda_": cfg['model_options']['lambda_'],
             "max_seq_len_padding": cfg['data_options']['max_seq_len_padding'],
             "transformer_encoder_layers": cfg['model_options']['transformer_encoder_layers'],
             "transformer_encoder_heads": cfg['model_options']['transformer_encoder_heads'],

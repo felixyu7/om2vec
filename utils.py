@@ -19,6 +19,37 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
+def imq_kernel_multi(z, prior_z, scales=None, eps=1e-7):
+    """
+    Multi-scale inverse-multiquadratic kernel matrix.
+    Returns K_zz, K_pp, K_zp (all WITHOUT diagonals) ready for an unbiased MMD².
+    """
+    if scales is None:
+        scales = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+    # Pair-wise squared L2 distances • no tiling needed
+    d_z_z  = torch.cdist(z,        z,        p=2).pow(2)
+    d_p_p  = torch.cdist(prior_z,  prior_z,  p=2).pow(2)
+    d_z_p  = torch.cdist(z,        prior_z,  p=2).pow(2)
+
+    k_zz, k_pp, k_zp = 0.0, 0.0, 0.0
+    dim = z.size(1)
+
+    for s in scales:
+        c = 2.0 * dim * s          # heuristic used in Pythae & Ermon-group code
+        k_zz += c / (c + d_z_z / s + eps)
+        k_pp += c / (c + d_p_p / s + eps)
+        k_zp += c / (c + d_z_p / s + eps)
+
+    # Average across scales
+    k_zz /= len(scales); k_pp /= len(scales); k_zp /= len(scales)
+
+    # Remove diagonal elements to get an unbiased U-statistic
+    k_zz = k_zz - torch.diag_embed(torch.diagonal(k_zz))
+    k_pp = k_pp - torch.diag_embed(torch.diagonal(k_pp))
+
+    return k_zz, k_pp, k_zp
+
 # --- Mixture of Gaussians NLL helper ---
 def mixture_gaussian_nll(target, weights, means, logvars, eps=1e-8):
     """
@@ -39,20 +70,6 @@ def mixture_gaussian_nll(target, weights, means, logvars, eps=1e-8):
     log_mix = torch.logsumexp(log_weights + log_prob, dim=-1)
     nll = -log_mix.mean()
     return nll
-def calculate_sequence_lengths(attention_mask):
-    """
-    Calculates the actual sequence lengths from a boolean attention mask.
-
-    Args:
-        attention_mask (torch.Tensor): Boolean tensor of shape (B, S),
-                                       where True indicates a padding token.
-
-    Returns:
-        torch.Tensor: Tensor of shape (B,) containing actual sequence lengths.
-    """
-    # If True is padding, then non-padding is (attention_mask == False) or (~attention_mask)
-    # Summing along the sequence dimension gives the number of non-padding tokens.
-    return (~attention_mask).sum(dim=1).long()
 
 def calculate_summary_stats(charges_log_norm_padded, times_log_norm_padded, attention_mask, epsilon=1e-9):
     """
