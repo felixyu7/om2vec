@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 import numpy as np
 
 class PositionalEncoding(nn.Module):
@@ -44,27 +43,6 @@ def imq_kernel_multi(z, prior_z, scales=None, eps=1e-7):
     k_pp -= torch.diag_embed(torch.diagonal(k_pp))
     return k_zz, k_pp, k_zp
 
-# --- Mixture of Gaussians NLL helper ---
-def mixture_gaussian_nll(target, weights, means, logvars, eps=1e-8):
-    """
-    Args:
-        target: (N,) ground truth values
-        weights: (N, K) mixture logits (not softmaxed)
-        means: (N, K)
-        logvars: (N, K)
-    Returns:
-        nll: scalar, mean negative log-likelihood
-    """
-    # weights: logits, so softmax
-    log_weights = F.log_softmax(weights, dim=-1)  # (N, K)
-    var = torch.exp(logvars)
-    # log-prob for each component
-    log_prob = -0.5 * (np.log(2 * np.pi) + logvars + ((target.unsqueeze(-1) - means) ** 2) / (var + eps))
-    # log-sum-exp over components
-    log_mix = torch.logsumexp(log_weights + log_prob, dim=-1)
-    nll = -log_mix.mean()
-    return nll
-
 def calculate_sequence_lengths(attention_mask):
     """
     Calculates the actual sequence lengths from a boolean attention mask.
@@ -76,8 +54,6 @@ def calculate_sequence_lengths(attention_mask):
     Returns:
         torch.Tensor: Tensor of shape (B,) containing actual sequence lengths.
     """
-    # If True is padding, then non-padding is (attention_mask == False) or (~attention_mask)
-    # Summing along the sequence dimension gives the number of non-padding tokens.
     return (~attention_mask).sum(dim=1).long()
 
 def calculate_summary_stats(charges_log_norm_padded, times_log_norm_padded, attention_mask, epsilon=1e-9):
@@ -193,3 +169,22 @@ def convert_absolute_times_to_log_intervals(times_log_norm_padded, original_leng
     log_time_intervals_padded.masked_fill_(interval_padding_mask, torch.log(torch.tensor(epsilon, device=device))) # or 0.0 if preferred for padding
 
     return log_time_intervals_padded
+
+def reparameterize(mu, logvar):
+    """Standard VAE reparameterization trick."""
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mu + eps * std
+
+def calculate_mmd_loss(z):
+    """Unbiased multi-scale IMQ-MMD² between q(z) and N(0,I)."""
+    prior_z = torch.randn_like(z)
+    k_zz, k_pp, k_zp = imq_kernel_multi(z, prior_z)
+
+    n = z.size(0); m = prior_z.size(0)
+
+    mmd2 = (k_zz.sum() / (n * (n - 1))
+        + k_pp.sum() / (m * (m - 1))
+        - 2 * k_zp.mean())
+
+    return mmd2
