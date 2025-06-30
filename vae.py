@@ -403,11 +403,8 @@ class NT_VAE(pl.LightningModule):
         mu_content = mu_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
         logvar_content = logvar_full[:, self.summary_stats_dim:]  # (B, z_content_dim)
 
-        # kl divergence loss with free-bits
-        free_nats = 0.2
+        # kl divergence loss
         kl_per_dim = 0.5 * (mu_content.pow(2) + logvar_content.exp() - 1.0 - logvar_content)
-        # “Information floor”: each dim must pay at least `free_nats`
-        kl_per_dim = torch.clamp(kl_per_dim, min=free_nats)
         # Sum over latent dims, then mean over the batch
         kld_loss = kl_per_dim.sum(dim=1).mean()
 
@@ -445,7 +442,7 @@ class NT_VAE(pl.LightningModule):
         pred_charges_log_norm = torch.log1p(reconstructed_charges)
         
         # Compute smooth L1 loss and mask invalid positions
-        charge_losses = F.mse_loss(pred_charges_log_norm, original_charges_log_norm_padded, reduction='none')
+        charge_losses = F.smooth_l1_loss(pred_charges_log_norm, original_charges_log_norm_padded, reduction='none')
         charge_losses = charge_losses * charge_valid_mask.float()
         
         # Average over valid positions only
@@ -467,7 +464,7 @@ class NT_VAE(pl.LightningModule):
             target_intervals = original_intervals_log_norm_padded[:, :-1]
             
             # Compute smooth L1 loss and mask invalid positions
-            interval_losses = F.mse_loss(pred_intervals_log_norm, target_intervals, reduction='none')
+            interval_losses = F.smooth_l1_loss(pred_intervals_log_norm, target_intervals, reduction='none')
             interval_losses = interval_losses * interval_valid_mask.float()
             
             # Average over valid positions only
@@ -501,13 +498,14 @@ class NT_VAE(pl.LightningModule):
         
         # MMD Loss
         z = self.reparameterize(forward_output['mu'], forward_output['logvar'])
-        mmd_loss = self._calculate_mmd_loss(z)
+        z_content = z[:, self.summary_stats_dim:]  # Extract content part only for MMD
+        mmd_loss = self._calculate_mmd_loss(z_content)
 
         # Total loss
         total_loss = (self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
                       self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
-                      (self.hparams.alpha - 1) * losses['kld_loss'] +
-                      self.hparams.lambda_ * mmd_loss)
+                      (1 - self.hparams.alpha) * losses['kld_loss'] +
+                      (self.hparams.lambda_ + self.hparams.alpha - 1) * mmd_loss)
 
         # Logging
         self.log("train_loss", total_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
@@ -524,13 +522,14 @@ class NT_VAE(pl.LightningModule):
         
         # MMD Loss
         z = self.reparameterize(forward_output['mu'], forward_output['logvar'])
-        mmd_loss = self._calculate_mmd_loss(z)
+        z_content = z[:, self.summary_stats_dim:]  # Extract content part only for MMD
+        mmd_loss = self._calculate_mmd_loss(z_content)
 
         # Total loss
         total_loss = (self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
                       self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
-                      (self.hparams.alpha - 1) * losses['kld_loss'] +
-                      self.hparams.lambda_ * mmd_loss)
+                      (1 - self.hparams.alpha) * losses['kld_loss'] +
+                      (self.hparams.lambda_ + self.hparams.alpha - 1) * mmd_loss)
 
         # Logging
         self.log("val_loss", total_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
@@ -547,13 +546,14 @@ class NT_VAE(pl.LightningModule):
         
         # MMD Loss
         z = self.reparameterize(forward_output['mu'], forward_output['logvar'])
-        mmd_loss = self._calculate_mmd_loss(z)
+        z_content = z[:, self.summary_stats_dim:]  # Extract content part only for MMD
+        mmd_loss = self._calculate_mmd_loss(z_content)
 
         # Total loss
         total_loss = (self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
                       self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
-                      (self.hparams.alpha - 1) * losses['kld_loss'] +
-                      self.hparams.lambda_ * mmd_loss)
+                      (1 - self.hparams.alpha) * losses['kld_loss'] +
+                      (self.hparams.lambda_ + self.hparams.alpha - 1) * mmd_loss)
 
         # Logging
         self.log("test_loss", total_loss, batch_size=self.hparams.batch_size, sync_dist=True, prog_bar=True)
