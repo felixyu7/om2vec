@@ -163,7 +163,7 @@ class NT_VAE(pl.LightningModule):
         # --- 4. Reconstruct Charges via Softmax Partitioning ---
         raw_charge_scores = self.output_projection_charge(transformed_sequence).squeeze(-1)
         masked_charge_scores = raw_charge_scores.masked_fill(~valid_mask, -float('inf'))
-        charge_probs = torch.softmax(masked_charge_scores, dim=-1).to(masked_charge_scores.dtype)
+        charge_probs = torch.softmax(masked_charge_scores, dim=-1)
         actual_total_charge = torch.exp(log_total_charge_z) - 1.0
         reconstructed_charges = charge_probs * actual_total_charge.unsqueeze(-1)
 
@@ -175,7 +175,7 @@ class NT_VAE(pl.LightningModule):
         interval_probs = torch.zeros_like(masked_interval_scores)
         valid_rows = ~torch.all(masked_interval_scores == -float('inf'), dim=-1)
         if valid_rows.any():
-            interval_probs[valid_rows] = torch.softmax(masked_interval_scores[valid_rows], dim=-1).to(interval_probs.dtype)
+            interval_probs[valid_rows] = torch.softmax(masked_interval_scores[valid_rows], dim=-1)
 
         actual_t_first = torch.exp(log_t_first_z)
         total_duration = (torch.exp(log_t_last_z) - actual_t_first).clamp(min=1e-9)
@@ -239,17 +239,6 @@ class NT_VAE(pl.LightningModule):
         mu_content = mu_full[:, self.summary_stats_dim:]
         logvar_content = logvar_full[:, self.summary_stats_dim:]
         kld_loss = 0.5 * (mu_content.pow(2) + logvar_content.exp() - 1.0 - logvar_content).sum(dim=1).mean()
-
-        # --- Pad original targets to match decoder output size ---
-        original_charges_size = original_charges_log_norm_padded.size(1)
-        if original_charges_size < max_len:
-            padding_size = max_len - original_charges_size
-            original_charges_log_norm_padded = F.pad(original_charges_log_norm_padded, (0, padding_size))
-
-        original_intervals_size = original_intervals_log_norm_padded.size(1)
-        if original_intervals_size < max_len:
-            padding_size = max_len - original_intervals_size
-            original_intervals_log_norm_padded = F.pad(original_intervals_log_norm_padded, (0, padding_size))
 
         # --- Reconstruction Losses ---
         range_tensor = torch.arange(max_len, device=device).unsqueeze(0)
