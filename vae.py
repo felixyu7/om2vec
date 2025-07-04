@@ -88,53 +88,76 @@ class NT_VAE(pl.LightningModule):
         B, S = charges_log_norm_padded.shape
         device = charges_log_norm_padded.device
 
-        # 1. Calculate summary statistics
+        # 1. Calculate summary statistics (always needed)
         stats_dict = calculate_summary_stats(charges_log_norm_padded, times_log_norm_abs_padded, attention_mask)
-        log_seq_length = stats_dict['log_seq_length']
-        log_total_charge = stats_dict['log_total_charge']
-        log_first_hit_time = stats_dict['log_first_hit_time']
-        log_last_hit_time = stats_dict['log_last_hit_time']
         original_lengths = stats_dict['original_lengths']
+        summary_stats_tensor = torch.stack([
+            stats_dict['log_seq_length'],
+            stats_dict['log_total_charge'],
+            stats_dict['log_first_hit_time'],
+            stats_dict['log_last_hit_time']
+        ], dim=-1)
 
-        # 2. Convert absolute times to log-normalized intervals
-        encoder_time_features_padded = convert_absolute_times_to_log_intervals(times_log_norm_abs_padded, original_lengths, attention_mask)
+        # 2. Identify multi-hit sequences that require transformer processing
+        is_multi_hit = original_lengths > 1
+        num_multi_hit = is_multi_hit.sum()
 
-        # 3. Form summary stats tensor
-        summary_stats_tensor = torch.stack([log_seq_length, log_total_charge, log_first_hit_time, log_last_hit_time], dim=-1)
+        # Initialize content latent parameters to a deterministic zero state
+        mu_content = torch.zeros(B, self.z_content_dim, device=device)
+        # Initialize logvar to a large negative value for a near-zero std dev
+        logvar_content = torch.full((B, self.z_content_dim), -10.0, device=device)
 
-        # 4. Embed input sequences
-        concatenated_input = torch.stack((charges_log_norm_padded, encoder_time_features_padded), dim=-1).float()
-        embedded_input = self.encoder_input_embedding(concatenated_input)
+        # 3. Process multi-hit sequences through the transformer encoder
+        if num_multi_hit > 0:
+            # Select only the multi-hit sequences for processing
+            mh_charges = charges_log_norm_padded[is_multi_hit]
+            mh_times_abs = times_log_norm_abs_padded[is_multi_hit]
+            mh_lengths = original_lengths[is_multi_hit]
+            mh_attn_mask = attention_mask[is_multi_hit]
+            mh_sensor_pos = sensor_pos_padded[is_multi_hit]
 
-        # 5. Prepend CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        embedded_with_cls = torch.cat([cls_tokens, embedded_input], dim=1)
-        embedded_with_cls = self.pos_encoder(embedded_with_cls)
+            # Convert absolute times to log-normalized intervals
+            mh_time_features = convert_absolute_times_to_log_intervals(mh_times_abs, mh_lengths, mh_attn_mask)
+            
+            # Embed input sequences
+            mh_concatenated_input = torch.stack((mh_charges, mh_time_features), dim=-1).float()
+            mh_embedded_input = self.encoder_input_embedding(mh_concatenated_input)
 
-        # 6. Prepare attention mask
-        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
-        extended_attention_mask = torch.cat([cls_mask, attention_mask], dim=1)
+            # Prepend CLS token
+            mh_cls_tokens = self.cls_token.expand(num_multi_hit, -1, -1)
+            mh_embedded_with_cls = torch.cat([mh_cls_tokens, mh_embedded_input], dim=1)
+            mh_embedded_with_cls = self.pos_encoder(mh_embedded_with_cls)
 
-        # 7. Pass through transformer encoder
-        encoded_sequence = self.transformer_encoder(embedded_with_cls, src_key_padding_mask=extended_attention_mask)
+            # Prepare attention mask
+            mh_cls_mask = torch.zeros(num_multi_hit, 1, dtype=torch.bool, device=device)
+            mh_extended_attention_mask = torch.cat([mh_cls_mask, mh_attn_mask], dim=1)
+
+            # Pass through transformer encoder
+            mh_encoded_sequence = self.transformer_encoder(mh_embedded_with_cls, src_key_padding_mask=mh_extended_attention_mask)
+            
+            # Extract CLS token representation
+            mh_cls_representation = mh_encoded_sequence[:, 0, :]
+            
+            # Concatenate CLS representation with sensor position
+            mh_encoder_latent_input = torch.cat((mh_cls_representation, mh_sensor_pos), dim=1)
+
+            # Project to content latent parameters
+            mh_mu_content = self.to_latent_mu(mh_encoder_latent_input)
+            mh_logvar_content = self.to_latent_logvar(mh_encoder_latent_input).clamp(min=-10, max=10)
+
+            # Scatter results back to the full batch tensors
+            mu_content[is_multi_hit] = mh_mu_content
+            logvar_content[is_multi_hit] = mh_logvar_content
+
+        # 4. For 1-hit sequences, mu_content and logvar_content remain zero (deterministic content)
         
-        # 8. Extract CLS token representation
-        cls_representation = encoded_sequence[:, 0, :]
-        
-        # 9. Concatenate CLS representation with sensor position
-        encoder_latent_input = torch.cat((cls_representation, sensor_pos_padded), dim=1)
-
-        # 10. Project to content latent parameters
-        mu_content = self.to_latent_mu(encoder_latent_input)
-        logvar_content = self.to_latent_logvar(encoder_latent_input)
-
-        # 11. Clamp logvar for stability
-        logvar_content = torch.clamp(logvar_content, min=-10, max=10)
-
-        # 12. Construct full mu and logvar
+        # 5. Construct full mu and logvar
         mu_full = torch.cat([summary_stats_tensor, mu_content], dim=-1)
         deterministic_logvar = torch.full_like(summary_stats_tensor, -10.0)
         logvar_full = torch.cat([deterministic_logvar, logvar_content], dim=-1)
+
+        # Note: encoder_time_features_padded is needed as a target for the loss function
+        encoder_time_features_padded = convert_absolute_times_to_log_intervals(times_log_norm_abs_padded, original_lengths, attention_mask)
 
         return mu_full, logvar_full, stats_dict, encoder_time_features_padded
 
@@ -144,48 +167,68 @@ class NT_VAE(pl.LightningModule):
         B, device = z.size(0), z.device
         max_len = self.hparams.max_seq_len_padding
 
-        # --- 1. Unpack Summary Stats from Latent Vector ---
+        # 1. Unpack summary stats and determine sequence lengths
         summary_stats = z[:, :self.summary_stats_dim]
         log_seq_length_z, log_total_charge_z, log_t_first_z, log_t_last_z = summary_stats.T
-
         seq_lengths_continuous = torch.exp(log_seq_length_z).clamp(min=1.0, max=float(max_len))
         actual_seq_lengths = torch.floor(seq_lengths_continuous).long() if inference else torch.round(seq_lengths_continuous).long()
 
-        # --- 2. Prepare Input for Transformer Decoder ---
-        z_projected = self.decoder_latent_to_input_proj(z)
-        decoder_input = z_projected.unsqueeze(1) + self.query_embed.unsqueeze(0)
-        decoder_input = self.decoder_pos_encoder(decoder_input)
+        # 2. Identify multi-hit sequences that require transformer processing
+        is_multi_hit = actual_seq_lengths > 1
+        num_multi_hit = is_multi_hit.sum()
 
-        # --- 3. Transformer Decoding ---
-        valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < actual_seq_lengths.unsqueeze(1)
-        transformed_sequence = self.decoder_transformer(src=decoder_input, src_key_padding_mask=~valid_mask)
+        # Initialize full output tensors
+        charge_probs = torch.zeros(B, max_len, device=device)
+        interval_probs = torch.zeros(B, max_len, device=device)
 
-        # --- 4. Reconstruct Charges via Softmax Partitioning ---
-        raw_charge_scores = self.output_projection_charge(transformed_sequence).squeeze(-1)
-        masked_charge_scores = raw_charge_scores.masked_fill(~valid_mask, -float('inf'))
-        charge_probs = torch.softmax(masked_charge_scores, dim=-1).to(masked_charge_scores.dtype)
-        actual_total_charge = torch.exp(log_total_charge_z) - 1.0
-        reconstructed_charges = charge_probs * actual_total_charge.unsqueeze(-1)
+        # 3. Handle 1-hit sequences deterministically
+        # For a 1-hit sequence, all charge probability is in the first bin.
+        charge_probs[~is_multi_hit, 0] = 1.0
+        # Interval probabilities remain all zero.
 
-        # --- 5. Reconstruct Time Intervals via L-1 Mask Partitioning ---
-        raw_interval_scores = self.output_projection_intervals(transformed_sequence).squeeze(-1)
-        interval_mask = (torch.arange(max_len, device=device).unsqueeze(0) < (actual_seq_lengths - 1).unsqueeze(1)) & (actual_seq_lengths.unsqueeze(1) > 1)
-        masked_interval_scores = raw_interval_scores.masked_fill(~interval_mask, -float('inf'))
-        
-        interval_probs = torch.zeros_like(masked_interval_scores)
-        valid_rows = ~torch.all(masked_interval_scores == -float('inf'), dim=-1)
-        if valid_rows.any():
-            interval_probs[valid_rows] = torch.softmax(masked_interval_scores[valid_rows], dim=-1).to(interval_probs.dtype)
+        # 4. Process multi-hit sequences through the transformer decoder
+        if num_multi_hit > 0:
+            # Select only the multi-hit sequences for processing
+            mh_z = z[is_multi_hit]
+            mh_lengths = actual_seq_lengths[is_multi_hit]
 
-        actual_t_first = torch.exp(log_t_first_z)
-        total_duration = (torch.exp(log_t_last_z) - actual_t_first).clamp(min=1e-9)
-        reconstructed_intervals = interval_probs * total_duration.unsqueeze(-1)
+            # Prepare input for Transformer Decoder
+            mh_z_projected = self.decoder_latent_to_input_proj(mh_z)
+            mh_decoder_input = mh_z_projected.unsqueeze(1) + self.query_embed.unsqueeze(0)
+            mh_decoder_input = self.decoder_pos_encoder(mh_decoder_input)
 
-        # --- 6. Format Output ---
+            # Transformer Decoding
+            mh_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < mh_lengths.unsqueeze(1)
+            mh_transformed_sequence = self.decoder_transformer(src=mh_decoder_input, src_key_padding_mask=~mh_valid_mask)
+
+            # Reconstruct Charges via Softmax Partitioning
+            mh_raw_charge_scores = self.output_projection_charge(mh_transformed_sequence).squeeze(-1)
+            mh_masked_charge_scores = mh_raw_charge_scores.masked_fill(~mh_valid_mask, -float('inf'))
+            mh_charge_probs = torch.softmax(mh_masked_charge_scores, dim=-1).to(mh_masked_charge_scores.dtype)
+            
+            # Reconstruct Time Intervals
+            mh_raw_interval_scores = self.output_projection_intervals(mh_transformed_sequence).squeeze(-1)
+            mh_interval_mask = torch.arange(max_len, device=device).unsqueeze(0) < (mh_lengths - 1).unsqueeze(1)
+            mh_masked_interval_scores = mh_raw_interval_scores.masked_fill(~mh_interval_mask, -float('inf'))
+            mh_interval_probs = torch.softmax(mh_masked_interval_scores, dim=-1).to(mh_masked_interval_scores.dtype)
+
+            # Scatter results back to the full batch tensors
+            charge_probs[is_multi_hit] = mh_charge_probs
+            interval_probs[is_multi_hit] = mh_interval_probs
+
+        # 5. Format output based on whether we are in inference mode or not
         if not inference:
             return {'charge_probs': charge_probs, 'interval_probs': interval_probs}
         else:
+            # This part is for generating actual sequences for visualization or analysis
             output_tq_pairs = []
+            actual_total_charge = torch.exp(log_total_charge_z) - 1.0
+            reconstructed_charges = charge_probs * actual_total_charge.unsqueeze(-1)
+            
+            actual_t_first = torch.exp(log_t_first_z)
+            total_duration = (torch.exp(log_t_last_z) - actual_t_first).clamp(min=1e-9)
+            reconstructed_intervals = interval_probs * total_duration.unsqueeze(-1)
+
             for i in range(B):
                 seq_len = actual_seq_lengths[i].item()
                 t_first = actual_t_first[i]
@@ -255,21 +298,38 @@ class NT_VAE(pl.LightningModule):
         range_tensor = torch.arange(max_len, device=device).unsqueeze(0)
         charge_valid_mask = range_tensor < original_lengths.unsqueeze(1)
 
-        # --- Charge Reconstruction Loss (Wasserstein) ---
-        true_charges_unnorm = torch.expm1(original_charges_log_norm_padded) # Inverse of log1p
-        true_charges_unnorm.masked_fill_(~charge_valid_mask, 0)
-        true_charge_dist = true_charges_unnorm / (true_charges_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
-        charge_recon_loss = calculate_wasserstein_loss(charge_probs, true_charge_dist, charge_valid_mask)
+        # --- Reconstruction Losses (for multi-hit sequences only) ---
+        is_multi_hit = original_lengths > 1
+        num_multi_hit = is_multi_hit.sum()
 
-        # --- Interval Reconstruction Loss (Wasserstein) ---
-        # A sequence of length N has N-1 intervals.
-        interval_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < (original_lengths - 1).unsqueeze(1)
-        if interval_valid_mask.any():
-            true_intervals_unnorm = torch.exp(original_intervals_log_norm_padded) # Inverse of log
-            true_intervals_unnorm.masked_fill_(~interval_valid_mask, 0)
-            true_interval_dist = true_intervals_unnorm / (true_intervals_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
-            interval_recon_loss = calculate_wasserstein_loss(interval_probs, true_interval_dist, interval_valid_mask)
+        if num_multi_hit > 0:
+            # Select only the multi-hit sequences for reconstruction loss calculation
+            mh_charge_probs = charge_probs[is_multi_hit]
+            mh_original_charges = original_charges_log_norm_padded[is_multi_hit]
+            mh_charge_valid_mask = charge_valid_mask[is_multi_hit]
+
+            # Charge Reconstruction Loss (Wasserstein)
+            mh_true_charges_unnorm = torch.expm1(mh_original_charges) # Inverse of log1p
+            mh_true_charges_unnorm.masked_fill_(~mh_charge_valid_mask, 0)
+            mh_true_charge_dist = mh_true_charges_unnorm / (mh_true_charges_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
+            charge_recon_loss = calculate_wasserstein_loss(mh_charge_probs, mh_true_charge_dist, mh_charge_valid_mask)
+
+            # Interval Reconstruction Loss (Wasserstein)
+            interval_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < (original_lengths - 1).unsqueeze(1)
+            mh_interval_probs = interval_probs[is_multi_hit]
+            mh_original_intervals = original_intervals_log_norm_padded[is_multi_hit]
+            mh_interval_valid_mask = interval_valid_mask[is_multi_hit]
+            
+            if mh_interval_valid_mask.any():
+                mh_true_intervals_unnorm = torch.exp(mh_original_intervals) # Inverse of log
+                mh_true_intervals_unnorm.masked_fill_(~mh_interval_valid_mask, 0)
+                mh_true_interval_dist = mh_true_intervals_unnorm / (mh_true_intervals_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
+                interval_recon_loss = calculate_wasserstein_loss(mh_interval_probs, mh_true_interval_dist, mh_interval_valid_mask)
+            else:
+                interval_recon_loss = torch.tensor(0.0, device=device)
         else:
+            # If the batch contains only 1-hit sequences, reconstruction loss is 0
+            charge_recon_loss = torch.tensor(0.0, device=device)
             interval_recon_loss = torch.tensor(0.0, device=device)
 
         return {
