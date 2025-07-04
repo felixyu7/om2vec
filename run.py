@@ -78,8 +78,8 @@ if __name__=="__main__":
             "lr": cfg['training_options']['lr'],
             "lr_schedule": cfg['training_options']['lr_schedule'],
             "weight_decay": cfg['training_options']['weight_decay'],
-            "charge_loss_weight": cfg['model_options']['charge_loss_weight'],
-            "interval_loss_weight": cfg['model_options']['interval_loss_weight'],
+            "charge_wasserstein_loss_weight": cfg['model_options']['charge_wasserstein_loss_weight'],
+            "interval_wasserstein_loss_weight": cfg['model_options']['interval_wasserstein_loss_weight'],
         }
 
         net = NT_VAE(**vae_init_args)

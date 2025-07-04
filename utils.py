@@ -188,3 +188,28 @@ def calculate_mmd_loss(z):
         - 2 * k_zp.mean())
 
     return mmd2
+
+def calculate_wasserstein_loss(pred_dist, true_dist, mask):
+    """
+    Calculates the 1D Wasserstein distance between two batches of distributions.
+    This is also known as the Earth Mover's Distance.
+
+    Args:
+        pred_dist (torch.Tensor): Predicted distributions (B, S), must sum to 1 over valid regions.
+        true_dist (torch.Tensor): True distributions (B, S), must sum to 1 over valid regions.
+        mask (torch.Tensor): Boolean mask (B, S), True for valid elements.
+
+    Returns:
+        torch.Tensor: The mean Wasserstein distance over the batch.
+    """
+    pred_dist = pred_dist * mask
+    true_dist = true_dist * mask
+
+    pred_cdf = torch.cumsum(pred_dist, dim=-1)
+    true_cdf = torch.cumsum(true_dist, dim=-1)
+
+    wasserstein_distance = torch.sum(torch.abs(pred_cdf - true_cdf), dim=-1)
+
+    loss = wasserstein_distance.mean()
+
+    return loss

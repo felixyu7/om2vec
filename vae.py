@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss
+from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, calculate_wasserstein_loss
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -23,8 +23,8 @@ class NT_VAE(pl.LightningModule):
                  lr=1e-3,
                  lr_schedule=[10, 1e-6],
                  weight_decay=1e-5,
-                 charge_loss_weight=1.0,
-                 interval_loss_weight=1.0
+                 charge_wasserstein_loss_weight=1.0,
+                 interval_wasserstein_loss_weight=1.0
                  ):
         super().__init__()
         self.save_hyperparameters()
@@ -183,7 +183,7 @@ class NT_VAE(pl.LightningModule):
 
         # --- 6. Format Output ---
         if not inference:
-            return {'reconstructed_charges': reconstructed_charges, 'reconstructed_intervals': reconstructed_intervals}
+            return {'charge_probs': charge_probs, 'interval_probs': interval_probs}
         else:
             output_tq_pairs = []
             for i in range(B):
@@ -215,8 +215,8 @@ class NT_VAE(pl.LightningModule):
         return {
             'mu': mu,
             'logvar': logvar,
-            'reconstructed_charges': decoded_output['reconstructed_charges'],
-            'reconstructed_intervals': decoded_output['reconstructed_intervals'],
+            'charge_probs': decoded_output['charge_probs'],
+            'interval_probs': decoded_output['interval_probs'],
             'original_charges_log_norm_padded': charges_log_norm_padded,
             'original_intervals_log_norm_padded': encoder_time_features_target,
             'original_lengths': stats_dict['original_lengths']
@@ -226,14 +226,14 @@ class NT_VAE(pl.LightningModule):
         """Calculate reconstruction and KL divergence losses."""
         mu_full = forward_output['mu']
         logvar_full = forward_output['logvar']
-        reconstructed_charges = forward_output['reconstructed_charges']
-        reconstructed_intervals = forward_output['reconstructed_intervals']
+        charge_probs = forward_output['charge_probs']
+        interval_probs = forward_output['interval_probs']
         original_charges_log_norm_padded = forward_output['original_charges_log_norm_padded']
         original_intervals_log_norm_padded = forward_output['original_intervals_log_norm_padded']
         original_lengths = forward_output['original_lengths']
 
         device = mu_full.device
-        B, max_len = reconstructed_charges.shape
+        B, max_len = charge_probs.shape
 
         # KLD Loss
         mu_content = mu_full[:, self.summary_stats_dim:]
@@ -255,18 +255,20 @@ class NT_VAE(pl.LightningModule):
         range_tensor = torch.arange(max_len, device=device).unsqueeze(0)
         charge_valid_mask = range_tensor < original_lengths.unsqueeze(1)
 
-        # Charge Loss
-        pred_charges_log_norm = torch.log1p(reconstructed_charges)
-        charge_losses = F.smooth_l1_loss(pred_charges_log_norm, original_charges_log_norm_padded, reduction='none')
-        charge_recon_loss = (charge_losses * charge_valid_mask).sum() / (charge_valid_mask.sum() + 1e-8)
+        # --- Charge Reconstruction Loss (Wasserstein) ---
+        true_charges_unnorm = torch.expm1(original_charges_log_norm_padded) # Inverse of log1p
+        true_charges_unnorm.masked_fill_(~charge_valid_mask, 0)
+        true_charge_dist = true_charges_unnorm / (true_charges_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
+        charge_recon_loss = calculate_wasserstein_loss(charge_probs, true_charge_dist, charge_valid_mask)
 
-        # Interval Loss
-        interval_valid_mask = (charge_valid_mask[:, :-1]) & (original_lengths.unsqueeze(1) > 1)
+        # --- Interval Reconstruction Loss (Wasserstein) ---
+        # A sequence of length N has N-1 intervals.
+        interval_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < (original_lengths - 1).unsqueeze(1)
         if interval_valid_mask.any():
-            pred_intervals_log_norm = torch.log(reconstructed_intervals[:, :-1].clamp(min=1e-9))
-            target_intervals = original_intervals_log_norm_padded[:, :-1]
-            interval_losses = F.smooth_l1_loss(pred_intervals_log_norm, target_intervals, reduction='none')
-            interval_recon_loss = (interval_losses * interval_valid_mask).sum() / (interval_valid_mask.sum() + 1e-8)
+            true_intervals_unnorm = torch.exp(original_intervals_log_norm_padded) # Inverse of log
+            true_intervals_unnorm.masked_fill_(~interval_valid_mask, 0)
+            true_interval_dist = true_intervals_unnorm / (true_intervals_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
+            interval_recon_loss = calculate_wasserstein_loss(interval_probs, true_interval_dist, interval_valid_mask)
         else:
             interval_recon_loss = torch.tensor(0.0, device=device)
 
@@ -284,8 +286,8 @@ class NT_VAE(pl.LightningModule):
         z = reparameterize(forward_output['mu'], forward_output['logvar'])
         mmd_loss = calculate_mmd_loss(z[:, self.summary_stats_dim:])
         
-        total_loss = (self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
-                      self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
+        total_loss = (self.hparams.charge_wasserstein_loss_weight * losses['charge_recon_loss'] +
+                      self.hparams.interval_wasserstein_loss_weight * losses['interval_recon_loss'] +
                       (1 - self.hparams.alpha) * losses['kld_loss'] +
                       (self.hparams.lambda_ + self.hparams.alpha - 1) * mmd_loss)
 
@@ -306,8 +308,8 @@ class NT_VAE(pl.LightningModule):
         z = reparameterize(forward_output['mu'], forward_output['logvar'])
         mmd_loss = calculate_mmd_loss(z[:, self.summary_stats_dim:])
         
-        total_loss = (self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
-                      self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
+        total_loss = (self.hparams.charge_wasserstein_loss_weight * losses['charge_recon_loss'] +
+                      self.hparams.interval_wasserstein_loss_weight * losses['interval_recon_loss'] +
                       (1 - self.hparams.alpha) * losses['kld_loss'] +
                       (self.hparams.lambda_ + self.hparams.alpha - 1) * mmd_loss)
 
@@ -328,8 +330,8 @@ class NT_VAE(pl.LightningModule):
         z = reparameterize(forward_output['mu'], forward_output['logvar'])
         mmd_loss = calculate_mmd_loss(z[:, self.summary_stats_dim:])
         
-        total_loss = (self.hparams.charge_loss_weight * losses['charge_recon_loss'] +
-                      self.hparams.interval_loss_weight * losses['interval_recon_loss'] +
+        total_loss = (self.hparams.charge_wasserstein_loss_weight * losses['charge_recon_loss'] +
+                      self.hparams.interval_wasserstein_loss_weight * losses['interval_recon_loss'] +
                       (1 - self.hparams.alpha) * losses['kld_loss'] +
                       (self.hparams.lambda_ + self.hparams.alpha - 1) * mmd_loss)
 
