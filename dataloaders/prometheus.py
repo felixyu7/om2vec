@@ -9,10 +9,10 @@ import pyarrow.parquet as pq
 from typing import Dict, Tuple, List # Added Tuple, List
 from collections import OrderedDict # For FIFO cache
 
-from .data_utils import get_file_names, InterleavedFileBatchSampler, variable_length_collate_fn # Removed process_time_sequence_for_intervals
-from functools import partial # For passing max_seq_len_padding to collate_fn
+from .data_utils import get_file_names, FileBatchSampler, variable_length_collate_fn
+from functools import partial
 
-class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from PrometheusDataModule
+class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
     """
     PyTorch Lightning data module for Prometheus dataset.
     """
@@ -27,169 +27,129 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule): # Renamed from Pro
     def setup(self, stage=None):
         """
         Called on each GPU separately - shards data to all GPUs.
-        
         Sets up train and validation datasets.
-        """ 
+        """
         if self.cfg['training']:
             train_files_by_folder, train_events_per_file_by_folder = get_file_names(
                 self.cfg['data_options']['train_data_files'],
                 self.cfg['data_options']['train_data_file_ranges'],
                 self.cfg['data_options']['shuffle_files']
             )
+            # Flatten the lists of files and event counts
+            all_train_files = [file for folder in train_files_by_folder for file in folder]
+            all_train_event_counts = [count for folder in train_events_per_file_by_folder for count in folder]
+            
             self.train_dataset = PrometheusTimeSeriesDataset(
-                train_files_by_folder,
-                train_events_per_file_by_folder,
+                all_train_files,
+                all_train_event_counts,
                 self.cfg
             )
             
         valid_files_by_folder, valid_events_per_file_by_folder = get_file_names(
             self.cfg['data_options']['valid_data_files'],
             self.cfg['data_options']['valid_data_file_ranges'],
-            self.cfg['data_options']['shuffle_files'] # Typically false for validation
+            shuffle_files=False # Validation files are typically not shuffled
         )
+        # Flatten the lists for validation set
+        all_valid_files = [file for folder in valid_files_by_folder for file in folder]
+        all_valid_event_counts = [count for folder in valid_events_per_file_by_folder for count in folder]
+
         self.valid_dataset = PrometheusTimeSeriesDataset(
-            valid_files_by_folder,
-            valid_events_per_file_by_folder,
+            all_valid_files,
+            all_valid_event_counts,
             self.cfg
         )
 
     def train_dataloader(self):
         """Returns the training dataloader."""
-        batch_sampler = InterleavedFileBatchSampler(
-            dataset=self.train_dataset,
+        batch_sampler = FileBatchSampler(
+            data_source=self.train_dataset,
             batch_size=self.cfg['training_options']['batch_size'],
-            shuffle_intra_batch=True,
-            shuffle_files_within_folder=self.cfg['data_options'].get('shuffle_files', True) # Align with global file shuffle option
+            shuffle=True
         )
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
-        dataloader = torch.utils.data.DataLoader(self.train_dataset,
-                                            batch_sampler=batch_sampler, # Use batch_sampler
-                                            collate_fn=collate_fn_with_padding,
-                                            pin_memory=True,
-                                            persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
-                                            num_workers=self.cfg['training_options']['num_workers'])
-        return dataloader
+        return torch.utils.data.DataLoader(self.train_dataset,
+                                           batch_sampler=batch_sampler,
+                                           collate_fn=collate_fn_with_padding,
+                                           pin_memory=True,
+                                           persistent_workers=self.cfg['training_options']['num_workers'] > 0,
+                                           num_workers=self.cfg['training_options']['num_workers'])
 
     def val_dataloader(self):
         """Returns the validation dataloader."""
-        batch_sampler = InterleavedFileBatchSampler(
-            dataset=self.valid_dataset,
+        batch_sampler = FileBatchSampler(
+            data_source=self.valid_dataset,
             batch_size=self.cfg['training_options']['batch_size'],
-            shuffle_intra_batch=False, # No need to shuffle within validation batches
-            shuffle_files_within_folder=False # Keep validation file order consistent
+            shuffle=False
         )
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
         return torch.utils.data.DataLoader(self.valid_dataset,
-                                           batch_sampler=batch_sampler, # Use batch_sampler
+                                           batch_sampler=batch_sampler,
                                            collate_fn=collate_fn_with_padding,
                                            pin_memory=True,
-                                           persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
+                                           persistent_workers=self.cfg['training_options']['num_workers'] > 0,
                                            num_workers=self.cfg['training_options']['num_workers'])
 
     def test_dataloader(self):
         """Returns the test dataloader (same as validation for now)."""
-        batch_sampler = InterleavedFileBatchSampler(
-            dataset=self.valid_dataset, # Using validation dataset for test
-            batch_size=self.cfg['training_options']['batch_size'],
-            shuffle_intra_batch=False,
-            shuffle_files_within_folder=False
-        )
-        collate_fn_with_padding = partial(variable_length_collate_fn)
-        
-        return torch.utils.data.DataLoader(self.valid_dataset,
-                                           batch_sampler=batch_sampler, # Use batch_sampler
-                                           collate_fn=collate_fn_with_padding,
-                                           pin_memory=True,
-                                           persistent_workers=True if self.cfg['training_options']['num_workers'] > 0 else False,
-                                           num_workers=self.cfg['training_options']['num_workers'])
+        return self.val_dataloader()
 
 class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     """
-    Dataset class for Prometheus data, handling multiple folders.
-    Loads data from parquet files and preprocesses it for the model.
+    Dataset for Prometheus data. Loads data from a list of parquet files.
     """
     def __init__(self,
-                 files_by_folder: List[List[str]],
-                 events_per_file_by_folder: List[List[int]],
+                 files: List[str],
+                 events_per_file: List[int],
                  cfg: Dict,
-                 cache_size: int = 5): # Added cache_size for Parquet data
-        self.files_by_folder = files_by_folder
-        self.events_per_file_by_folder = events_per_file_by_folder
+                 cache_size: int = 5):
+        self.files = files
+        self.events_per_file = events_per_file
         self.cfg = cfg
         self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0)
         self.max_seq_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
         
-        self.num_folders = len(self.files_by_folder)
-        self.folder_total_events = [sum(counts) for counts in self.events_per_file_by_folder]
-        self.dataset_size = sum(self.folder_total_events)
+        self.dataset_size = sum(self.events_per_file)
+        self.cumulative_lengths = np.concatenate(([0], np.cumsum(np.array(self.events_per_file, dtype=np.int64))))
 
-        # Cumulative lengths for files within each folder
-        self.cumulative_lengths_by_folder_file = []
-        for folder_event_counts in self.events_per_file_by_folder:
-            if folder_event_counts: # Check if the list is not empty
-                self.cumulative_lengths_by_folder_file.append(
-                    np.concatenate(([0], np.cumsum(np.array(folder_event_counts, dtype=np.int64))))
-                )
-            else: # Handle empty folder (no files or files with 0 events)
-                self.cumulative_lengths_by_folder_file.append(np.array([0], dtype=np.int64))
-
-        # Simple FIFO cache for loaded Parquet data (ak.RecordBatch)
+        # Simple FIFO cache for loaded Parquet data
         self.cache_size = cache_size
-        self.data_cache = OrderedDict() # Stores {file_path: ak_data}
-        self.current_file_path_per_folder_file_tuple = {}
+        self.data_cache = OrderedDict()
 
     def __len__(self):
-        return self.dataset_size # Total events across all folders
+        return self.dataset_size
     
-    def _get_file_path_and_event_index_in_file(self, folder_idx: int, event_idx_in_folder: int) -> Tuple[str, int]:
+    def _get_file_path_and_index_in_file(self, global_event_idx: int) -> Tuple[str, int]:
         """
-        Given a folder index and an event index within that folder,
-        determines the specific file and the event's index within that file.
+        Maps a global event index to a specific file and the event's index within that file.
         """
-
-        cumulative_lengths_for_folder = self.cumulative_lengths_by_folder_file[folder_idx]
-
-        file_idx_in_folder = int(np.searchsorted(cumulative_lengths_for_folder, event_idx_in_folder + 1) - 1)
-        event_idx_in_file = int(event_idx_in_folder - cumulative_lengths_for_folder[file_idx_in_folder])
-        
-        file_path = self.files_by_folder[folder_idx][file_idx_in_folder]
+        file_idx = int(np.searchsorted(self.cumulative_lengths, global_event_idx + 1) - 1)
+        event_idx_in_file = int(global_event_idx - self.cumulative_lengths[file_idx])
+        file_path = self.files[file_idx]
         return file_path, event_idx_in_file
 
     def _load_data_from_file(self, file_path: str):
         """Loads data from a parquet file, using a cache."""
         if file_path in self.data_cache:
-            # Move to end to mark as recently used
             self.data_cache.move_to_end(file_path)
             return self.data_cache[file_path]
+        
         data = ak.from_parquet(file_path)
-        # Add to cache
         if len(self.data_cache) >= self.cache_size:
-            self.data_cache.popitem(last=False) # Remove oldest item
+            self.data_cache.popitem(last=False)
         self.data_cache[file_path] = data
         return data
 
-    def __getitem__(self, item_tuple: Tuple[int, int]) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, global_event_idx: int) -> Dict[str, torch.Tensor]:
         """
         Returns one training example.
-        The VAE's encode() method will now handle calculation of summary stats and time intervals.
-        
-        Data structure:
-        - charges_log_norm: Log1p-normalized charges [length N]
-        - times_log_norm: Log-normalized ABSOLUTE times [length N]
-        - sensor_pos: Sensor position [3D vector]
-        
-        item_tuple: (folder_idx, event_idx_in_folder)
         """
-        folder_idx, event_idx_in_folder = item_tuple
-
-        file_path, true_idx = self._get_file_path_and_event_index_in_file(folder_idx, event_idx_in_folder)
+        file_path, event_idx_in_file = self._get_file_path_and_index_in_file(global_event_idx)
         
-        # Load data using cache
         ak_data_for_file = self._load_data_from_file(file_path)
-
-        row = ak_data_for_file[true_idx]
+        row = ak_data_for_file[event_idx_in_file]
 
         # ------------------------------------------------ raw hit times
         raw_t = np.asarray(row['hits_t'], dtype=np.float32)
