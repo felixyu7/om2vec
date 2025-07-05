@@ -103,8 +103,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     def __init__(self,
                  files: List[str],
                  events_per_file: List[int],
-                 cfg: Dict,
-                 cache_size: int = 5):
+                 cfg: Dict):
         self.files = files
         self.events_per_file = events_per_file
         self.cfg = cfg
@@ -115,7 +114,7 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
         self.cumulative_lengths = np.concatenate(([0], np.cumsum(np.array(self.events_per_file, dtype=np.int64))))
 
         # Simple FIFO cache for loaded Parquet data
-        self.cache_size = cache_size
+        self.cache_size = self.cfg['data_options'].get('cache_size', 5)
         self.data_cache = OrderedDict()
 
     def __len__(self):
