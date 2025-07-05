@@ -142,8 +142,8 @@ class NT_VAE(pl.LightningModule):
             mh_encoder_latent_input = torch.cat((mh_cls_representation, mh_sensor_pos), dim=1)
 
             # Project to content latent parameters
-            mh_mu_content = self.to_latent_mu(mh_encoder_latent_input)
-            mh_logvar_content = self.to_latent_logvar(mh_encoder_latent_input).clamp(min=-10, max=10)
+            mh_mu_content = self.to_latent_mu(mh_encoder_latent_input).to(mu_content.dtype)
+            mh_logvar_content = self.to_latent_logvar(mh_encoder_latent_input).clamp(min=-10, max=10).to(logvar_content.dtype)
 
             # Scatter results back to the full batch tensors
             mu_content[is_multi_hit] = mh_mu_content

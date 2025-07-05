@@ -18,31 +18,6 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
-def imq_kernel_multi(z, prior_z, scales=None, eps=1e-7):
-    if scales is None:
-        scales = [0.1, 0.2, 0.5, 1., 2., 5., 10.]
-
-    d2_z_z = torch.cdist(z,        z,        p=2).pow(2)
-    d2_p_p = torch.cdist(prior_z,  prior_z,  p=2).pow(2)
-    d2_z_p = torch.cdist(z,        prior_z,  p=2).pow(2)
-
-    k_zz = k_pp = k_zp = 0.0
-    dim = z.size(1)
-
-    for s in scales:
-        c = 2.0 * dim * s         # <<< heavier-tail constant
-        k_zz += c / (c + d2_z_z / s + eps)
-        k_pp += c / (c + d2_p_p / s + eps)
-        k_zp += c / (c + d2_z_p / s + eps)
-
-    # average over the 7 radii → stable gradients
-    k_zz /= len(scales); k_pp /= len(scales); k_zp /= len(scales)
-
-    # unbiased: drop diagonals
-    k_zz -= torch.diag_embed(torch.diagonal(k_zz))
-    k_pp -= torch.diag_embed(torch.diagonal(k_pp))
-    return k_zz, k_pp, k_zp
-
 def calculate_sequence_lengths(attention_mask):
     """
     Calculates the actual sequence lengths from a boolean attention mask.
@@ -72,9 +47,10 @@ def calculate_summary_stats(charges_log_norm_padded, times_log_norm_padded, atte
     """
     B, S = charges_log_norm_padded.shape
     device = charges_log_norm_padded.device
+    dtype = charges_log_norm_padded.dtype
 
     original_lengths = calculate_sequence_lengths(attention_mask)
-    log_seq_length = torch.log(original_lengths.float().clamp(min=1.0)) # Clamp for log(0)
+    log_seq_length = torch.log(original_lengths.to(dtype).clamp(min=1.0)) # Clamp for log(0)
 
     # Un-normalize charges (inverse of log1p)
     charges_unnorm = torch.exp(charges_log_norm_padded) - 1.0
@@ -102,7 +78,7 @@ def calculate_summary_stats(charges_log_norm_padded, times_log_norm_padded, atte
     # Mask padded times with a small value (or 0) before finding max
     masked_times_for_last = times_unnorm.clone()
     masked_times_for_last.masked_fill_(attention_mask, 0.0) # Padded values won't be max
-    last_hit_time_unnorm = torch.zeros(B, device=device)
+    last_hit_time_unnorm = torch.zeros(B, device=device, dtype=dtype)
 
     for i in range(B):
         if original_lengths[i] > 0:
@@ -139,7 +115,7 @@ def convert_absolute_times_to_log_intervals(times_log_norm_padded, original_leng
     times_unnorm = torch.exp(times_log_norm_padded)
     
     # Initialize intervals tensor (e.g., with zeros)
-    time_intervals_unnorm_padded = torch.zeros_like(times_unnorm)
+    time_intervals_unnorm_padded = torch.zeros_like(times_unnorm, dtype=times_log_norm_padded.dtype)
 
     for i in range(B):
         seq_len = original_lengths[i].item()
@@ -166,7 +142,7 @@ def convert_absolute_times_to_log_intervals(times_log_norm_padded, original_leng
             interval_padding_mask[i, :seq_len-1] = False # These are valid interval positions
         # All other positions remain True (to be padded)
     
-    log_time_intervals_padded.masked_fill_(interval_padding_mask, torch.log(torch.tensor(epsilon, device=device))) # or 0.0 if preferred for padding
+    log_time_intervals_padded.masked_fill_(interval_padding_mask, torch.log(torch.tensor(epsilon, device=device, dtype=times_log_norm_padded.dtype))) # or 0.0 if preferred for padding
 
     return log_time_intervals_padded
 
@@ -176,17 +152,37 @@ def reparameterize(mu, logvar):
     eps = torch.randn_like(std)
     return mu + eps * std
 
-def calculate_mmd_loss(z):
-    """Unbiased multi-scale IMQ-MMD² between q(z) and N(0,I)."""
+def rbf_kernel(x: torch.Tensor, y: torch.Tensor, sigma: float = 1.0, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Computes the RBF (Gaussian) kernel matrix between x and y:
+      k(x, y) = exp(-||x - y||^2 / (2 * sigma^2))
+    """
+    # pairwise squared distances
+    d2 = torch.cdist(x, y, p=2).pow(2)
+    return torch.exp(-d2 / (2 * sigma**2) + eps)
+
+def calculate_mmd_loss(z: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+    """
+    Unbiased RBF-MMD^2 between q(z) (the batch z) and p(z)=N(0,I).
+    """
+    # sample from the prior
     prior_z = torch.randn_like(z)
-    k_zz, k_pp, k_zp = imq_kernel_multi(z, prior_z)
 
-    n = z.size(0); m = prior_z.size(0)
+    # kernel matrices
+    k_zz = rbf_kernel(z,       z,       sigma)
+    k_pp = rbf_kernel(prior_z, prior_z, sigma)
+    k_zp = rbf_kernel(z,       prior_z, sigma)
 
-    mmd2 = (k_zz.sum() / (n * (n - 1))
-        + k_pp.sum() / (m * (m - 1))
-        - 2 * k_zp.mean())
+    n = z.size(0)
+    m = prior_z.size(0)
 
+    # subtract diagonal for unbiased estimate
+    # note: torch.diagonal(k_zz).sum() extracts the diagonal entries sum
+    sum_kzz = (k_zz.sum() - torch.diagonal(k_zz).sum()) / (n * (n - 1))
+    sum_kpp = (k_pp.sum() - torch.diagonal(k_pp).sum()) / (m * (m - 1))
+    sum_kzp = k_zp.mean()  # all pairs are off-diagonal by construction
+
+    mmd2 = sum_kzz + sum_kpp - 2 * sum_kzp
     return mmd2
 
 def wasserstein_1d(pred_dist, true_dist, mask, bin_width=1.0):

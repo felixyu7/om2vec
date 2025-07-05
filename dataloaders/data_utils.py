@@ -97,7 +97,7 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
     # Get sequence lengths from 'charges_log_norm' (or 'times_log_norm')
     seq_lens_list = [item["charges_log_norm"].numel() for item in batch]
     seq_lens = torch.tensor(seq_lens_list, dtype=torch.long, device=device)
-    max_len = int(seq_lens.max().item()) if bsz and seq_lens.numel() > 0 and seq_lens.max().item() > 0 else 0
+    max_len = int(seq_lens.max().item()) if bsz and seq_lens.numel() > 0 and seq_lens.max().item() > 0 else 1
 
     # ---------- pre-allocate padded buffers ----------
     charges_padded = torch.zeros(bsz, max_len, dtype=dtype, device=device)
