@@ -5,103 +5,63 @@ import glob
 import os
 import random
 from torch.utils.data import Sampler, Dataset
-from typing import List, Dict, Tuple # Added Tuple
-import pyarrow.parquet as pq # Added import
+from typing import List, Dict, Tuple
+import pyarrow.parquet as pq
 
-def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> Tuple[List[List[str]], List[List[int]]]:
+def get_file_names(data_dirs: List[str], 
+                   ranges: List[List[int]], 
+                   shuffle_files: bool = False) -> List[str]:
     """
-    Get file names from directories within specified ranges, grouped by directory.
-    Also returns the number of events (rows) for each file.
-
+    Get file names from directories within specified ranges.
+    
     Args:
         data_dirs: List of directories to search for files
-        ranges: List of [start, end] ranges for files in each directory
-        shuffle_files: Whether to shuffle files within each directory's list
-
+        ranges: List of [start, end] ranges for each directory
+        
     Returns:
-        A tuple containing:
-            - files_by_folder: List of lists of file paths, one inner list per directory.
-            - events_per_file_by_folder: List of lists of event counts, mirroring files_by_folder.
+        List of file paths
     """
-    files_by_folder = []
-    events_per_file_by_folder = []
-
+    filtered_files = []
     for i, directory in enumerate(data_dirs):
-        all_files_in_dir = sorted(glob.glob(os.path.join(directory, '*.parquet')))
-        
-        # Apply range selection
-        file_range = ranges[i]
-        selected_files_in_dir = all_files_in_dir[file_range[0]:file_range[1]]
-
-        if not selected_files_in_dir:
-            files_by_folder.append([])
-            events_per_file_by_folder.append([])
-            continue
-
-        current_folder_files = []
-        current_folder_event_counts = []
-
-        # Prepare list of (file_path, event_count) for shuffling if needed
-        file_event_pairs = []
-        for f_path in selected_files_in_dir:
-            try:
-                pf = pq.ParquetFile(f_path)
-                event_count = pf.metadata.num_rows
-                file_event_pairs.append((f_path, event_count))
-            except Exception as e:
-                # print(f"Warning: Could not read metadata for {f_path}: {e}. Skipping file.")
-                # Optionally, append with 0 events or handle differently
-                # For now, we skip files that error out during metadata read.
-                continue # Skip this file
-        
-        if not file_event_pairs: # All selected files in dir failed to read metadata
-            files_by_folder.append([])
-            events_per_file_by_folder.append([])
-            continue
-
+        all_files = sorted(glob.glob(os.path.join(directory, '*.parquet')))
         if shuffle_files:
-            random.shuffle(file_event_pairs)
-        
-        # Unzip after potential shuffle
-        current_folder_files, current_folder_event_counts = zip(*file_event_pairs)
-        
-        files_by_folder.append(list(current_folder_files))
-        events_per_file_by_folder.append(list(current_folder_event_counts))
-            
-    return files_by_folder, events_per_file_by_folder
+            random.shuffle(all_files)
+        file_range = ranges[i]
+        filtered_files.extend(
+            all_files[file_range[0]:file_range[1]]
+        )
+    return sorted(filtered_files)
 
-class FileBatchSampler(Sampler):
+class ParquetFileSampler(Sampler):
     """
-    Custom sampler that shuffles files and then yields batches of indices from each file.
-    This is I/O efficient as it reads one file at a time.
+    Custom sampler for parquet files that respects file boundaries during batching.
+    
+    This sampler first selects files in random order, then for each file,
+    it shuffles the indices and yields batches from that file before moving
+    to the next file.
     """
-    def __init__(self, data_source: Dataset, batch_size: int, shuffle: bool = True):
-        super().__init__(data_source)
-        self.data_source = data_source
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.cumulative_lengths = data_source.cumulative_lengths
-        self.total_events = data_source.dataset_size
+    def __init__(self, 
+                 data_source: Dataset, 
+                 cumulative_lengths: np.ndarray, 
+                 batch_size: int):
+       super().__init__(data_source) # Call Sampler's __init__
+       self.data_source = data_source
+       self.cumulative_lengths = cumulative_lengths  # expects array starting with 0, then cumulative sums
+       self.batch_size = batch_size
 
     def __iter__(self):
         n_files = len(self.cumulative_lengths) - 1
-        file_indices = np.random.permutation(n_files) if self.shuffle else np.arange(n_files)
-
-        for file_idx in file_indices:
-            start_event_idx = self.cumulative_lengths[file_idx]
-            end_event_idx = self.cumulative_lengths[file_idx + 1]
-            
-            event_indices_in_file = np.arange(start_event_idx, end_event_idx)
-            if self.shuffle:
-                np.random.shuffle(event_indices_in_file)
-            
-            for i in range(0, len(event_indices_in_file), self.batch_size):
-                yield event_indices_in_file[i:i+self.batch_size].tolist()
+        file_order = np.random.permutation(n_files)
+        
+        for file_index in file_order:
+            start_idx = self.cumulative_lengths[file_index]
+            end_idx = self.cumulative_lengths[file_index + 1]
+            indices = np.random.permutation(np.arange(start_idx, end_idx))
+            for i in range(0, len(indices), self.batch_size):
+                yield from indices[i:i+self.batch_size].tolist()
 
     def __len__(self) -> int:
-        # This is an estimate, as the last batch of each file might be smaller.
-        # A more accurate length would be sum(ceil(file_size / batch_size))
-        return (self.total_events + self.batch_size - 1) // self.batch_size
+       return len(self.data_source)
 
 def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
 ) -> Dict[str, torch.Tensor]:
@@ -168,5 +128,3 @@ def variable_length_collate_fn(batch: List[Dict[str, torch.Tensor]]
         # The VAE's encode method will derive original_lengths from attention_mask
         # and other summary stats from these inputs.
     }
-
-# The InterleavedFileBatchSampler has been removed and replaced by the simpler FileBatchSampler.

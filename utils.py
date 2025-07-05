@@ -189,27 +189,19 @@ def calculate_mmd_loss(z):
 
     return mmd2
 
-def calculate_wasserstein_loss(pred_dist, true_dist, mask):
-    """
-    Calculates the 1D Wasserstein distance between two batches of distributions.
-    This is also known as the Earth Mover's Distance.
+def wasserstein_1d(pred_dist, true_dist, mask, bin_width=1.0):
+    mask = mask.to(pred_dist.dtype)
 
-    Args:
-        pred_dist (torch.Tensor): Predicted distributions (B, S), must sum to 1 over valid regions.
-        true_dist (torch.Tensor): True distributions (B, S), must sum to 1 over valid regions.
-        mask (torch.Tensor): Boolean mask (B, S), True for valid elements.
+    pred = (pred_dist * mask).clamp(min=0)
+    true = (true_dist * mask).clamp(min=0)
 
-    Returns:
-        torch.Tensor: The mean Wasserstein distance over the batch.
-    """
-    pred_dist = pred_dist * mask
-    true_dist = true_dist * mask
+    # renormalise so each sequence sums to 1 over valid bins
+    pred = pred / pred.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    true = true / true.sum(dim=-1, keepdim=True).clamp(min=1e-12)
 
-    pred_cdf = torch.cumsum(pred_dist, dim=-1)
-    true_cdf = torch.cumsum(true_dist, dim=-1)
+    pred_cdf = torch.cumsum(pred, dim=-1)
+    true_cdf = torch.cumsum(true, dim=-1)
 
-    wasserstein_distance = torch.sum(torch.abs(pred_cdf - true_cdf), dim=-1)
-
-    loss = wasserstein_distance.mean()
-
-    return loss
+    # canonical W1 (no length normalisation), scaled by bin width
+    w1 = torch.sum(torch.abs(pred_cdf - true_cdf), dim=-1) * bin_width
+    return w1.mean()

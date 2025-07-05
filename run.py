@@ -1,9 +1,9 @@
 import torch
 import numpy as np
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import os
-from pytorch_lightning.loggers import WandbLogger, CSVLogger
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger, CSVLogger
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from vae import NT_VAE
 
@@ -109,7 +109,7 @@ if __name__=="__main__":
                              gradient_clip_val=cfg['training_options']['gradient_clip_val'],
                              logger=wandb_logger, 
                              callbacks=[checkpoint_callback, lr_monitor],
-                             num_sanity_val_steps=0)
+                             num_sanity_val_steps=2)
         if cfg['resume_training']:
             print("Resuming training from checkpoint ", cfg['checkpoint'])
             trainer.fit(model=net, datamodule=dm, ckpt_path=cfg['checkpoint'])

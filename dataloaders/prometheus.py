@@ -3,13 +3,13 @@ import glob
 import torch
 import numpy as np
 import math
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import awkward as ak
 import pyarrow.parquet as pq
-from typing import Dict, Tuple, List # Added Tuple, List
-from collections import OrderedDict # For FIFO cache
+from typing import Dict, Tuple, List
+from collections import OrderedDict
 
-from .data_utils import get_file_names, FileBatchSampler, variable_length_collate_fn
+from .data_utils import get_file_names, ParquetFileSampler, variable_length_collate_fn
 from functools import partial
 
 class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
@@ -30,47 +30,34 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
         Sets up train and validation datasets.
         """
         if self.cfg['training']:
-            train_files_by_folder, train_events_per_file_by_folder = get_file_names(
-                self.cfg['data_options']['train_data_files'],
+            train_files = get_file_names(
+                self.cfg['data_options']['train_data_files'], 
                 self.cfg['data_options']['train_data_file_ranges'],
                 self.cfg['data_options']['shuffle_files']
             )
-            # Flatten the lists of files and event counts
-            all_train_files = [file for folder in train_files_by_folder for file in folder]
-            all_train_event_counts = [count for folder in train_events_per_file_by_folder for count in folder]
-            
             self.train_dataset = PrometheusTimeSeriesDataset(
-                all_train_files,
-                all_train_event_counts,
+                train_files,
                 self.cfg
             )
             
-        valid_files_by_folder, valid_events_per_file_by_folder = get_file_names(
-            self.cfg['data_options']['valid_data_files'],
+        valid_files = get_file_names(
+            self.cfg['data_options']['valid_data_files'], 
             self.cfg['data_options']['valid_data_file_ranges'],
-            shuffle_files=False # Validation files are typically not shuffled
+            shuffle_files=False
         )
-        # Flatten the lists for validation set
-        all_valid_files = [file for folder in valid_files_by_folder for file in folder]
-        all_valid_event_counts = [count for folder in valid_events_per_file_by_folder for count in folder]
-
         self.valid_dataset = PrometheusTimeSeriesDataset(
-            all_valid_files,
-            all_valid_event_counts,
+            valid_files,
             self.cfg
         )
 
     def train_dataloader(self):
         """Returns the training dataloader."""
-        batch_sampler = FileBatchSampler(
-            data_source=self.train_dataset,
-            batch_size=self.cfg['training_options']['batch_size'],
-            shuffle=True
-        )
+        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
         return torch.utils.data.DataLoader(self.train_dataset,
-                                           batch_sampler=batch_sampler,
+                                           batch_size=self.cfg['training_options']['batch_size'],
+                                           sampler=sampler,
                                            collate_fn=collate_fn_with_padding,
                                            pin_memory=True,
                                            persistent_workers=self.cfg['training_options']['num_workers'] > 0,
@@ -78,15 +65,12 @@ class PrometheusTimeSeriesDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         """Returns the validation dataloader."""
-        batch_sampler = FileBatchSampler(
-            data_source=self.valid_dataset,
-            batch_size=self.cfg['training_options']['batch_size'],
-            shuffle=False
-        )
+        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
         collate_fn_with_padding = partial(variable_length_collate_fn)
 
         return torch.utils.data.DataLoader(self.valid_dataset,
-                                           batch_sampler=batch_sampler,
+                                           batch_size=self.cfg['training_options']['batch_size'],
+                                           sampler=sampler,
                                            collate_fn=collate_fn_with_padding,
                                            pin_memory=True,
                                            persistent_workers=self.cfg['training_options']['num_workers'] > 0,
@@ -102,53 +86,42 @@ class PrometheusTimeSeriesDataset(torch.utils.data.Dataset):
     """
     def __init__(self,
                  files: List[str],
-                 events_per_file: List[int],
                  cfg: Dict):
         self.files = files
-        self.events_per_file = events_per_file
         self.cfg = cfg
         self.grouping_window_ns = self.cfg['data_options'].get('grouping_window_ns', 2.0)
         self.max_seq_len_padding = self.cfg['data_options'].get('max_seq_len_padding', None)
         
-        self.dataset_size = sum(self.events_per_file)
-        self.cumulative_lengths = np.concatenate(([0], np.cumsum(np.array(self.events_per_file, dtype=np.int64))))
-
-        # Simple FIFO cache for loaded Parquet data
-        self.cache_size = self.cfg['data_options'].get('cache_size', 5)
-        self.data_cache = OrderedDict()
+        # Count number of events in each file
+        num_events = []
+        for file in self.files:
+            data = pq.ParquetFile(file)
+            num_events.append(data.metadata.num_rows)
+        num_events = np.array(num_events)
+        self.cumulative_lengths = np.concatenate(([0], np.cumsum(num_events)))
+        self.dataset_size = self.cumulative_lengths[-1]
+        
+        self.current_file = ''
+        self.current_data = None
 
     def __len__(self):
-        return self.dataset_size
-    
-    def _get_file_path_and_index_in_file(self, global_event_idx: int) -> Tuple[str, int]:
-        """
-        Maps a global event index to a specific file and the event's index within that file.
-        """
-        file_idx = int(np.searchsorted(self.cumulative_lengths, global_event_idx + 1) - 1)
-        event_idx_in_file = int(global_event_idx - self.cumulative_lengths[file_idx])
-        file_path = self.files[file_idx]
-        return file_path, event_idx_in_file
+        return int(self.dataset_size)
 
-    def _load_data_from_file(self, file_path: str):
-        """Loads data from a parquet file, using a cache."""
-        if file_path in self.data_cache:
-            self.data_cache.move_to_end(file_path)
-            return self.data_cache[file_path]
-        
-        data = ak.from_parquet(file_path)
-        if len(self.data_cache) >= self.cache_size:
-            self.data_cache.popitem(last=False)
-        self.data_cache[file_path] = data
-        return data
-
-    def __getitem__(self, global_event_idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
         """
         Returns one training example.
         """
-        file_path, event_idx_in_file = self._get_file_path_and_index_in_file(global_event_idx)
+        if i < 0 or i >= self.dataset_size:
+            raise IndexError("Index out of range")
+        file_index = np.searchsorted(self.cumulative_lengths, i+1) - 1
+        true_idx = i - self.cumulative_lengths[file_index]
+                
+        # Load file if it's not already loaded
+        if self.current_file != self.files[file_index]:
+            self.current_file = self.files[file_index]
+            self.current_data = ak.from_parquet(self.files[file_index], columns=['hits_t', 'sensor_pos_x', 'sensor_pos_y', 'sensor_pos_z'])
         
-        ak_data_for_file = self._load_data_from_file(file_path)
-        row = ak_data_for_file[event_idx_in_file]
+        row = self.current_data[true_idx]
 
         # ------------------------------------------------ raw hit times
         raw_t = np.asarray(row['hits_t'], dtype=np.float32)

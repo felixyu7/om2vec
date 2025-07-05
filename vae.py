@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
-from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, calculate_wasserstein_loss
+import lightning.pytorch as pl
+from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, wasserstein_1d
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -314,7 +314,7 @@ class NT_VAE(pl.LightningModule):
             mh_true_charges_unnorm = torch.expm1(mh_original_charges) # Inverse of log1p
             mh_true_charges_unnorm.masked_fill_(~mh_charge_valid_mask, 0)
             mh_true_charge_dist = mh_true_charges_unnorm / (mh_true_charges_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
-            charge_recon_loss = calculate_wasserstein_loss(mh_charge_probs, mh_true_charge_dist, mh_charge_valid_mask)
+            charge_recon_loss = wasserstein_1d(mh_charge_probs, mh_true_charge_dist, mh_charge_valid_mask)
 
             # Interval Reconstruction Loss (Wasserstein)
             interval_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < (original_lengths - 1).unsqueeze(1)
@@ -326,7 +326,7 @@ class NT_VAE(pl.LightningModule):
                 mh_true_intervals_unnorm = torch.exp(mh_original_intervals) # Inverse of log
                 mh_true_intervals_unnorm.masked_fill_(~mh_interval_valid_mask, 0)
                 mh_true_interval_dist = mh_true_intervals_unnorm / (mh_true_intervals_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
-                interval_recon_loss = calculate_wasserstein_loss(mh_interval_probs, mh_true_interval_dist, mh_interval_valid_mask)
+                interval_recon_loss = wasserstein_1d(mh_interval_probs, mh_true_interval_dist, mh_interval_valid_mask)
             else:
                 interval_recon_loss = torch.tensor(0.0, device=device)
         else:
