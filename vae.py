@@ -120,7 +120,7 @@ class NT_VAE(pl.LightningModule):
             mh_time_features = convert_absolute_times_to_log_intervals(mh_times_abs, mh_lengths, mh_attn_mask)
             
             # Embed input sequences
-            mh_concatenated_input = torch.stack((mh_charges, mh_time_features), dim=-1).float()
+            mh_concatenated_input = torch.stack((mh_charges, mh_time_features), dim=-1)
             mh_embedded_input = self.encoder_input_embedding(mh_concatenated_input)
 
             # Prepend CLS token
@@ -204,13 +204,13 @@ class NT_VAE(pl.LightningModule):
             # Reconstruct Charges via Softmax Partitioning
             mh_raw_charge_scores = self.output_projection_charge(mh_transformed_sequence).squeeze(-1)
             mh_masked_charge_scores = mh_raw_charge_scores.masked_fill(~mh_valid_mask, -float('inf'))
-            mh_charge_probs = torch.softmax(mh_masked_charge_scores, dim=-1).to(mh_masked_charge_scores.dtype)
+            mh_charge_probs = torch.softmax(mh_masked_charge_scores, dim=-1)
             
             # Reconstruct Time Intervals
             mh_raw_interval_scores = self.output_projection_intervals(mh_transformed_sequence).squeeze(-1)
             mh_interval_mask = torch.arange(max_len, device=device).unsqueeze(0) < (mh_lengths - 1).unsqueeze(1)
             mh_masked_interval_scores = mh_raw_interval_scores.masked_fill(~mh_interval_mask, -float('inf'))
-            mh_interval_probs = torch.softmax(mh_masked_interval_scores, dim=-1).to(mh_masked_interval_scores.dtype)
+            mh_interval_probs = torch.softmax(mh_masked_interval_scores, dim=-1)
 
             # Scatter results back to the full batch tensors
             charge_probs[is_multi_hit] = mh_charge_probs
@@ -243,16 +243,18 @@ class NT_VAE(pl.LightningModule):
 
     def forward(self, batch):
         """Forward pass through the VAE."""
-        charges_log_norm_padded = batch['charges_log_norm_padded'].float()
-        times_log_norm_abs_padded = batch['times_log_norm_padded'].float()
-        attention_mask = batch['attention_mask'].bool()
-        sensor_pos_padded = batch['sensor_pos_batched'].float()
+        # Ensure all input tensors are on the correct device and dtype
+        charges_log_norm_padded = batch['charges_log_norm_padded'].to(self.dtype)
+        times_log_norm_abs_padded = batch['times_log_norm_padded'].to(self.dtype)
+        attention_mask = batch['attention_mask'].bool() # Mask should be boolean
+        sensor_pos_padded = batch['sensor_pos_batched'].to(self.dtype)
 
         mu, logvar, stats_dict, encoder_time_features_target = self.encode(
             charges_log_norm_padded, times_log_norm_abs_padded, sensor_pos_padded, attention_mask
         )
 
         z = reparameterize(mu, logvar)
+        z = z.to(self.dtype)  # Ensure z has the correct dtype
         decoded_output = self.decode(z, inference=False)
 
         return {
