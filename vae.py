@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, wasserstein_1d
+from utils import MonotonicNN, PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, wasserstein_1d, wasserstein_1d_from_cdf
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -19,6 +19,7 @@ class NT_VAE(pl.LightningModule):
                  transformer_decoder_heads=8,
                  transformer_decoder_ff_dim=256,
                  transformer_decoder_dropout=0.1,
+                 monotonic_nn_hidden_dim=128,
                  batch_size=32,
                  lr=1e-3,
                  lr_schedule=[10, 1e-6],
@@ -79,8 +80,8 @@ class NT_VAE(pl.LightningModule):
             num_layers=self.hparams.transformer_decoder_layers
         )
 
-        self.output_projection_charge = nn.Linear(self.hparams.embed_dim, 1)
-        self.output_projection_intervals = nn.Linear(self.hparams.embed_dim, 1)
+        self.output_projection_charge = MonotonicNN(self.hparams.embed_dim, self.hparams.monotonic_nn_hidden_dim, 1)
+        self.output_projection_intervals = MonotonicNN(self.hparams.embed_dim, self.hparams.monotonic_nn_hidden_dim, 1)
 
 
     def encode(self, charges_log_norm_padded, times_log_norm_abs_padded, sensor_pos_padded, attention_mask):
@@ -178,13 +179,18 @@ class NT_VAE(pl.LightningModule):
         num_multi_hit = is_multi_hit.sum()
 
         # Initialize full output tensors
-        charge_probs = torch.zeros(B, max_len, device=device)
-        interval_probs = torch.zeros(B, max_len, device=device)
+        charge_cdfs = torch.zeros(B, max_len, device=device)
+        interval_cdfs = torch.zeros(B, max_len, device=device)
+        # For inference, we'll need the PDF, so we'll store it if needed.
+        charge_pdfs = torch.zeros(B, max_len, device=device)
+        interval_pdfs = torch.zeros(B, max_len, device=device)
 
         # 3. Handle 1-hit sequences deterministically
         # For a 1-hit sequence, all charge probability is in the first bin.
-        charge_probs[~is_multi_hit, 0] = 1.0
-        # Interval probabilities remain all zero.
+        # For a 1-hit sequence, the CDF is a step function at the first bin.
+        charge_cdfs[~is_multi_hit, 0:] = 1.0
+        charge_pdfs[~is_multi_hit, 0] = 1.0
+        # Interval CDFs/PDFs remain all zero as there are no intervals.
 
         # 4. Process multi-hit sequences through the transformer decoder
         if num_multi_hit > 0:
@@ -201,33 +207,37 @@ class NT_VAE(pl.LightningModule):
             mh_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < mh_lengths.unsqueeze(1)
             mh_transformed_sequence = self.decoder_transformer(src=mh_decoder_input, src_key_padding_mask=~mh_valid_mask)
 
-            # Reconstruct Charges via Softmax Partitioning
-            mh_raw_charge_scores = self.output_projection_charge(mh_transformed_sequence).squeeze(-1)
-            mh_masked_charge_scores = mh_raw_charge_scores.masked_fill(~mh_valid_mask, -float('inf'))
-            mh_charge_probs = torch.softmax(mh_masked_charge_scores, dim=-1)
-            
-            # Reconstruct Time Intervals
-            mh_raw_interval_scores = self.output_projection_intervals(mh_transformed_sequence).squeeze(-1)
+            # Reconstruct Charges via Monotonic NN
+            mh_unnorm_charge_pdf = self.output_projection_charge(mh_transformed_sequence).squeeze(-1)
+            mh_unnorm_charge_pdf.masked_fill_(~mh_valid_mask, 0)
+            mh_charge_pdf = mh_unnorm_charge_pdf / (mh_unnorm_charge_pdf.sum(dim=-1, keepdim=True) + 1e-9)
+            mh_charge_cdf = torch.cumsum(mh_charge_pdf, dim=-1)
+
+            # Reconstruct Time Intervals via Monotonic NN
+            mh_unnorm_interval_pdf = self.output_projection_intervals(mh_transformed_sequence).squeeze(-1)
             mh_interval_mask = torch.arange(max_len, device=device).unsqueeze(0) < (mh_lengths - 1).unsqueeze(1)
-            mh_masked_interval_scores = mh_raw_interval_scores.masked_fill(~mh_interval_mask, -float('inf'))
-            mh_interval_probs = torch.softmax(mh_masked_interval_scores, dim=-1)
+            mh_unnorm_interval_pdf.masked_fill_(~mh_interval_mask, 0)
+            mh_interval_pdf = mh_unnorm_interval_pdf / (mh_unnorm_interval_pdf.sum(dim=-1, keepdim=True) + 1e-9)
+            mh_interval_cdf = torch.cumsum(mh_interval_pdf, dim=-1)
 
             # Scatter results back to the full batch tensors
-            charge_probs[is_multi_hit] = mh_charge_probs
-            interval_probs[is_multi_hit] = mh_interval_probs
+            charge_cdfs[is_multi_hit] = mh_charge_cdf
+            interval_cdfs[is_multi_hit] = mh_interval_cdf
+            charge_pdfs[is_multi_hit] = mh_charge_pdf
+            interval_pdfs[is_multi_hit] = mh_interval_pdf
 
         # 5. Format output based on whether we are in inference mode or not
         if not inference:
-            return {'charge_probs': charge_probs, 'interval_probs': interval_probs}
+            return {'charge_cdfs': charge_cdfs, 'interval_cdfs': interval_cdfs}
         else:
             # This part is for generating actual sequences for visualization or analysis
             output_tq_pairs = []
             actual_total_charge = torch.exp(log_total_charge_z) - 1.0
-            reconstructed_charges = charge_probs * actual_total_charge.unsqueeze(-1)
+            reconstructed_charges = charge_pdfs * actual_total_charge.unsqueeze(-1)
             
             actual_t_first = torch.exp(log_t_first_z)
             total_duration = (torch.exp(log_t_last_z) - actual_t_first).clamp(min=1e-9)
-            reconstructed_intervals = interval_probs * total_duration.unsqueeze(-1)
+            reconstructed_intervals = interval_pdfs * total_duration.unsqueeze(-1)
 
             for i in range(B):
                 seq_len = actual_seq_lengths[i].item()
@@ -260,8 +270,8 @@ class NT_VAE(pl.LightningModule):
         return {
             'mu': mu,
             'logvar': logvar,
-            'charge_probs': decoded_output['charge_probs'],
-            'interval_probs': decoded_output['interval_probs'],
+            'charge_cdfs': decoded_output['charge_cdfs'],
+            'interval_cdfs': decoded_output['interval_cdfs'],
             'original_charges_log_norm_padded': charges_log_norm_padded,
             'original_intervals_log_norm_padded': encoder_time_features_target,
             'original_lengths': stats_dict['original_lengths']
@@ -271,14 +281,14 @@ class NT_VAE(pl.LightningModule):
         """Calculate reconstruction and KL divergence losses."""
         mu_full = forward_output['mu']
         logvar_full = forward_output['logvar']
-        charge_probs = forward_output['charge_probs']
-        interval_probs = forward_output['interval_probs']
+        charge_cdfs = forward_output['charge_cdfs']
+        interval_cdfs = forward_output['interval_cdfs']
         original_charges_log_norm_padded = forward_output['original_charges_log_norm_padded']
         original_intervals_log_norm_padded = forward_output['original_intervals_log_norm_padded']
         original_lengths = forward_output['original_lengths']
 
         device = mu_full.device
-        B, max_len = charge_probs.shape
+        B, max_len = charge_cdfs.shape
 
         # KLD Loss
         mu_content = mu_full[:, self.summary_stats_dim:]
@@ -306,27 +316,23 @@ class NT_VAE(pl.LightningModule):
 
         if num_multi_hit > 0:
             # Select only the multi-hit sequences for reconstruction loss calculation
-            mh_charge_probs = charge_probs[is_multi_hit]
+            mh_charge_cdfs = charge_cdfs[is_multi_hit]
             mh_original_charges = original_charges_log_norm_padded[is_multi_hit]
             mh_charge_valid_mask = charge_valid_mask[is_multi_hit]
 
-            # Charge Reconstruction Loss (Wasserstein)
+            # Charge Reconstruction Loss (Wasserstein from CDF)
             mh_true_charges_unnorm = torch.expm1(mh_original_charges) # Inverse of log1p
-            mh_true_charges_unnorm.masked_fill_(~mh_charge_valid_mask, 0)
-            mh_true_charge_dist = mh_true_charges_unnorm / (mh_true_charges_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
-            charge_recon_loss = wasserstein_1d(mh_charge_probs, mh_true_charge_dist, mh_charge_valid_mask)
+            charge_recon_loss = wasserstein_1d_from_cdf(mh_charge_cdfs, mh_true_charges_unnorm, mh_charge_valid_mask)
 
-            # Interval Reconstruction Loss (Wasserstein)
+            # Interval Reconstruction Loss (Wasserstein from CDF)
             interval_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < (original_lengths - 1).unsqueeze(1)
-            mh_interval_probs = interval_probs[is_multi_hit]
+            mh_interval_cdfs = interval_cdfs[is_multi_hit]
             mh_original_intervals = original_intervals_log_norm_padded[is_multi_hit]
             mh_interval_valid_mask = interval_valid_mask[is_multi_hit]
             
             if mh_interval_valid_mask.any():
                 mh_true_intervals_unnorm = torch.exp(mh_original_intervals) # Inverse of log
-                mh_true_intervals_unnorm.masked_fill_(~mh_interval_valid_mask, 0)
-                mh_true_interval_dist = mh_true_intervals_unnorm / (mh_true_intervals_unnorm.sum(dim=-1, keepdim=True) + 1e-9)
-                interval_recon_loss = wasserstein_1d(mh_interval_probs, mh_true_interval_dist, mh_interval_valid_mask)
+                interval_recon_loss = wasserstein_1d_from_cdf(mh_interval_cdfs, mh_true_intervals_unnorm, mh_interval_valid_mask)
             else:
                 interval_recon_loss = torch.tensor(0.0, device=device)
         else:

@@ -74,6 +74,7 @@ if __name__=="__main__":
             "transformer_decoder_heads": cfg['model_options']['transformer_decoder_heads'],
             "transformer_decoder_ff_dim": cfg['model_options']['transformer_decoder_ff_dim'],
             "transformer_decoder_dropout": cfg['model_options']['transformer_decoder_dropout'],
+            "monotonic_nn_hidden_dim": cfg['model_options']['monotonic_nn_hidden_dim'],
             "batch_size": cfg['training_options']['batch_size'],
             "lr": cfg['training_options']['lr'],
             "lr_schedule": cfg['training_options']['lr_schedule'],

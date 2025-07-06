@@ -201,3 +201,41 @@ def wasserstein_1d(pred_dist, true_dist, mask, bin_width=1.0):
     # canonical W1 (no length normalisation), scaled by bin width
     w1 = torch.sum(torch.abs(pred_cdf - true_cdf), dim=-1) * bin_width
     return w1.mean()
+
+class MonotonicNN(nn.Module):
+    """
+    A neural network that outputs positive values, intended to be integrated
+    (e.g., via cumsum) to produce a monotonic function (like a CDF).
+    The network has one hidden layer with a Tanh activation function.
+    The output layer uses a Softplus activation to ensure positive outputs.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Softplus()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def wasserstein_1d_from_cdf(pred_cdf, true_dist, mask, bin_width=1.0):
+    """
+    Calculates the 1D Wasserstein distance between a predicted CDF and a true distribution (PDF).
+    """
+    mask = mask.to(pred_cdf.dtype)
+
+    # Prepare true CDF from true distribution (PDF)
+    true = (true_dist * mask).clamp(min=0)
+    true = true / true.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    true_cdf = torch.cumsum(true, dim=-1)
+
+    # The predicted CDF is assumed to be correctly formed (normalized and monotonic).
+    # We just need to apply the mask.
+    pred_cdf_masked = pred_cdf * mask
+    true_cdf_masked = true_cdf * mask
+
+    w1 = torch.sum(torch.abs(pred_cdf_masked - true_cdf_masked), dim=-1) * bin_width
+    return w1.mean()
