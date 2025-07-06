@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-from x_transformers.x_transformers import Encoder, Decoder
-from utils import calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, wasserstein_1d
+from utils import PositionalEncoding, calculate_summary_stats, convert_absolute_times_to_log_intervals, reparameterize, calculate_mmd_loss, wasserstein_1d
 
 class NT_VAE(pl.LightningModule):
     def __init__(self,
@@ -36,17 +35,21 @@ class NT_VAE(pl.LightningModule):
         # Encoder
         self.encoder_input_embedding = nn.Linear(2, self.hparams.embed_dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.hparams.embed_dim) * 0.02)
-        self.transformer_encoder = Encoder(
-            dim=self.hparams.embed_dim,
-            depth=self.hparams.transformer_encoder_layers,
-            heads=self.hparams.transformer_encoder_heads,
-            ff_mult=self.hparams.transformer_encoder_ff_dim // self.hparams.embed_dim,
-            attn_dropout=self.hparams.transformer_encoder_dropout,
-            ff_dropout=self.hparams.transformer_encoder_dropout,
-            use_rmsnorm=True,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            use_flash_attn=True
+        self.pos_encoder = PositionalEncoding(self.hparams.embed_dim,
+                                              self.hparams.transformer_encoder_dropout,
+                                              max_len=self.hparams.max_seq_len_padding + 1)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hparams.embed_dim,
+            nhead=self.hparams.transformer_encoder_heads,
+            dim_feedforward=self.hparams.transformer_encoder_ff_dim,
+            activation='gelu',
+            dropout=self.hparams.transformer_encoder_dropout,
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=self.hparams.transformer_encoder_layers
         )
 
         self.encoder_to_latent_input_dim = self.hparams.embed_dim + 3
@@ -55,20 +58,25 @@ class NT_VAE(pl.LightningModule):
 
         # Decoder
         self.decoder_latent_to_input_proj = nn.Linear(self.hparams.latent_dim, self.hparams.embed_dim)
+        self.decoder_pos_encoder = PositionalEncoding(
+            self.hparams.embed_dim,
+            self.hparams.transformer_decoder_dropout,
+            max_len=self.hparams.max_seq_len_padding
+        )
         self.query_embed = nn.Parameter(torch.randn(self.hparams.max_seq_len_padding, self.hparams.embed_dim) * 0.02)
 
-        self.decoder_transformer = Decoder(
-            dim=self.hparams.embed_dim,
-            depth=self.hparams.transformer_decoder_layers,
-            heads=self.hparams.transformer_decoder_heads,
-            ff_mult=self.hparams.transformer_decoder_ff_dim // self.hparams.embed_dim,
-            attn_dropout=self.hparams.transformer_decoder_dropout,
-            ff_dropout=self.hparams.transformer_decoder_dropout,
-            use_rmsnorm=True,
-            ff_glu=True,
-            rotary_pos_emb=True,
-            use_flash_attn=True,
-            cross_attend=True
+        decoder_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hparams.embed_dim,
+            nhead=self.hparams.transformer_decoder_heads,
+            dim_feedforward=self.hparams.transformer_decoder_ff_dim,
+            activation='gelu',
+            dropout=self.hparams.transformer_decoder_dropout,
+            batch_first=True,
+            norm_first=True
+        )
+        self.decoder_transformer = nn.TransformerEncoder(
+            decoder_encoder_layer,
+            num_layers=self.hparams.transformer_decoder_layers
         )
 
         self.output_projection_charge = nn.Linear(self.hparams.embed_dim, 1)
@@ -115,15 +123,20 @@ class NT_VAE(pl.LightningModule):
             mh_concatenated_input = torch.stack((mh_charges, mh_time_features), dim=-1)
             mh_embedded_input = self.encoder_input_embedding(mh_concatenated_input)
 
+            # Prepend CLS token
+            mh_cls_tokens = self.cls_token.expand(num_multi_hit, -1, -1)
+            mh_embedded_with_cls = torch.cat([mh_cls_tokens, mh_embedded_input], dim=1)
+            mh_embedded_with_cls = self.pos_encoder(mh_embedded_with_cls)
+
+            # Prepare attention mask
+            mh_cls_mask = torch.zeros(num_multi_hit, 1, dtype=torch.bool, device=device)
+            mh_extended_attention_mask = torch.cat([mh_cls_mask, mh_attn_mask], dim=1)
+
             # Pass through transformer encoder
-            mh_encoded_sequence = self.transformer_encoder(
-                mh_embedded_input,
-                mask=~mh_attn_mask,
-                cls=self.cls_token.expand(num_multi_hit, -1, -1)
-            )
+            mh_encoded_sequence = self.transformer_encoder(mh_embedded_with_cls, src_key_padding_mask=mh_extended_attention_mask)
             
-            # The output is the CLS token representation
-            mh_cls_representation = mh_encoded_sequence
+            # Extract CLS token representation
+            mh_cls_representation = mh_encoded_sequence[:, 0, :]
             
             # Concatenate CLS representation with sensor position
             mh_encoder_latent_input = torch.cat((mh_cls_representation, mh_sensor_pos), dim=1)
@@ -181,13 +194,12 @@ class NT_VAE(pl.LightningModule):
 
             # Prepare input for Transformer Decoder
             mh_z_projected = self.decoder_latent_to_input_proj(mh_z)
+            mh_decoder_input = mh_z_projected.unsqueeze(1) + self.query_embed.unsqueeze(0)
+            mh_decoder_input = self.decoder_pos_encoder(mh_decoder_input)
+
             # Transformer Decoding
             mh_valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < mh_lengths.unsqueeze(1)
-            mh_transformed_sequence = self.decoder_transformer(
-                x=self.query_embed.unsqueeze(0).repeat(num_multi_hit, 1, 1),
-                context=mh_z_projected.unsqueeze(1),
-                mask=mh_valid_mask
-            )
+            mh_transformed_sequence = self.decoder_transformer(src=mh_decoder_input, src_key_padding_mask=~mh_valid_mask)
 
             # Reconstruct Charges via Softmax Partitioning
             mh_raw_charge_scores = self.output_projection_charge(mh_transformed_sequence).squeeze(-1)
